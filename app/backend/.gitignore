@@ -1,0 +1,24 @@
+# Go build and test artifacts
+/api/bin/
+/api/coverage/
+/api/coverage.out
+*.test
+*.prof
+
+# Rust build artifacts
+/worker/target/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Local tools and editor state
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Operating system files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+
+members = [
+    "crates/worker",
+    "crates/encoding",
+    "crates/queue",
+    "crates/storage",
+    "crates/persistence",
+]

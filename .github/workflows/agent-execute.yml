@@ -1,0 +1,258 @@
+# Task Spec intake, Codex execution, then Orchestrator Git / PR delivery.
+#
+# Intake contract:
+# - valid: the selected Task Spec parsed successfully
+# - should_execute: start the execute job
+# - Invalid Spec / unusable intake (parse failure, multiple specs, path escape):
+#   parse-spec exits non-zero so the workflow fails. execute is skipped via needs
+#   (do not add if: always()).
+# - Non-base-branch push (loop prevention): parse-spec succeeds, should_execute=false,
+#   execute is skipped, workflow succeeds.
+#
+# Write authority isolation:
+# - execute has contents: read and the Codex API secret. persist-credentials: false.
+# - deliver has contents/pull-requests/issues write and GITHUB_TOKEN. No CODEX_API_KEY.
+# - Pull Request creation uses AGENT_PR_PAT only (create_pull). Commit, push,
+#   reconciliation, labels, comments, and other GitHub API calls keep GITHUB_TOKEN.
+# - AGENT_PR_PAT is never passed to Codex, the Review Classifier, or git.
+# - Both jobs use persist-credentials: false so Final Verification and other
+#   repository-controlled processes cannot reach stored git write credentials.
+# - Deliver injects HTTPS auth into the Orchestrator git subprocess only.
+# - Codex subprocess never receives GitHub write credentials.
+#
+# Concurrency contract:
+# - Execute uses job-level concurrency per task_id with cancel-in-progress: false.
+# - Official default pending queue is one run (queue: single). queue: max is not used.
+# - Do not re-push the same task_id until the in-progress execute job finishes.
+#
+# Codex sandbox bootstrap (execute job):
+# - openai/codex-action is environment prep only. It must not replace
+#   run-task.py / run_task_cycle() / Codex CLI.
+# - Omit prompt and prompt-file so the action does not run Codex.
+# - Official GitHub-hosted Linux bootstrap enables unprivileged user
+#   namespaces and clears AppArmor's userns gate so later
+#   `codex exec --sandbox workspace-write` is not blocked by
+#   `bwrap: loopback: Failed RTM_NEWADDR`. See openai/codex-action README
+#   (GitHub-hosted Linux runners) and issue #75 / PR #77.
+# - danger-full-access is forbidden. Keep workspace-write.
+# - drop-sudo is irreversible for the rest of the job: do all toolchain
+#   and install steps before the action; do not use sudo after it.
+# - Do not pass the repository Codex API secret into the action. Production auth
+#   stays CODEX_API_KEY on the Orchestrator step / Codex subprocess.
+#   A non-empty placeholder is required so the action still runs the
+#   Linux sandbox bootstrap (and the unused Responses API proxy).
+#
+# Official references used while writing this file:
+# - https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows
+# - https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
+# - https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions
+# - https://github.com/actions/checkout (persist-credentials, fetch-depth)
+# - https://github.com/actions/setup-python
+# - https://github.com/actions/setup-node
+# - https://github.com/openai/codex-action
+# - https://github.com/actions/upload-artifact
+# - https://github.com/actions/download-artifact
+# - https://docs.github.com/en/rest/pulls/pulls
+# - https://docs.github.com/en/rest/issues/labels
+
+name: Agent Execute
+
+on:
+  push:
+    paths:
+      - "specs/tasks/**/*.md"
+  workflow_dispatch:
+    inputs:
+      spec_path:
+        description: Path to the Task Spec markdown file under specs/tasks
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  parse-spec:
+    name: Parse spec
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      task_id: ${{ steps.parse.outputs.task_id }}
+      spec_path: ${{ steps.parse.outputs.spec_path }}
+      base_branch: ${{ steps.parse.outputs.base_branch }}
+      target_branch: ${{ steps.parse.outputs.target_branch }}
+      valid: ${{ steps.parse.outputs.valid }}
+      should_execute: ${{ steps.parse.outputs.should_execute }}
+    steps:
+      - name: Checkout history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install orchestrator
+        run: python -m pip install -e .
+
+      - name: Parse Task Spec
+        id: parse
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          SPEC_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.spec_path || '' }}
+        run: python agent/scripts/prepare-intake.py
+
+  execute:
+    name: Execute task
+    needs: [parse-spec]
+    if: ${{ needs.parse-spec.outputs.should_execute == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: autonomous-agent-${{ needs.parse-spec.outputs.task_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install orchestrator
+        run: python -m pip install -e .
+
+      - name: Assert history and execution guard
+        run: python agent/scripts/prepare-execute.py --spec "${{ needs.parse-spec.outputs.spec_path }}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.12.0"
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: app/backend/api/go.mod
+          cache: false
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.98.0
+
+      - name: Install frontend dependencies
+        working-directory: app/frontend
+        run: npm ci
+
+      - name: Install Playwright browsers and system dependencies
+        working-directory: app/frontend
+        run: npx playwright install --with-deps
+
+      - name: Install pinned Codex CLI
+        id: codex-cli
+        run: |
+          PKG=$(python -c "from agent.config import load_config; c=load_config(); print(f'{c.codex.package}@{c.codex.version}')")
+          VER=$(python -c "from agent.config import load_config; print(load_config().codex.version)")
+          npm install -g "$PKG"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Bootstrap Codex sandbox
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: unused-bootstrap-placeholder
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          codex-version: ${{ steps.codex-cli.outputs.version }}
+
+      - name: Run orchestrator
+        env:
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+          GITHUB_TOKEN: ""
+        run: python agent/scripts/run-work-unit.py --spec "${{ needs.parse-spec.outputs.spec_path }}" --report-dir "${{ runner.temp }}/agent-report"
+
+      - name: Upload work report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-work-${{ needs.parse-spec.outputs.task_id }}
+          path: ${{ runner.temp }}/agent-report
+          if-no-files-found: error
+
+  deliver:
+    name: Deliver commit and pull request
+    needs: [parse-spec, execute]
+    if: ${{ always() && needs.parse-spec.result == 'success' && needs.parse-spec.outputs.should_execute == 'true' && needs.execute.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install orchestrator
+        run: python -m pip install -e .
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.12.0"
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: app/backend/api/go.mod
+          cache: false
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.98.0
+
+      - name: Install frontend dependencies
+        working-directory: app/frontend
+        run: npm ci
+
+      - name: Install Playwright browsers and system dependencies
+        working-directory: app/frontend
+        run: npx playwright install --with-deps
+
+      - name: Download work report
+        uses: actions/download-artifact@v7
+        with:
+          name: agent-work-${{ needs.parse-spec.outputs.task_id }}
+          path: ${{ runner.temp }}/agent-report
+
+      - name: Commit, push, and open pull request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          AGENT_PR_PAT: ${{ secrets.AGENT_PR_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        run: python agent/scripts/deliver.py --spec "${{ needs.parse-spec.outputs.spec_path }}" --report-dir "${{ runner.temp }}/agent-report"
