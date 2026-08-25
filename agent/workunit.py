@@ -14,6 +14,7 @@ import jsonschema
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 
 from agent.classify import FailureClass
+from agent.codex_runner import detach_codex_api_key
 from agent.config import AgentConfig, load_config
 from agent.cycle import CycleOutcome, CycleResult, run_task_cycle
 from agent.errors import AgentError
@@ -527,6 +528,7 @@ def run_work_unit(
     persist_state: bool = False,
 ) -> WorkUnitReport:
     cfg = config or load_config()
+    rest_env, api_key = detach_codex_api_key(env, api_key_env=cfg.codex.api_key_env)
     root = Path(repo_root)
     parsed = spec if isinstance(spec, TaskSpec) else parse_spec(spec)
     validate_spec_scope_policy(parsed, cfg.runtime_edit_policy)
@@ -593,7 +595,8 @@ def run_work_unit(
             parsed,
             repo_root=root,
             config=cfg,
-            env=env,
+            env=rest_env,
+            api_key=api_key,
             executor=executor,
             state=current_state,
             persist_state=persist_state,

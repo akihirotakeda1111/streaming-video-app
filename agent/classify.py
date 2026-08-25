@@ -52,6 +52,8 @@ ENV_PHRASES = (
     "name or service not known",
     "nodename nor servname provided",
     "unknownhostexception",
+    "401 unauthorized",
+    "missing bearer",
 )
 
 # Errno tokens must be whole words. "enotfound" must not match FileNotFoundError.
@@ -103,3 +105,20 @@ def classify_output(
     if name in REPAIRABLE_BINARIES and exit_code not in (None, 0):
         return FailureClass.AGENT_REPAIRABLE
     return FailureClass.ESCALATION_REQUIRED
+
+
+def classify_codex_failure(
+    *,
+    stdout: str,
+    stderr: str,
+    exit_code: int | None = None,
+    api_key_present: bool = True,
+) -> FailureClass:
+    if not api_key_present:
+        return FailureClass.ENVIRONMENT_FAILURE
+    return classify_output(
+        stdout=stdout,
+        stderr=stderr,
+        binary="codex",
+        exit_code=exit_code,
+    )

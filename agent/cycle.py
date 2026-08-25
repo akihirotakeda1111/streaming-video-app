@@ -11,7 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from agent.classify import FailureClass, classify_output, classify_validation
+from agent.classify import FailureClass, classify_codex_failure, classify_validation
 from agent.codex_runner import (
     CodexRunResult,
     Executor,
@@ -86,6 +86,25 @@ _SUCCESS_CYCLE_OUTCOMES = frozenset(
         CycleOutcome.FINAL_VERIFICATION_PASSED,
     }
 )
+
+
+def _bind_codex_credential(
+    env: Mapping[str, str] | None,
+    provided_key: str | None,
+    *,
+    api_key_env: str,
+) -> tuple[Mapping[str, str] | None, str | None]:
+    """Scrub process env, then bind a Work Unit-owned or Cycle-owned credential.
+
+    ``detach_codex_api_key`` copies ``env`` and does not mutate the caller mapping.
+    Process environment is always scrubbed. ``run_work_unit`` passes the same
+    explicit key to every cycle. Direct callers such as ``run-task.py`` omit
+    ``api_key`` and receive the detached process value.
+    """
+    rest_env, detached_key = detach_codex_api_key(env, api_key_env=api_key_env)
+    if provided_key is not None:
+        return rest_env, provided_key
+    return rest_env, detached_key
 
 
 def _as_cycle_outcome(value: object) -> CycleOutcome:
@@ -260,6 +279,7 @@ def run_task_cycle(
     repo_root: Path | str,
     config: AgentConfig | None = None,
     env: Mapping[str, str] | None = None,
+    api_key: str | None = None,
     executor: Executor | None = None,
     state: ExecutionState | None = None,
     persist_state: bool = True,
@@ -268,7 +288,7 @@ def run_task_cycle(
     root = Path(repo_root)
     parsed = spec if isinstance(spec, TaskSpec) else parse_spec(spec)
     validate_spec_scope_policy(parsed, cfg.runtime_edit_policy)
-    rest_env, api_key = detach_codex_api_key(env, api_key_env=cfg.codex.api_key_env)
+    rest_env, api_key = _bind_codex_credential(env, api_key, api_key_env=cfg.codex.api_key_env)
     snapshot = capture_snapshot(root)
     unsafe = _reject_unsafe_current_state(
         parsed, root, cfg, snapshot.base_sha, provided_state=state
@@ -506,12 +526,12 @@ def _after_codex(
             message=f"SCOPE_VIOLATION: {', '.join(scope.violation_paths)}",
         )
 
-    if implement.exit_code != 0 and not scope.changed_paths:
-        classification = classify_output(
+    if implement.exit_code != 0:
+        classification = classify_codex_failure(
             stdout=implement.stdout,
             stderr=implement.stderr,
-            binary="codex",
             exit_code=implement.exit_code,
+            api_key_present=bool((api_key or "").strip()),
         )
         target = (
             ExecutionStatus.FAILED
@@ -530,7 +550,7 @@ def _after_codex(
             scope=scope,
             failure_class=classification,
             repair_attempts=state.repair_attempts,
-            message="codex exited non-zero without in-scope changes",
+            message="codex exited non-zero",
         )
 
     emit(
