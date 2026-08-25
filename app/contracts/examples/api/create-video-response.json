@@ -1,0 +1,21 @@
+{
+  "videoId": "018f47a2-45c2-7a84-b84f-5f6dd7b5910a",
+  "job": {
+    "jobId": "018f47a2-4699-7892-9fc0-fbe46d3bbd67",
+    "status": "UPLOADING",
+    "failure": null
+  },
+  "upload": {
+    "method": "PUT",
+    "url": "https://streaming-video-input.s3.ap-northeast-1.amazonaws.com/videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=900&X-Amz-Signature=example",
+    "headers": {
+      "Content-Type": "video/mp4"
+    },
+    "expiresAt": "2026-08-25T03:15:00Z",
+    "object": {
+      "bucket": "streaming-video-input",
+      "key": "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4"
+    }
+  },
+  "createdAt": "2026-08-25T03:00:00Z"
+}

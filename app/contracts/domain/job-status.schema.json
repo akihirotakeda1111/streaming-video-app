@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://streaming-video-app.example/contracts/domain/job-status.schema.json",
+  "title": "JobStatus",
+  "description": "Phase 1 encoding job status shared by the Go API, Rust worker, and frontend.",
+  "type": "string",
+  "enum": [
+    "UPLOADING",
+    "QUEUED",
+    "PROCESSING",
+    "COMPLETED",
+    "FAILED"
+  ]
+}
