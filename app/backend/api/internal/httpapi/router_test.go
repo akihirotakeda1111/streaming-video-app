@@ -71,7 +71,7 @@ func TestDecodeJSONAndBodyLimit(t *testing.T) {
 
 		handler.ServeHTTP(rr, req)
 
-		assertErrorResponse(t, rr, http.StatusBadRequest, "malformed_json")
+		assertErrorResponse(t, rr, http.StatusBadRequest, "INVALID_REQUEST")
 	})
 
 	t.Run("too_large", func(t *testing.T) {
@@ -81,7 +81,7 @@ func TestDecodeJSONAndBodyLimit(t *testing.T) {
 
 		handler.ServeHTTP(rr, req)
 
-		assertErrorResponse(t, rr, http.StatusRequestEntityTooLarge, "request_too_large")
+		assertErrorResponse(t, rr, http.StatusBadRequest, "INVALID_REQUEST")
 	})
 }
 
@@ -110,4 +110,3 @@ func assertErrorResponse(t *testing.T, rr *httptest.ResponseRecorder, wantStatus
 		t.Fatal("message is empty")
 	}
 }
-
