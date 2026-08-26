@@ -46,12 +46,13 @@ type S3PresignResult struct {
 
 // S3UploadPresigner adapts a PutObject presign client to the upload presigner boundary.
 type S3UploadPresigner struct {
-	client S3PresignClient
+	client      S3PresignClient
+	inputBucket string
 }
 
-// NewS3UploadPresigner builds the S3 adapter around the provided client boundary.
-func NewS3UploadPresigner(client S3PresignClient) *S3UploadPresigner {
-	return &S3UploadPresigner{client: client}
+// NewS3UploadPresigner builds the S3 adapter around the provided client and trusted input bucket.
+func NewS3UploadPresigner(client S3PresignClient, inputBucket string) *S3UploadPresigner {
+	return &S3UploadPresigner{client: client, inputBucket: inputBucket}
 }
 
 // PresignUpload validates the upload contract and delegates to the SDK boundary.
@@ -62,8 +63,14 @@ func (p *S3UploadPresigner) PresignUpload(ctx context.Context, bucket, key, cont
 	if p.client == nil {
 		return PresignedUpload{}, errors.New("s3 presign client is required")
 	}
+	if p.inputBucket == "" {
+		return PresignedUpload{}, errors.New("input bucket is required")
+	}
 	if bucket == "" {
 		return PresignedUpload{}, errors.New("bucket is required")
+	}
+	if bucket != p.inputBucket {
+		return PresignedUpload{}, errors.New("bucket must match the configured input bucket")
 	}
 	if !canonicalSourceKeyPattern.MatchString(key) {
 		return PresignedUpload{}, errors.New("key must be the canonical source key")

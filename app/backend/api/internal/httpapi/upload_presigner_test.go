@@ -8,13 +8,15 @@ import (
 	"time"
 )
 
+const testInputBucket = "input-bucket"
+
 func TestS3UploadPresignerPresignUploadForwardsCanonicalPutObject(t *testing.T) {
 	client := &fakeS3PresignClient{}
-	presigner := NewS3UploadPresigner(client)
+	presigner := NewS3UploadPresigner(client, testInputBucket)
 
 	got, err := presigner.PresignUpload(
 		context.Background(),
-		"input-bucket",
+		testInputBucket,
 		"videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
 		uploadContentType,
 		15*time.Minute,
@@ -68,38 +70,45 @@ func TestS3UploadPresignerRejectsInvalidInputsBeforeClientCall(t *testing.T) {
 		},
 		{
 			name:        "noncanonical_key",
-			bucket:      "input-bucket",
+			bucket:      testInputBucket,
 			key:         "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/upload.mp4",
 			contentType: uploadContentType,
 			expiry:      time.Minute,
 		},
 		{
 			name:        "uppercase_uuid",
-			bucket:      "input-bucket",
+			bucket:      testInputBucket,
 			key:         "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-22222222222A/source.mp4",
 			contentType: uploadContentType,
 			expiry:      time.Minute,
 		},
 		{
 			name:        "wrong_content_type",
-			bucket:      "input-bucket",
+			bucket:      testInputBucket,
 			key:         "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
 			contentType: "video/mpeg",
 			expiry:      time.Minute,
 		},
 		{
 			name:        "nonpositive_expiry",
-			bucket:      "input-bucket",
+			bucket:      testInputBucket,
 			key:         "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
 			contentType: uploadContentType,
 			expiry:      0,
+		},
+		{
+			name:        "wrong_bucket",
+			bucket:      "other-bucket",
+			key:         "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
+			contentType: uploadContentType,
+			expiry:      time.Minute,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &fakeS3PresignClient{}
-			presigner := NewS3UploadPresigner(client)
+			presigner := NewS3UploadPresigner(client, testInputBucket)
 
 			_, err := presigner.PresignUpload(context.Background(), tc.bucket, tc.key, tc.contentType, tc.expiry)
 			if err == nil {
@@ -115,11 +124,11 @@ func TestS3UploadPresignerRejectsInvalidInputsBeforeClientCall(t *testing.T) {
 func TestS3UploadPresignerPropagatesClientError(t *testing.T) {
 	clientErr := errors.New("presign failed")
 	client := &fakeS3PresignClient{err: clientErr}
-	presigner := NewS3UploadPresigner(client)
+	presigner := NewS3UploadPresigner(client, testInputBucket)
 
 	_, err := presigner.PresignUpload(
 		context.Background(),
-		"input-bucket",
+		testInputBucket,
 		"videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
 		uploadContentType,
 		time.Minute,
