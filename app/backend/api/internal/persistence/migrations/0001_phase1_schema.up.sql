@@ -10,19 +10,19 @@ CREATE TABLE videos (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE encoding_jobs (
-    job_id uuid PRIMARY KEY,
+CREATE TABLE jobs (
+    id uuid PRIMARY KEY,
     video_id uuid NOT NULL UNIQUE REFERENCES videos(video_id) ON DELETE CASCADE,
     status text NOT NULL CHECK (status IN ('UPLOADING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED')),
     failure_code text,
     failure_message text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT encoding_jobs_failure_details_check CHECK (
+    CONSTRAINT jobs_failure_details_check CHECK (
         (status = 'FAILED' AND failure_code IS NOT NULL AND failure_message IS NOT NULL)
         OR
         (status <> 'FAILED' AND failure_code IS NULL AND failure_message IS NULL)
     )
 );
 
-CREATE INDEX encoding_jobs_status_idx ON encoding_jobs (status);
+CREATE INDEX jobs_status_idx ON jobs (status);

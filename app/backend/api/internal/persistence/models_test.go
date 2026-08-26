@@ -89,23 +89,24 @@ func TestMigrationStructure(t *testing.T) {
 		"upload_bucket text NOT NULL",
 		"upload_key text NOT NULL",
 		"upload_expires_at timestamptz NOT NULL",
-		"CREATE TABLE encoding_jobs",
+		"CREATE TABLE jobs",
+		"id uuid PRIMARY KEY",
 		"video_id uuid NOT NULL UNIQUE REFERENCES videos(video_id) ON DELETE CASCADE",
 		"status text NOT NULL CHECK (status IN ('UPLOADING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED'))",
-		"CONSTRAINT encoding_jobs_failure_details_check CHECK (",
-		"CREATE INDEX encoding_jobs_status_idx ON encoding_jobs (status)",
+		"CONSTRAINT jobs_failure_details_check CHECK (",
+		"CREATE INDEX jobs_status_idx ON jobs (status)",
 	)
 
 	if strings.Count(up, "CREATE TABLE") != 2 {
 		t.Fatalf("up migration should define exactly two tables, got %d", strings.Count(up, "CREATE TABLE"))
 	}
 
-	if idxJobs := strings.Index(down, "DROP TABLE IF EXISTS encoding_jobs"); idxJobs < 0 {
-		t.Fatal("down migration must drop encoding_jobs")
+	if idxJobs := strings.Index(down, "DROP TABLE IF EXISTS jobs"); idxJobs < 0 {
+		t.Fatal("down migration must drop jobs")
 	} else if idxVideos := strings.Index(down, "DROP TABLE IF EXISTS videos"); idxVideos < 0 {
 		t.Fatal("down migration must drop videos")
 	} else if idxJobs > idxVideos {
-		t.Fatal("down migration must drop encoding_jobs before videos")
+		t.Fatal("down migration must drop jobs before videos")
 	}
 }
 
