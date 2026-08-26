@@ -26,3 +26,18 @@ output "runtime_configuration" {
     error_message = "video_input_bucket and video_output_bucket must differ to prevent an encoding loop."
   }
 }
+
+output "video_input_bucket_name" {
+  description = "Resolved Phase 1 input bucket name."
+  value       = aws_s3_bucket.video_input.bucket
+}
+
+output "video_output_bucket_name" {
+  description = "Resolved Phase 1 output bucket name."
+  value       = aws_s3_bucket.video_output.bucket
+}
+
+output "video_encoding_queue_url" {
+  description = "Resolved Phase 1 encoding queue URL."
+  value       = aws_sqs_queue.video_encoding.url
+}
