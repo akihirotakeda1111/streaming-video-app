@@ -44,7 +44,7 @@ func Load(lookupEnv LookupEnvFunc) (Config, error) {
 	if err := loadRequiredString(lookupEnv, envDatabaseURL, &cfg.DatabaseURL); err != nil {
 		return Config{}, err
 	}
-	if err := validateURL(cfg.DatabaseURL); err != nil {
+	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
 		return Config{}, wrapInvalid(envDatabaseURL, err)
 	}
 
@@ -73,7 +73,7 @@ func Load(lookupEnv LookupEnvFunc) (Config, error) {
 	if err := loadRequiredString(lookupEnv, envOutputS3, &cfg.OutputS3Endpoint); err != nil {
 		return Config{}, err
 	}
-	if err := validateURL(cfg.OutputS3Endpoint); err != nil {
+	if err := validateS3EndpointURL(cfg.OutputS3Endpoint); err != nil {
 		return Config{}, wrapInvalid(envOutputS3, err)
 	}
 
@@ -104,15 +104,41 @@ func validateHTTPAddr(addr string) error {
 	return nil
 }
 
-func validateURL(raw string) error {
+func validateURL(raw string) (*url.URL, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("must be a valid URL")
+		return nil, fmt.Errorf("must be a valid URL")
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
-		return fmt.Errorf("must include a scheme and host")
+		return nil, fmt.Errorf("must include a scheme and host")
 	}
-	return nil
+	return parsed, nil
+}
+
+func validateDatabaseURL(raw string) error {
+	parsed, err := validateURL(raw)
+	if err != nil {
+		return err
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "postgres", "postgresql":
+		return nil
+	default:
+		return fmt.Errorf("must use a postgres scheme")
+	}
+}
+
+func validateS3EndpointURL(raw string) error {
+	parsed, err := validateURL(raw)
+	if err != nil {
+		return err
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		return nil
+	default:
+		return fmt.Errorf("must use an http or https scheme")
+	}
 }
 
 func validateS3Bucket(name string) error {
@@ -121,6 +147,9 @@ func validateS3Bucket(name string) error {
 	}
 	if strings.Contains(name, "..") {
 		return fmt.Errorf("must not contain consecutive dots")
+	}
+	if net.ParseIP(name) != nil {
+		return fmt.Errorf("must not be formatted as an IP address")
 	}
 	return nil
 }

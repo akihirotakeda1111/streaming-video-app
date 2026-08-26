@@ -97,6 +97,39 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envOutputS3:    "http://localhost:4566",
 			},
 		},
+		{
+			name: "ip_form_bucket",
+			env: map[string]string{
+				envHTTPAddr:    "0.0.0.0:8080",
+				envDatabaseURL: "postgres://user:pass@localhost:5432/app?sslmode=disable",
+				envAWSRegion:   "ap-northeast-1",
+				envVideoInput:  "192.168.5.4",
+				envVideoOutput: "streaming-video-output-dev",
+				envOutputS3:    "http://localhost:4566",
+			},
+		},
+		{
+			name: "bad_database_url_scheme",
+			env: map[string]string{
+				envHTTPAddr:    "0.0.0.0:8080",
+				envDatabaseURL: "http://localhost:5432/app",
+				envAWSRegion:   "ap-northeast-1",
+				envVideoInput:  "streaming-video-input-dev",
+				envVideoOutput: "streaming-video-output-dev",
+				envOutputS3:    "http://localhost:4566",
+			},
+		},
+		{
+			name: "bad_s3_endpoint_scheme",
+			env: map[string]string{
+				envHTTPAddr:    "0.0.0.0:8080",
+				envDatabaseURL: "postgres://user:pass@localhost:5432/app?sslmode=disable",
+				envAWSRegion:   "ap-northeast-1",
+				envVideoInput:  "streaming-video-input-dev",
+				envVideoOutput: "streaming-video-output-dev",
+				envOutputS3:    "ftp://localhost:4566",
+			},
+		},
 	}
 
 	for _, tc := range tests {
