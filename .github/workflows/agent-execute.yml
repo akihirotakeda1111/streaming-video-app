@@ -37,6 +37,10 @@
 # - danger-full-access is forbidden. Keep workspace-write.
 # - drop-sudo is irreversible for the rest of the job: do all toolchain
 #   and install steps before the action; do not use sudo after it.
+# - Task Spec allowed_paths only select application toolchains and dependencies.
+#   They do not gate execute, delivery, verification, or sandbox steps.
+# - Node.js remains unconditional in execute because it installs the Codex CLI;
+#   frontend npm cache and dependencies remain conditional.
 # - Do not pass the repository Codex API secret into the action. Production auth
 #   stays CODEX_API_KEY on the Orchestrator step / Codex subprocess.
 #   A non-empty placeholder is required so the action still runs the
@@ -84,6 +88,9 @@ jobs:
       target_branch: ${{ steps.parse.outputs.target_branch }}
       valid: ${{ steps.parse.outputs.valid }}
       should_execute: ${{ steps.parse.outputs.should_execute }}
+      frontend: ${{ steps.environments.outputs.frontend }}
+      backend_api: ${{ steps.environments.outputs.backend_api }}
+      backend_worker: ${{ steps.environments.outputs.backend_worker }}
     steps:
       - name: Checkout history
         uses: actions/checkout@v7
@@ -108,6 +115,43 @@ jobs:
           EVENT_BEFORE: ${{ github.event.before }}
           SPEC_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.spec_path || '' }}
         run: python agent/scripts/prepare-intake.py
+
+      - name: Detect required application environments
+        id: environments
+        env:
+          SPEC_PATH: ${{ steps.parse.outputs.spec_path }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+
+          from agent.spec import parse_spec
+
+          paths = tuple(
+              path.replace("\\", "/").strip("/")
+              for path in parse_spec(os.environ["SPEC_PATH"]).allowed_paths
+          )
+          targets = {
+              "frontend": "app/frontend",
+              "backend_api": "app/backend/api",
+              "backend_worker": "app/backend/worker",
+          }
+
+          def overlaps(target: str) -> bool:
+              for path in paths:
+                  literal = re.split(r"[\*\?\[]", path, maxsplit=1)[0].rstrip("/")
+                  if (
+                      literal == target
+                      or literal.startswith(f"{target}/")
+                      or target.startswith(f"{literal}/")
+                  ):
+                      return True
+              return False
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for name, target in targets.items():
+                  print(f"{name}={'true' if overlaps(target) else 'false'}", file=output)
+          PY
 
   execute:
     name: Execute task
@@ -141,25 +185,29 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: "24.12.0"
-          cache: npm
+          cache: ${{ needs.parse-spec.outputs.frontend == 'true' && 'npm' || '' }}
           cache-dependency-path: app/frontend/package-lock.json
 
       - name: Set up Go
+        if: ${{ needs.parse-spec.outputs.backend_api == 'true' }}
         uses: actions/setup-go@v7
         with:
           go-version-file: app/backend/api/go.mod
           cache: false
 
       - name: Set up Rust
+        if: ${{ needs.parse-spec.outputs.backend_worker == 'true' }}
         run: |
           rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.98.0
 
       - name: Install frontend dependencies
+        if: ${{ needs.parse-spec.outputs.frontend == 'true' }}
         working-directory: app/frontend
         run: npm ci
 
       - name: Install Playwright browsers and system dependencies
+        if: ${{ needs.parse-spec.outputs.frontend == 'true' }}
         working-directory: app/frontend
         run: npx playwright install --with-deps
 
@@ -218,6 +266,7 @@ jobs:
         run: python -m pip install -e .
 
       - name: Set up Node.js
+        if: ${{ needs.parse-spec.outputs.frontend == 'true' }}
         uses: actions/setup-node@v7
         with:
           node-version: "24.12.0"
@@ -225,21 +274,25 @@ jobs:
           cache-dependency-path: app/frontend/package-lock.json
 
       - name: Set up Go
+        if: ${{ needs.parse-spec.outputs.backend_api == 'true' }}
         uses: actions/setup-go@v7
         with:
           go-version-file: app/backend/api/go.mod
           cache: false
 
       - name: Set up Rust
+        if: ${{ needs.parse-spec.outputs.backend_worker == 'true' }}
         run: |
           rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.98.0
 
       - name: Install frontend dependencies
+        if: ${{ needs.parse-spec.outputs.frontend == 'true' }}
         working-directory: app/frontend
         run: npm ci
 
       - name: Install Playwright browsers and system dependencies
+        if: ${{ needs.parse-spec.outputs.frontend == 'true' }}
         working-directory: app/frontend
         run: npx playwright install --with-deps
 
