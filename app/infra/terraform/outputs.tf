@@ -20,4 +20,9 @@ output "runtime_configuration" {
     video_input_bucket       = var.video_input_bucket
     video_output_bucket      = var.video_output_bucket
   }
+
+  precondition {
+    condition     = var.video_input_bucket != var.video_output_bucket
+    error_message = "video_input_bucket and video_output_bucket must differ to prevent an encoding loop."
+  }
 }
