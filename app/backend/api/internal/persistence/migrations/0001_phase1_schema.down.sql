@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS encoding_jobs;
+DROP TABLE IF EXISTS videos;
