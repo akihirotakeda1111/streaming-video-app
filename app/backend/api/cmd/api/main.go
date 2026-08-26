@@ -15,6 +15,12 @@ import (
 	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/httpapi"
 )
 
+const (
+	readHeaderTimeout = 10 * time.Second
+	writeTimeout      = 30 * time.Second
+	idleTimeout       = 60 * time.Second
+)
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -33,8 +39,11 @@ func run(ctx context.Context, lookupEnv config.LookupEnvFunc, deps bootstrap.Dep
 
 	if deps.Server == nil {
 		deps.Server = &http.Server{
-			Addr:    cfg.HTTPAddr,
-			Handler: httpapi.NewRouter(),
+			Addr:              cfg.HTTPAddr,
+			Handler:           httpapi.NewRouter(),
+			ReadHeaderTimeout: readHeaderTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
 		}
 	}
 
