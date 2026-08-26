@@ -103,11 +103,11 @@ func assertErrorResponse(t *testing.T, rr *httptest.ResponseRecorder, wantStatus
 	if err := json.Unmarshal(data, &resp); err != nil {
 		t.Fatalf("unmarshal error response: %v", err)
 	}
-	if resp.Error.Code != wantCode {
-		t.Fatalf("error.code = %q, want %q", resp.Error.Code, wantCode)
+	if resp.Code != wantCode {
+		t.Fatalf("code = %q, want %q", resp.Code, wantCode)
 	}
-	if resp.Error.Message == "" {
-		t.Fatal("error.message is empty")
+	if resp.Message == "" {
+		t.Fatal("message is empty")
 	}
 }
 

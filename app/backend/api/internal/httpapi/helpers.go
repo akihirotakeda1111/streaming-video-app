@@ -11,10 +11,6 @@ import (
 const jsonContentType = "application/json; charset=utf-8"
 
 type ErrorResponse struct {
-	Error ErrorDetail `json:"error"`
-}
-
-type ErrorDetail struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 }
@@ -31,10 +27,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	_ = writeJSON(w, status, ErrorResponse{
-		Error: ErrorDetail{
-			Code:    code,
-			Message: message,
-		},
+		Code:    code,
+		Message: message,
 	})
 }
 
