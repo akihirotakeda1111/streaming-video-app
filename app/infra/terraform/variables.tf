@@ -13,13 +13,13 @@ variable "environment" {
 variable "aws_region" {
   type        = string
   description = "AWS region for the Phase 1 shared AWS foundation."
-  default     = "us-east-1"
+  default     = "ap-northeast-1"
 }
 
 variable "video_encoding_queue_url" {
   type        = string
   description = "Non-secret SQS queue URL placeholder for the encoding worker."
-  default     = "https://sqs.us-east-1.amazonaws.com/123456789012/streaming-video-encoding"
+  default     = "https://sqs.ap-northeast-1.amazonaws.com/123456789012/streaming-video-encoding"
 }
 
 variable "video_input_bucket" {
