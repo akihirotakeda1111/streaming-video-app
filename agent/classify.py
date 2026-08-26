@@ -54,6 +54,21 @@ ENV_PHRASES = (
     "unknownhostexception",
     "401 unauthorized",
     "missing bearer",
+    "stream disconnected before completion",
+)
+
+# Retry only unambiguous Codex stream/transport disconnects. Auth, permission,
+# and policy failures stay on the normal classification path.
+CODEX_TRANSPORT_ERROR_PHRASES = ("stream disconnected before completion",)
+CODEX_TRANSPORT_RETRY_DENY_PHRASES = (
+    "401 unauthorized",
+    "403 forbidden",
+    "missing bearer",
+    "authentication failed",
+    "iam policy",
+    "scope_violation",
+    "forbidden command",
+    "command not in allowlist",
 )
 
 # Errno tokens must be whole words. "enotfound" must not match FileNotFoundError.
@@ -122,3 +137,11 @@ def classify_codex_failure(
         binary="codex",
         exit_code=exit_code,
     )
+
+
+def is_codex_transport_error(*, stdout: str, stderr: str) -> bool:
+    """True only for a clear Codex stream disconnect, never auth or policy errors."""
+    text = f"{stdout}\n{stderr}".lower()
+    if any(marker in text for marker in CODEX_TRANSPORT_RETRY_DENY_PHRASES):
+        return False
+    return any(marker in text for marker in CODEX_TRANSPORT_ERROR_PHRASES)

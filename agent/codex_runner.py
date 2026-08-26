@@ -13,6 +13,12 @@ Verified against OpenAI docs at implementation time (2026-08-15):
 - Final message: ``--output-last-message`` / ``-o``
 - JSONL events: ``--json``
 - Prompt on stdin: ``codex exec -``
+- Resume: ``codex exec resume [OPTIONS] <session_id> -``
+  ``codex exec resume --help`` (verified 2026-08-26): ``--sandbox`` is not a
+  resume flag. Keep first-run and resume argv builders separate.
+  Resume supports ``--skip-git-repo-check``, ``--json``,
+  ``--output-last-message``, ``--ignore-user-config``, ``--model``, and
+  ``-c sandbox_mode="..."``.
 - Hermetic config: ``--ignore-user-config``
 - Model override: ``--model`` when configured
   https://developers.openai.com/codex/config-advanced
@@ -104,6 +110,7 @@ _SECRET_ASSIGN = re.compile(
 )
 _SK_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}")
 _GITHUB_TOKEN_VALUE = re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]+")
+_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 
 Executor = Callable[..., "ProcessResult"]
 
@@ -123,6 +130,7 @@ class CodexRunResult:
     final_response: str | None
     metadata: dict[str, Any] = field(default_factory=dict)
     diagnostic: dict[str, Any] | None = None
+    thread_id: str | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -131,6 +139,7 @@ class CodexRunResult:
             "stderr": self.stderr,
             "final_response": self.final_response,
             "metadata": self.metadata,
+            "thread_id": self.thread_id,
         }
         if self.diagnostic is not None:
             payload["diagnostic"] = self.diagnostic
@@ -146,17 +155,74 @@ def load_implementation_instruction() -> str:
         ) from exc
 
 
+def normalize_codex_thread_id(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if _THREAD_ID_RE.fullmatch(stripped):
+        return stripped
+    return None
+
+
+def extract_thread_id(*texts: str) -> str | None:
+    started: str | None = None
+    fallback: str | None = None
+    for text in texts:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            found = _thread_id_from_event(parsed)
+            if found is None:
+                continue
+            type_name = str(parsed.get("type") or parsed.get("event") or "").strip().lower()
+            if type_name == "thread.started":
+                started = found
+            else:
+                fallback = found
+    return started or fallback
+
+
+def _thread_id_from_event(event: dict[str, Any]) -> str | None:
+    for key in ("thread_id", "threadId"):
+        raw = event.get(key)
+        found = normalize_codex_thread_id(raw if isinstance(raw, str) else None)
+        if found:
+            return found
+    thread = event.get("thread")
+    if isinstance(thread, dict):
+        for key in ("id", "thread_id", "threadId"):
+            raw = thread.get(key)
+            found = normalize_codex_thread_id(raw if isinstance(raw, str) else None)
+            if found:
+                return found
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        return _thread_id_from_event(payload)
+    return None
+
+
+def _require_allowed_sandbox(cfg: CodexConfig) -> None:
+    if cfg.sandbox not in ALLOWED_SANDBOXES:
+        raise AgentError.policy_violation(
+            f"unsupported Codex sandbox: {cfg.sandbox}",
+            code="UNSUPPORTED_SANDBOX",
+        )
+
+
 def build_codex_command(
     *,
     last_message_path: Path,
     config: CodexConfig | None = None,
 ) -> list[str]:
     cfg = config or load_config().codex
-    if cfg.sandbox not in ALLOWED_SANDBOXES:
-        raise AgentError.policy_violation(
-            f"unsupported Codex sandbox: {cfg.sandbox}",
-            code="UNSUPPORTED_SANDBOX",
-        )
+    _require_allowed_sandbox(cfg)
     command = [
         cfg.bin,
         "exec",
@@ -172,6 +238,44 @@ def build_codex_command(
     if cfg.model:
         command.extend(["--model", cfg.model])
     command.append("-")
+    return command
+
+
+def build_codex_resume_command(
+    *,
+    last_message_path: Path,
+    thread_id: str,
+    config: CodexConfig | None = None,
+) -> list[str]:
+    """Build ``codex exec resume [OPTIONS] <session_id> -``.
+
+    Resume does not accept ``--sandbox``. Sandbox is set with ``-c sandbox_mode``.
+    Options must precede the session id; see ``codex exec resume --help``.
+    """
+    cfg = config or load_config().codex
+    _require_allowed_sandbox(cfg)
+    session_id = normalize_codex_thread_id(thread_id)
+    if session_id is None:
+        raise AgentError.invalid_input(
+            "invalid Codex thread id",
+            code="INVALID_THREAD_ID",
+        )
+    command = [
+        cfg.bin,
+        "exec",
+        "resume",
+        "--skip-git-repo-check",
+        "-c",
+        f'sandbox_mode="{cfg.sandbox}"',
+        "--output-last-message",
+        str(last_message_path),
+        "--json",
+    ]
+    if cfg.ignore_user_config:
+        command.append("--ignore-user-config")
+    if cfg.model:
+        command.extend(["--model", cfg.model])
+    command.extend([session_id, "-"])
     return command
 
 
@@ -436,6 +540,7 @@ def run_codex(
     prompt: str | None = None,
     stage: str = "implementation",
     attempt: int = 0,
+    thread_id: str | None = None,
 ) -> CodexRunResult:
     cfg = config or load_config()
     root = Path(repo_root)
@@ -453,10 +558,21 @@ def run_codex(
     api_key_value = child_env.get(cfg.codex.api_key_env)
     secrets = [api_key_value] if api_key_value else []
     api_key_env_present = bool((api_key_value or "").strip())
+    resume_thread_id = normalize_codex_thread_id(thread_id)
 
     with tempfile.TemporaryDirectory(prefix="codex-run-") as tmp:
         last_message_path = Path(tmp) / "last-message.txt"
-        command = build_codex_command(last_message_path=last_message_path, config=cfg.codex)
+        if resume_thread_id is None:
+            command = build_codex_command(
+                last_message_path=last_message_path,
+                config=cfg.codex,
+            )
+        else:
+            command = build_codex_resume_command(
+                last_message_path=last_message_path,
+                thread_id=resume_thread_id,
+                config=cfg.codex,
+            )
         started = time.monotonic()
         process = (executor or _default_executor)(
             command,
@@ -474,6 +590,7 @@ def run_codex(
     stderr = redact_secrets(process.stderr, secrets)
     if final_response is not None:
         final_response = redact_secrets(final_response, secrets)
+    resolved_thread_id = extract_thread_id(stdout, stderr) or resume_thread_id
 
     diagnostic = None
     if process.returncode != 0:
@@ -505,8 +622,10 @@ def run_codex(
             "spec_id": spec.id,
             "duration_ms": elapsed_ms,
             "api_key_env_present": api_key_env_present,
+            "thread_id": resolved_thread_id,
         },
         diagnostic=diagnostic,
+        thread_id=resolved_thread_id,
     )
 
 
