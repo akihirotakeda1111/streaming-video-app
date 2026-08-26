@@ -117,7 +117,7 @@ resource "aws_sqs_queue_policy" "video_encoding" {
 }
 
 resource "aws_s3_bucket_notification" "video_input" {
-  bucket = aws_s3_bucket.video_input.id
+  bucket     = aws_s3_bucket.video_input.id
   depends_on = [aws_sqs_queue_policy.video_encoding]
 
   queue {

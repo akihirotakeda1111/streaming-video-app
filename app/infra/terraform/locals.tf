@@ -1,5 +1,5 @@
 locals {
-  name_prefix = "${var.project_name}-${var.environment}"
+  name_prefix      = "${var.project_name}-${var.environment}"
   s3_path_wildcard = "*"
 
   phase1_environment_variable_names = {
