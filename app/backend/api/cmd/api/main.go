@@ -17,6 +17,7 @@ import (
 
 const (
 	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 15 * time.Second
 	writeTimeout      = 30 * time.Second
 	idleTimeout       = 60 * time.Second
 )
@@ -42,6 +43,7 @@ func run(ctx context.Context, lookupEnv config.LookupEnvFunc, deps bootstrap.Dep
 			Addr:              cfg.HTTPAddr,
 			Handler:           httpapi.NewRouter(),
 			ReadHeaderTimeout: readHeaderTimeout,
+			ReadTimeout:       readTimeout,
 			WriteTimeout:      writeTimeout,
 			IdleTimeout:       idleTimeout,
 		}
