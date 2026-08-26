@@ -22,7 +22,7 @@
 # - Codex never receives REVIEW_CLASSIFIER_API_KEY, GITHUB_TOKEN, or AGENT_PR_PAT.
 # - Merge is never performed.
 # - Repair never runs against the default branch or a pull_request merge SHA.
-# - Task Spec allowed_paths only select application toolchains and dependencies.
+# - Pull Request changed paths only select application toolchains and dependencies.
 #   They do not gate review, repair, verification, or sandbox steps.
 # - Environment detection uses the trusted orchestrator parser. Node.js remains
 #   unconditional because it installs the Codex CLI.
@@ -161,7 +161,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Detect required application environments
+      - name: Detect changed application environments
         id: environments
         working-directory: ${{ runner.temp }}/orchestrator
         env:
@@ -170,15 +170,16 @@ jobs:
         run: |
           python - <<'PY'
           import os
-          import re
+          from pathlib import Path
 
+          from agent.gitutil import change_path_list, collect_changes
+          from agent.review_loop import _merge_base_sha
           from agent.spec import parse_spec
 
-          paths = tuple(
-              path.replace("\\", "/").strip("/")
-              for path in parse_spec(
-                  os.path.join(os.environ["WORKSPACE_ROOT"], os.environ["SPEC_PATH"])
-              ).allowed_paths
+          workspace = Path(os.environ["WORKSPACE_ROOT"])
+          spec = parse_spec(workspace / os.environ["SPEC_PATH"])
+          paths = change_path_list(
+              collect_changes(workspace, _merge_base_sha(workspace, spec))
           )
           targets = {
               "frontend": "app/frontend",
@@ -187,15 +188,7 @@ jobs:
           }
 
           def overlaps(target: str) -> bool:
-              for path in paths:
-                  literal = re.split(r"[\*\?\[]", path, maxsplit=1)[0].rstrip("/")
-                  if (
-                      literal == target
-                      or literal.startswith(f"{target}/")
-                      or target.startswith(f"{literal}/")
-                  ):
-                      return True
-              return False
+              return any(path == target or path.startswith(f"{target}/") for path in paths)
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for name, target in targets.items():
