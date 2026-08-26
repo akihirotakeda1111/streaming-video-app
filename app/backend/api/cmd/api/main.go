@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/bootstrap"
 	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/config"
@@ -13,7 +16,10 @@ import (
 )
 
 func main() {
-	if err := run(context.Background(), os.LookupEnv, bootstrap.Dependencies{}); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, os.LookupEnv, bootstrap.Dependencies{}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
