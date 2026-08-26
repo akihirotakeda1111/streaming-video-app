@@ -70,8 +70,8 @@ data "aws_iam_policy_document" "api_local_execution" {
 
 data "aws_iam_policy_document" "worker_local_execution" {
   statement {
-    sid     = "AllowQueueConsumption"
-    effect  = "Allow"
+    sid    = "AllowQueueConsumption"
+    effect = "Allow"
     actions = [
       "sqs:ReceiveMessage",
       "sqs:DeleteMessage",

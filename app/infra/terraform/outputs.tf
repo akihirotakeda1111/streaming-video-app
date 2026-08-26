@@ -51,7 +51,7 @@ output "api_local_execution" {
   description = "Non-secret IAM configuration for the local Go API."
   value = {
     policy_arn = aws_iam_policy.api_local_execution.arn
-    user_name   = aws_iam_user.api_local_execution.name
+    user_name  = aws_iam_user.api_local_execution.name
   }
 }
 
@@ -59,6 +59,6 @@ output "worker_local_execution" {
   description = "Non-secret IAM configuration for the local Rust worker."
   value = {
     policy_arn = aws_iam_policy.worker_local_execution.arn
-    user_name   = aws_iam_user.worker_local_execution.name
+    user_name  = aws_iam_user.worker_local_execution.name
   }
 }
