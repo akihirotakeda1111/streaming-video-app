@@ -4,10 +4,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 
 	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/bootstrap"
 	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/config"
+	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/httpapi"
 )
 
 func main() {
@@ -21,6 +23,13 @@ func run(ctx context.Context, lookupEnv config.LookupEnvFunc, deps bootstrap.Dep
 	cfg, err := config.Load(lookupEnv)
 	if err != nil {
 		return err
+	}
+
+	if deps.Server == nil {
+		deps.Server = &http.Server{
+			Addr:    cfg.HTTPAddr,
+			Handler: httpapi.NewRouter(),
+		}
 	}
 
 	return bootstrap.New(cfg, deps).Start(ctx)
