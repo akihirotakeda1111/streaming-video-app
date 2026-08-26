@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,6 +101,30 @@ func TestVideoCreationServiceRejectsInvalidMetadata(t *testing.T) {
 				SizeBytes:   -1,
 			},
 		},
+		{
+			name: "size_too_large",
+			req: CreateVideoRequest{
+				FileName:    "sample.mp4",
+				ContentType: "video/mp4",
+				SizeBytes:   maxSizeBytes + 1,
+			},
+		},
+		{
+			name: "file_name_empty",
+			req: CreateVideoRequest{
+				FileName:    "",
+				ContentType: "video/mp4",
+				SizeBytes:   1,
+			},
+		},
+		{
+			name: "file_name_too_long",
+			req: CreateVideoRequest{
+				FileName:    strings.Repeat("a", maxFileNameLength+1),
+				ContentType: "video/mp4",
+				SizeBytes:   1,
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -126,6 +151,52 @@ func TestVideoCreationServiceRejectsInvalidMetadata(t *testing.T) {
 			}
 			if len(repo.inputs) != 0 {
 				t.Fatal("CreateVideo() persisted invalid input")
+			}
+		})
+	}
+}
+
+func TestVideoCreationServiceAcceptsContractBounds(t *testing.T) {
+	tests := []struct {
+		name string
+		req  CreateVideoRequest
+	}{
+		{
+			name: "size_max",
+			req: CreateVideoRequest{
+				FileName:    "sample.mp4",
+				ContentType: "video/mp4",
+				SizeBytes:   maxSizeBytes,
+			},
+		},
+		{
+			name: "file_name_max",
+			req: CreateVideoRequest{
+				FileName:    strings.Repeat("a", maxFileNameLength),
+				ContentType: "video/mp4",
+				SizeBytes:   1,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &fakeVideoCreationRepo{}
+			svc := &VideoCreationService{
+				repo:         repo,
+				uploadBucket: "input-bucket",
+				uploadTTL:    time.Minute,
+				now:          time.Now,
+				newCanonicalID: func() (persistence.CanonicalUUID, error) {
+					return persistence.CanonicalUUID("11111111-1111-1111-1111-111111111111"), nil
+				},
+			}
+
+			if _, err := svc.CreateVideo(context.Background(), tc.req); err != nil {
+				t.Fatalf("CreateVideo() error = %v, want nil", err)
+			}
+			if len(repo.inputs) != 1 {
+				t.Fatalf("repo input count = %d, want 1", len(repo.inputs))
 			}
 		})
 	}

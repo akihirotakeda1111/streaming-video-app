@@ -7,11 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/persistence"
 )
 
-const defaultUploadTTL = 15 * time.Minute
+const (
+	defaultUploadTTL  = 15 * time.Minute
+	maxFileNameLength = 255
+	maxSizeBytes      = 5368709120 // 5 GiB
+)
 
 // CreateVideoRequest carries the request-domain metadata required to create the upload state.
 type CreateVideoRequest struct {
@@ -116,11 +121,18 @@ func (s *VideoCreationService) CreateVideo(ctx context.Context, req CreateVideoR
 }
 
 func validateCreateVideoRequest(req CreateVideoRequest) error {
+	nameLen := utf8.RuneCountInString(req.FileName)
+	if nameLen < 1 || nameLen > maxFileNameLength {
+		return &ValidationError{Field: "file_name", Reason: "must be between 1 and 255 characters"}
+	}
 	if req.ContentType != "video/mp4" {
 		return &ValidationError{Field: "content_type", Reason: "must be video/mp4"}
 	}
 	if req.SizeBytes <= 0 {
 		return &ValidationError{Field: "size_bytes", Reason: "must be greater than zero"}
+	}
+	if req.SizeBytes > maxSizeBytes {
+		return &ValidationError{Field: "size_bytes", Reason: "must be at most 5 GiB"}
 	}
 	return nil
 }
