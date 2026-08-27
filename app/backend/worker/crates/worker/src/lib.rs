@@ -1,6 +1,7 @@
 //! Configuration and lifecycle support for the Phase 1 encoding worker.
 
 pub mod fakes;
+pub mod runtime;
 
 /// A deterministic representation of wall-clock time used by worker ports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

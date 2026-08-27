@@ -10,7 +10,9 @@ pub struct Message {
 pub struct QueueError(pub String);
 
 pub trait Receive {
-    fn receive(&mut self) -> Result<Option<Message>, QueueError>;
+    fn receive(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<Message>, QueueError>> + Send;
 }
 
 pub trait Delete {

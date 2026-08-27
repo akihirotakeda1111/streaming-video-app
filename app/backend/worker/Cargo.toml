@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.dependencies]
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2.5"
