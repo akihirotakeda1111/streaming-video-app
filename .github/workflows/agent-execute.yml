@@ -22,11 +22,12 @@
 #
 # S3 work-report checkpoint:
 # - Provision terraform/ before enabling this workflow.
-# - Set AGENT_REPORT_AWS_REGION, AGENT_REPORT_BUCKET,
-#   AGENT_REPORT_UPLOAD_ROLE_ARN, and AGENT_REPORT_DOWNLOAD_ROLE_ARN as
-#   repository variables from the agent_report_storage Terraform output.
-# - AWS credentials are requested only after Codex exits. Execute receives an
-#   S3 PutObject-only role; deliver receives an S3 GetObject-only role.
+# - Set AGENT_REPORT_AWS_REGION and AGENT_REPORT_BUCKET as repository variables
+#   from the agent_report_storage Terraform output.
+# - Create access keys for the Terraform-managed upload/download IAM users and
+#   register them as the corresponding AGENT_REPORT_* GitHub repository secrets.
+# - AWS credentials are loaded only after Codex exits. Execute receives an S3
+#   PutObject-only key; deliver receives an S3 GetObject-only key.
 #
 # Concurrency contract:
 # - Execute uses job-level concurrency per task_id with cancel-in-progress: false.
@@ -63,7 +64,6 @@
 # - https://github.com/actions/setup-node
 # - https://github.com/openai/codex-action
 # - https://github.com/aws-actions/configure-aws-credentials
-# - https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
 # - https://docs.aws.amazon.com/cli/latest/reference/s3api/put-object.html
 # - https://docs.aws.amazon.com/cli/latest/reference/s3api/get-object.html
 # - https://docs.github.com/en/rest/pulls/pulls
@@ -170,7 +170,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
     concurrency:
       group: autonomous-agent-${{ needs.parse-spec.outputs.task_id }}
       cancel-in-progress: false
@@ -253,7 +252,8 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
           aws-region: ${{ vars.AGENT_REPORT_AWS_REGION }}
-          role-to-assume: ${{ vars.AGENT_REPORT_UPLOAD_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AGENT_REPORT_UPLOAD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AGENT_REPORT_UPLOAD_AWS_SECRET_ACCESS_KEY }}
 
       - name: Upload work report to S3
         if: ${{ !cancelled() }}
@@ -283,7 +283,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write
       pull-requests: write
       issues: write
     steps:
@@ -336,7 +335,8 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
           aws-region: ${{ vars.AGENT_REPORT_AWS_REGION }}
-          role-to-assume: ${{ vars.AGENT_REPORT_DOWNLOAD_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AGENT_REPORT_DOWNLOAD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AGENT_REPORT_DOWNLOAD_AWS_SECRET_ACCESS_KEY }}
 
       - name: Download work report from S3
         env:

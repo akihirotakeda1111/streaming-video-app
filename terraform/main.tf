@@ -7,12 +7,6 @@ locals {
   object_resource_pattern = "${aws_s3_bucket.agent_report.arn}/${local.object_prefix}*"
 }
 
-resource "aws_iam_openid_connect_provider" "github_actions" {
-  url = "https://token.actions.githubusercontent.com"
-
-  client_id_list = ["sts.amazonaws.com"]
-}
-
 resource "aws_s3_bucket" "agent_report" {
   bucket = local.bucket_name
 }
@@ -61,30 +55,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "agent_report" {
   }
 }
 
-data "aws_iam_policy_document" "github_actions_agent_report_assume" {
-  statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-
-    principals {
-      type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.github_actions.arn]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = [var.github_actions_oidc_subject]
-    }
-  }
-}
-
 data "aws_iam_policy_document" "agent_report_upload" {
   statement {
     effect    = "Allow"
@@ -101,14 +71,12 @@ data "aws_iam_policy_document" "agent_report_download" {
   }
 }
 
-resource "aws_iam_role" "agent_report_upload" {
-  name               = "${local.name_prefix}-upload"
-  assume_role_policy = data.aws_iam_policy_document.github_actions_agent_report_assume.json
+resource "aws_iam_user" "agent_report_upload" {
+  name = "${local.name_prefix}-upload"
 }
 
-resource "aws_iam_role" "agent_report_download" {
-  name               = "${local.name_prefix}-download"
-  assume_role_policy = data.aws_iam_policy_document.github_actions_agent_report_assume.json
+resource "aws_iam_user" "agent_report_download" {
+  name = "${local.name_prefix}-download"
 }
 
 resource "aws_iam_policy" "agent_report_upload" {
@@ -121,12 +89,12 @@ resource "aws_iam_policy" "agent_report_download" {
   policy = data.aws_iam_policy_document.agent_report_download.json
 }
 
-resource "aws_iam_role_policy_attachment" "agent_report_upload" {
-  role       = aws_iam_role.agent_report_upload.name
+resource "aws_iam_user_policy_attachment" "agent_report_upload" {
+  user       = aws_iam_user.agent_report_upload.name
   policy_arn = aws_iam_policy.agent_report_upload.arn
 }
 
-resource "aws_iam_role_policy_attachment" "agent_report_download" {
-  role       = aws_iam_role.agent_report_download.name
+resource "aws_iam_user_policy_attachment" "agent_report_download" {
+  user       = aws_iam_user.agent_report_download.name
   policy_arn = aws_iam_policy.agent_report_download.arn
 }

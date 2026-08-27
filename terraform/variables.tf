@@ -6,14 +6,8 @@ variable "aws_region" {
 
 variable "github_repository" {
   type        = string
-  description = "GitHub repository allowed to exchange work reports with S3."
+  description = "GitHub repository used to scope work-report S3 object keys."
   default     = "akihirotakeda1111/streaming-video-app"
-}
-
-variable "github_actions_oidc_subject" {
-  type        = string
-  description = "Exact GitHub Actions OIDC subject allowed to assume the work-report roles."
-  default     = "repo:akihirotakeda1111/streaming-video-app:ref:refs/heads/dev"
 }
 
 variable "agent_report_retention_days" {
