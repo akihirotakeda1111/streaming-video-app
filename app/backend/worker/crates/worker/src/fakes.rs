@@ -82,7 +82,7 @@ impl FakeQueue {
 }
 
 impl Receive for FakeQueue {
-    fn receive(&mut self) -> Result<Option<Message>, QueueError> {
+    async fn receive(&mut self) -> Result<Option<Message>, QueueError> {
         self.log.push(Call::Receive);
         if let Some(error) = self.receive_failures.pop_front() {
             return Err(QueueError(error));
@@ -297,20 +297,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn queue_redelivers_until_delete_succeeds() {
+    #[tokio::test]
+    async fn queue_redelivers_until_delete_succeeds() {
         let mut queue = FakeQueue::new(CallLog::default());
         queue.push_message(message("r1"));
 
-        assert_eq!(queue.receive().unwrap().unwrap().receipt_handle, "r1");
-        assert_eq!(queue.receive().unwrap().unwrap().receipt_handle, "r1");
+        assert_eq!(queue.receive().await.unwrap().unwrap().receipt_handle, "r1");
+        assert_eq!(queue.receive().await.unwrap().unwrap().receipt_handle, "r1");
 
         queue.fail_delete("delete failed");
         assert!(queue.delete("r1").is_err());
-        assert_eq!(queue.receive().unwrap().unwrap().receipt_handle, "r1");
+        assert_eq!(queue.receive().await.unwrap().unwrap().receipt_handle, "r1");
 
         queue.delete("r1").unwrap();
-        assert!(queue.receive().unwrap().is_none());
+        assert!(queue.receive().await.unwrap().is_none());
     }
 
     #[test]

@@ -35,7 +35,11 @@ impl BlockingRuntime {
 }
 
 trait SqsApi {
-    fn receive(&mut self, queue_url: &str) -> Result<Option<Message>, String>;
+    fn receive(
+        &mut self,
+        queue_url: &str,
+        wait_time_seconds: i32,
+    ) -> impl Future<Output = Result<Option<Message>, String>> + Send;
     fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String>;
 }
 
@@ -45,24 +49,27 @@ pub struct AwsSqsApi {
 }
 
 impl SqsApi for AwsSqsApi {
-    fn receive(&mut self, queue_url: &str) -> Result<Option<Message>, String> {
-        self.runtime.block_on(async {
-            let response = self
-                .client
-                .receive_message()
-                .queue_url(queue_url)
-                .max_number_of_messages(1)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(response
-                .messages
-                .and_then(|messages| messages.into_iter().next())
-                .map(|message| Message {
-                    receipt_handle: message.receipt_handle.unwrap_or_default(),
-                    body: message.body.unwrap_or_default(),
-                }))
-        })
+    async fn receive(
+        &mut self,
+        queue_url: &str,
+        wait_time_seconds: i32,
+    ) -> Result<Option<Message>, String> {
+        let response = self
+            .client
+            .receive_message()
+            .queue_url(queue_url)
+            .max_number_of_messages(1)
+            .wait_time_seconds(wait_time_seconds)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(response
+            .messages
+            .and_then(|messages| messages.into_iter().next())
+            .map(|message| Message {
+                receipt_handle: message.receipt_handle.unwrap_or_default(),
+                body: message.body.unwrap_or_default(),
+            }))
     }
 
     fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String> {
@@ -104,8 +111,11 @@ impl SqsQueue<AwsSqsApi> {
 }
 
 impl<A: SqsApi> Receive for SqsQueue<A> {
-    fn receive(&mut self) -> Result<Option<Message>, QueueError> {
-        self.api.receive(&self.queue_url).map_err(QueueError)
+    async fn receive(&mut self) -> Result<Option<Message>, QueueError> {
+        self.api
+            .receive(&self.queue_url, 20)
+            .await
+            .map_err(QueueError)
     }
 }
 
@@ -126,8 +136,16 @@ mod tests {
         calls: Vec<Vec<String>>,
     }
     impl SqsApi for FakeApi {
-        fn receive(&mut self, queue_url: &str) -> Result<Option<Message>, String> {
-            self.calls.push(vec!["receive".into(), queue_url.into()]);
+        async fn receive(
+            &mut self,
+            queue_url: &str,
+            wait_time_seconds: i32,
+        ) -> Result<Option<Message>, String> {
+            self.calls.push(vec![
+                "receive".into(),
+                queue_url.into(),
+                wait_time_seconds.to_string(),
+            ]);
             Ok(Some(Message {
                 receipt_handle: "receipt".into(),
                 body: "body".into(),
@@ -143,20 +161,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn adapter_always_uses_configured_queue_without_aws() {
+    #[tokio::test]
+    async fn adapter_uses_configured_queue_and_long_polling_without_aws() {
         let mut queue = SqsQueue {
             queue_url: "https://example.test/configured".into(),
             api: FakeApi::default(),
         };
-        assert_eq!(queue.receive().unwrap().unwrap().body, "body");
+        assert_eq!(queue.receive().await.unwrap().unwrap().body, "body");
         queue.delete("receipt").unwrap();
         assert_eq!(
             queue.api.calls,
             vec![
                 vec![
                     "receive".to_string(),
-                    "https://example.test/configured".to_string()
+                    "https://example.test/configured".to_string(),
+                    "20".to_string(),
                 ],
                 vec![
                     "delete".to_string(),
