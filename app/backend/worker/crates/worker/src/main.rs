@@ -1,23 +1,9 @@
-use std::convert::Infallible;
-
-use queue::{Message, sqs::SqsQueue};
+use persistence::postgres::PostgresJobState;
+use queue::sqs::SqsQueue;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
-use worker::runtime::{MessageProcessor, PHASE1_MAX_CONCURRENCY};
-
-#[derive(Clone)]
-struct Phase1Processor;
-
-impl MessageProcessor for Phase1Processor {
-    type Error = Infallible;
-
-    async fn process(&self, _message: Message) -> Result<(), Self::Error> {
-        // Phase 1 task 23 intentionally stops at the replaceable dispatch
-        // boundary. A later task owns parsing, processing, and deletion.
-        warn!("message dispatched; processing pipeline is not installed");
-        Ok(())
-    }
-}
+use tracing::{error, info};
+use worker::claim::AtomicClaimProcessor;
+use worker::runtime::PHASE1_MAX_CONCURRENCY;
 
 async fn shutdown_requested() -> std::io::Result<()> {
     #[cfg(unix)]
@@ -60,6 +46,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let jobs = match PostgresJobState::connect(&config.database_url) {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            error!(%error, "database initialization failed");
+            std::process::exit(1);
+        }
+    };
+    let processor = AtomicClaimProcessor::new(jobs, config.input_bucket.clone());
     let (stop, shutdown) = watch::channel(false);
     tokio::spawn(async move {
         if let Err(error) = shutdown_requested().await {
@@ -71,7 +65,7 @@ async fn main() {
 
     info!(region = %config.aws_region, queue_url = %config.queue_url, max_concurrency = PHASE1_MAX_CONCURRENCY, "worker started");
     if let Err(error) =
-        worker::runtime::run(queue, Phase1Processor, shutdown, PHASE1_MAX_CONCURRENCY).await
+        worker::runtime::run(queue, processor, shutdown, PHASE1_MAX_CONCURRENCY).await
     {
         error!(%error, "worker stopped with an error");
         std::process::exit(1);

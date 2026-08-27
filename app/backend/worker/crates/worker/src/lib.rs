@@ -1,5 +1,6 @@
 //! Configuration and lifecycle support for the Phase 1 encoding worker.
 
+pub mod claim;
 pub mod event;
 pub mod fakes;
 pub mod runtime;
