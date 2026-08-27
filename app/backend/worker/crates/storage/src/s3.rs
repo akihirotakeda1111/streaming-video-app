@@ -1,9 +1,38 @@
 //! Amazon S3 adapter using configured input and output buckets.
 
+use std::future::Future;
+
 use aws_sdk_s3::{Client, primitives::ByteStream};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 
 use crate::{ObjectError, Read, Write};
+
+enum BlockingRuntime {
+    Current,
+    Owned(Runtime),
+}
+
+impl BlockingRuntime {
+    fn connect() -> Result<Self, String> {
+        if Handle::try_current().is_ok() {
+            Ok(Self::Current)
+        } else {
+            Runtime::new()
+                .map(Self::Owned)
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
+        match self {
+            Self::Current => {
+                let handle = Handle::current();
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            Self::Owned(runtime) => runtime.block_on(future),
+        }
+    }
+}
 
 trait S3Api {
     fn get(&mut self, bucket: &str, key: &str) -> Result<Vec<u8>, String>;
@@ -12,7 +41,7 @@ trait S3Api {
 
 pub struct AwsS3Api {
     client: Client,
-    runtime: Runtime,
+    runtime: BlockingRuntime,
 }
 
 impl S3Api for AwsS3Api {
@@ -63,7 +92,7 @@ impl S3Storage<AwsS3Api> {
         input_bucket: impl Into<String>,
         output_bucket: impl Into<String>,
     ) -> Result<Self, ObjectError> {
-        let runtime = Runtime::new().map_err(|error| ObjectError(error.to_string()))?;
+        let runtime = BlockingRuntime::connect().map_err(ObjectError)?;
         let config = runtime.block_on(
             aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .region(aws_config::Region::new(region.to_owned()))
@@ -132,5 +161,19 @@ mod tests {
         assert!(storage.read("other", "source").is_err());
         assert!(storage.write("input", "manifest", b"hls").is_err());
         assert_eq!(storage.api.calls.len(), 2);
+    }
+
+    #[test]
+    fn block_on_creates_a_runtime_outside_tokio() {
+        let runtime = BlockingRuntime::connect().unwrap();
+        assert!(matches!(runtime, BlockingRuntime::Owned(_)));
+        assert_eq!(runtime.block_on(async { 7 }), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_on_reuses_the_current_runtime() {
+        let runtime = BlockingRuntime::connect().unwrap();
+        assert!(matches!(runtime, BlockingRuntime::Current));
+        assert_eq!(runtime.block_on(async { 7 }), 7);
     }
 }

@@ -1,9 +1,38 @@
 //! Amazon SQS adapter using the configured region and queue URL.
 
+use std::future::Future;
+
 use aws_sdk_sqs::Client;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 
 use crate::{Delete, Message, QueueError, Receive};
+
+enum BlockingRuntime {
+    Current,
+    Owned(Runtime),
+}
+
+impl BlockingRuntime {
+    fn connect() -> Result<Self, String> {
+        if Handle::try_current().is_ok() {
+            Ok(Self::Current)
+        } else {
+            Runtime::new()
+                .map(Self::Owned)
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
+        match self {
+            Self::Current => {
+                let handle = Handle::current();
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            Self::Owned(runtime) => runtime.block_on(future),
+        }
+    }
+}
 
 trait SqsApi {
     fn receive(&mut self, queue_url: &str) -> Result<Option<Message>, String>;
@@ -12,7 +41,7 @@ trait SqsApi {
 
 pub struct AwsSqsApi {
     client: Client,
-    runtime: Runtime,
+    runtime: BlockingRuntime,
 }
 
 impl SqsApi for AwsSqsApi {
@@ -58,7 +87,7 @@ pub struct SqsQueue<A = AwsSqsApi> {
 impl SqsQueue<AwsSqsApi> {
     /// Loads the standard AWS credential chain and pins the requested region.
     pub fn new(region: &str, queue_url: impl Into<String>) -> Result<Self, QueueError> {
-        let runtime = Runtime::new().map_err(|error| QueueError(error.to_string()))?;
+        let runtime = BlockingRuntime::connect().map_err(QueueError)?;
         let config = runtime.block_on(
             aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .region(aws_config::Region::new(region.to_owned()))
@@ -136,5 +165,19 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn block_on_creates_a_runtime_outside_tokio() {
+        let runtime = BlockingRuntime::connect().unwrap();
+        assert!(matches!(runtime, BlockingRuntime::Owned(_)));
+        assert_eq!(runtime.block_on(async { 7 }), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_on_reuses_the_current_runtime() {
+        let runtime = BlockingRuntime::connect().unwrap();
+        assert!(matches!(runtime, BlockingRuntime::Current));
+        assert_eq!(runtime.block_on(async { 7 }), 7);
     }
 }
