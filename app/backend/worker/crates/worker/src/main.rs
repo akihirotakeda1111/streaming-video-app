@@ -1,8 +1,9 @@
 use persistence::postgres::PostgresJobState;
 use queue::sqs::SqsQueue;
+use storage::s3::S3Storage;
 use tokio::sync::watch;
 use tracing::{error, info};
-use worker::claim::AtomicClaimProcessor;
+use worker::claim::ProcessingDownloadProcessor;
 use worker::runtime::PHASE1_MAX_CONCURRENCY;
 
 async fn shutdown_requested() -> std::io::Result<()> {
@@ -53,7 +54,23 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let processor = AtomicClaimProcessor::new(jobs, config.input_bucket.clone());
+    let storage = match S3Storage::new(
+        &config.aws_region,
+        config.input_bucket.clone(),
+        config.output_bucket.clone(),
+    ) {
+        Ok(storage) => storage,
+        Err(error) => {
+            error!(error = %error.0, "storage initialization failed");
+            std::process::exit(1);
+        }
+    };
+    let processor = ProcessingDownloadProcessor::new(
+        jobs,
+        storage,
+        config.input_bucket.clone(),
+        config.temporary_directory.clone(),
+    );
     let (stop, shutdown) = watch::channel(false);
     tokio::spawn(async move {
         if let Err(error) = shutdown_requested().await {

@@ -1,13 +1,58 @@
 //! Parse an SQS notification and atomically claim each eligible job.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    fmt, fs, io,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use persistence::{JobState, PersistenceError};
 use queue::Message;
+use storage::{ObjectError, Read};
+use tempfile::Builder;
 use tracing::{info, warn};
 
 use crate::event::parse_notification;
 use crate::runtime::MessageProcessor;
+
+pub const LOCAL_SOURCE_FILENAME: &str = "source.mp4";
+
+#[derive(Debug)]
+pub enum ProcessingError {
+    Persistence(PersistenceError),
+    Storage(ObjectError),
+    Filesystem(io::Error),
+}
+
+impl fmt::Display for ProcessingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Persistence(error) => write!(formatter, "job state: {error}"),
+            Self::Storage(error) => write!(formatter, "source download: {}", error.0),
+            Self::Filesystem(error) => write!(formatter, "work directory: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessingError {}
+
+impl From<PersistenceError> for ProcessingError {
+    fn from(error: PersistenceError) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+impl From<ObjectError> for ProcessingError {
+    fn from(error: ObjectError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<io::Error> for ProcessingError {
+    fn from(error: io::Error) -> Self {
+        Self::Filesystem(error)
+    }
+}
 
 /// Claims `UPLOADING` jobs from parsed S3 notifications. Downstream download
 /// and encoding remain later tasks; this processor never deletes messages.
@@ -47,6 +92,108 @@ impl<J: JobState + Send + 'static> MessageProcessor for AtomicClaimProcessor<J> 
             info!(job_id = %item.job_id, video_id = %item.video_id, "claimed job");
         }
         Ok(())
+    }
+}
+
+/// Claims a notification, durably marks each owned job as processing, and
+/// downloads its canonical source into an isolated temporary directory.
+pub struct ProcessingDownloadProcessor<J, S> {
+    jobs: Arc<Mutex<J>>,
+    storage: Arc<Mutex<S>>,
+    input_bucket: String,
+    temporary_directory: PathBuf,
+}
+
+impl<J, S> Clone for ProcessingDownloadProcessor<J, S> {
+    fn clone(&self) -> Self {
+        Self {
+            jobs: self.jobs.clone(),
+            storage: self.storage.clone(),
+            input_bucket: self.input_bucket.clone(),
+            temporary_directory: self.temporary_directory.clone(),
+        }
+    }
+}
+
+impl<J, S> ProcessingDownloadProcessor<J, S> {
+    pub fn new(
+        jobs: J,
+        storage: S,
+        input_bucket: impl Into<String>,
+        temporary_directory: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            jobs: Arc::new(Mutex::new(jobs)),
+            storage: Arc::new(Mutex::new(storage)),
+            input_bucket: input_bucket.into(),
+            temporary_directory: temporary_directory.into(),
+        }
+    }
+}
+
+impl<J, S> MessageProcessor for ProcessingDownloadProcessor<J, S>
+where
+    J: JobState + Send + 'static,
+    S: Read + Send + 'static,
+{
+    type Error = ProcessingError;
+
+    async fn process(&self, message: Message) -> Result<(), Self::Error> {
+        let owned = {
+            let mut jobs = self.jobs.lock().map_err(|_| {
+                ProcessingError::Persistence(PersistenceError("job state lock poisoned".into()))
+            })?;
+            claim_notification(&mut *jobs, &message.body, &self.input_bucket)?
+        };
+
+        for item in owned {
+            {
+                let mut jobs = self.jobs.lock().map_err(|_| {
+                    ProcessingError::Persistence(PersistenceError("job state lock poisoned".into()))
+                })?;
+                jobs.mark_processing(&item.job_id)?;
+            }
+
+            let work_directory = JobDirectory::create(&self.temporary_directory, &item.job_id)?;
+            let contents = {
+                let mut storage = self.storage.lock().map_err(|_| {
+                    ProcessingError::Storage(ObjectError("storage lock poisoned".into()))
+                })?;
+                storage.read(&item.bucket, &item.key)?
+            };
+            work_directory.write_source(&contents)?;
+            info!(job_id = %item.job_id, bucket = %item.bucket, key = %item.key, "downloaded source");
+        }
+        Ok(())
+    }
+}
+
+struct JobDirectory {
+    directory: tempfile::TempDir,
+}
+
+impl JobDirectory {
+    fn create(root: &Path, job_id: &str) -> io::Result<Self> {
+        fs::create_dir_all(root)?;
+        let safe_id: String = job_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        Ok(Self {
+            directory: Builder::new()
+                .prefix(&format!("job-{safe_id}-"))
+                .tempdir_in(root)?,
+        })
+    }
+
+    fn write_source(&self, contents: &[u8]) -> io::Result<()> {
+        fs::write(self.directory.path().join(LOCAL_SOURCE_FILENAME), contents)
     }
 }
 
