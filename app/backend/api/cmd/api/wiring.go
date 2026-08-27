@@ -33,7 +33,7 @@ func (d *postgresDatabase) PingContext(ctx context.Context) error { return d.db.
 func (d *postgresDatabase) Close() error                          { return d.db.Close() }
 func (d *postgresDatabase) RequiredTables(ctx context.Context) (bool, bool, error) {
 	var videos, jobs *string
-	err := d.db.QueryRowContext(ctx, `SELECT to_regclass('public.videos')::text, to_regclass('public.jobs')::text`).Scan(&videos, &jobs)
+	err := d.db.QueryRowContext(ctx, `SELECT to_regclass('videos')::text, to_regclass('jobs')::text`).Scan(&videos, &jobs)
 	return videos != nil, jobs != nil, err
 }
 
