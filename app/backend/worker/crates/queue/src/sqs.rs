@@ -110,7 +110,7 @@ impl SqsQueue<AwsSqsApi> {
     }
 }
 
-impl<A: SqsApi> Receive for SqsQueue<A> {
+impl<A: SqsApi + Send> Receive for SqsQueue<A> {
     async fn receive(&mut self) -> Result<Option<Message>, QueueError> {
         self.api
             .receive(&self.queue_url, 20)
