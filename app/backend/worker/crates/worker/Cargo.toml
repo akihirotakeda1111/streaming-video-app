@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+encoding = { path = "../encoding" }
+persistence = { path = "../persistence" }
+queue = { path = "../queue" }
+storage = { path = "../storage" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

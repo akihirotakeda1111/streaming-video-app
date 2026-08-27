@@ -1,5 +1,15 @@
 //! Configuration and lifecycle support for the Phase 1 encoding worker.
 
+pub mod fakes;
+
+/// A deterministic representation of wall-clock time used by worker ports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Timestamp(pub u64);
+
+pub trait Clock {
+    fn now(&mut self) -> Timestamp;
+}
+
 use std::{env, fmt, path::PathBuf};
 
 use url::Url;
