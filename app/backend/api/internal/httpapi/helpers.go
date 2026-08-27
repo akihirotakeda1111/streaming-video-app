@@ -38,24 +38,24 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 
 	if err := dec.Decode(dst); err != nil {
 		if isBodyTooLarge(err) {
-			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
+			writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "The request body is invalid.")
 			return false
 		}
-		writeError(w, http.StatusBadRequest, "malformed_json", "request body must be valid JSON")
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "The request body is invalid.")
 		return false
 	}
 
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); err != io.EOF {
 		if err == nil {
-			writeError(w, http.StatusBadRequest, "malformed_json", "request body must contain a single JSON object")
+			writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "The request body is invalid.")
 			return false
 		}
 		if isBodyTooLarge(err) {
-			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
+			writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "The request body is invalid.")
 			return false
 		}
-		writeError(w, http.StatusBadRequest, "malformed_json", "request body must be valid JSON")
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "The request body is invalid.")
 		return false
 	}
 
