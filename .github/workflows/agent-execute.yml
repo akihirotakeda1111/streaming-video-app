@@ -20,15 +20,6 @@
 # - Deliver injects HTTPS auth into the Orchestrator git subprocess only.
 # - Codex subprocess never receives GitHub write credentials.
 #
-# S3 work-report checkpoint:
-# - Provision terraform/ before enabling this workflow.
-# - Set AGENT_REPORT_AWS_REGION and AGENT_REPORT_BUCKET as repository variables
-#   from the agent_report_storage Terraform output.
-# - Create access keys for the Terraform-managed upload/download IAM users and
-#   register them as the corresponding AGENT_REPORT_* GitHub repository secrets.
-# - AWS credentials are loaded only after Codex exits. Execute receives an S3
-#   PutObject-only key; deliver receives an S3 GetObject-only key.
-#
 # Concurrency contract:
 # - Execute uses job-level concurrency per task_id with cancel-in-progress: false.
 # - Official default pending queue is one run (queue: single). queue: max is not used.
@@ -63,9 +54,8 @@
 # - https://github.com/actions/setup-python
 # - https://github.com/actions/setup-node
 # - https://github.com/openai/codex-action
-# - https://github.com/aws-actions/configure-aws-credentials
-# - https://docs.aws.amazon.com/cli/latest/reference/s3api/put-object.html
-# - https://docs.aws.amazon.com/cli/latest/reference/s3api/get-object.html
+# - https://github.com/actions/upload-artifact
+# - https://github.com/actions/download-artifact
 # - https://docs.github.com/en/rest/pulls/pulls
 # - https://docs.github.com/en/rest/issues/labels
 
@@ -243,38 +233,28 @@ jobs:
           GITHUB_TOKEN: ""
         run: python agent/scripts/run-work-unit.py --spec "${{ needs.parse-spec.outputs.spec_path }}" --report-dir "${{ runner.temp }}/agent-report"
 
-      - name: Package work report
+      - name: Upload work report
+        id: upload-work-report
         if: ${{ !cancelled() }}
-        run: tar -C "${{ runner.temp }}/agent-report" -czf "${{ runner.temp }}/agent-report.tar.gz" .
-
-      - name: Configure AWS credentials for work report upload
-        if: ${{ !cancelled() }}
-        uses: aws-actions/configure-aws-credentials@v6.2.3
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
         with:
-          aws-region: ${{ vars.AGENT_REPORT_AWS_REGION }}
-          aws-access-key-id: ${{ secrets.AGENT_REPORT_UPLOAD_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AGENT_REPORT_UPLOAD_AWS_SECRET_ACCESS_KEY }}
+          name: agent-work-${{ needs.parse-spec.outputs.task_id }}
+          path: ${{ runner.temp }}/agent-report
+          if-no-files-found: error
 
-      - name: Upload work report to S3
-        if: ${{ !cancelled() }}
-        env:
-          AGENT_REPORT_BUCKET: ${{ vars.AGENT_REPORT_BUCKET }}
-          AGENT_REPORT_KEY: agent-work/${{ github.repository }}/${{ github.run_id }}/${{ needs.parse-spec.outputs.task_id }}/agent-report.tar.gz
-        run: |
-          for attempt in 1 2; do
-            if aws s3api put-object \
-              --bucket "$AGENT_REPORT_BUCKET" \
-              --key "$AGENT_REPORT_KEY" \
-              --body "${{ runner.temp }}/agent-report.tar.gz" \
-              --content-type application/gzip \
-              --checksum-algorithm SHA256; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 1 ]; then
-              sleep 120
-            fi
-          done
-          exit 1
+      - name: Wait before retrying work report upload
+        if: ${{ !cancelled() && steps.upload-work-report.outcome == 'failure' }}
+        run: sleep 120
+
+      - name: Retry work report upload
+        if: ${{ !cancelled() && steps.upload-work-report.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-work-${{ needs.parse-spec.outputs.task_id }}
+          path: ${{ runner.temp }}/agent-report
+          if-no-files-found: error
+          overwrite: true
 
   deliver:
     name: Deliver commit and pull request
@@ -331,25 +311,11 @@ jobs:
         working-directory: app/frontend
         run: npx playwright install --with-deps
 
-      - name: Configure AWS credentials for work report download
-        uses: aws-actions/configure-aws-credentials@v6.2.3
+      - name: Download work report
+        uses: actions/download-artifact@v7
         with:
-          aws-region: ${{ vars.AGENT_REPORT_AWS_REGION }}
-          aws-access-key-id: ${{ secrets.AGENT_REPORT_DOWNLOAD_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AGENT_REPORT_DOWNLOAD_AWS_SECRET_ACCESS_KEY }}
-
-      - name: Download work report from S3
-        env:
-          AGENT_REPORT_BUCKET: ${{ vars.AGENT_REPORT_BUCKET }}
-          AGENT_REPORT_KEY: agent-work/${{ github.repository }}/${{ github.run_id }}/${{ needs.parse-spec.outputs.task_id }}/agent-report.tar.gz
-        run: |
-          mkdir -p "${{ runner.temp }}/agent-report"
-          aws s3api get-object \
-            --bucket "$AGENT_REPORT_BUCKET" \
-            --key "$AGENT_REPORT_KEY" \
-            --checksum-mode ENABLED \
-            "${{ runner.temp }}/agent-report.tar.gz"
-          tar -C "${{ runner.temp }}/agent-report" -xzf "${{ runner.temp }}/agent-report.tar.gz"
+          name: agent-work-${{ needs.parse-spec.outputs.task_id }}
+          path: ${{ runner.temp }}/agent-report
 
       - name: Commit, push, and open pull request
         env:
