@@ -10,3 +10,5 @@ pub trait JobState {
     fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError>;
     fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError>;
 }
+
+pub mod postgres;

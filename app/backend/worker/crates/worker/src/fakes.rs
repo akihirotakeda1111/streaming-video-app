@@ -188,8 +188,7 @@ impl FakeJobState {
         }
     }
     pub fn add_claim(&mut self, job_id: &str, video_id: &str, claimed: bool) {
-        self.claims
-            .push((job_id.into(), video_id.into(), claimed));
+        self.claims.push((job_id.into(), video_id.into(), claimed));
     }
     pub fn fail_claim(&mut self, message: impl Into<String>) {
         self.claim_failures.push_back(message.into());

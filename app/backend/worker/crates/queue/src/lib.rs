@@ -16,3 +16,5 @@ pub trait Receive {
 pub trait Delete {
     fn delete(&mut self, receipt_handle: &str) -> Result<(), QueueError>;
 }
+
+pub mod sqs;

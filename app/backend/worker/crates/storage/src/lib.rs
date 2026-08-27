@@ -11,3 +11,5 @@ pub trait Read {
 pub trait Write {
     fn write(&mut self, bucket: &str, key: &str, contents: &[u8]) -> Result<(), ObjectError>;
 }
+
+pub mod s3;
