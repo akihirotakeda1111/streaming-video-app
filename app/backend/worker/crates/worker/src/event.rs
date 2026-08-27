@@ -45,8 +45,8 @@ pub fn parse_notification(
 
 fn parse_record(record: &Value, configured_input_bucket: &str) -> Option<WorkItem> {
     let event_name = record.get("eventName")?.as_str()?;
-    if !event_name.starts_with("s3:ObjectCreated:")
-        || event_name["s3:ObjectCreated:".len()..].is_empty()
+    if !event_name.starts_with("ObjectCreated:")
+        || event_name["ObjectCreated:".len()..].is_empty()
     {
         return None;
     }
@@ -118,4 +118,69 @@ fn canonical_uuid(value: &str) -> bool {
                 byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE: &str =
+        include_str!("../../../../../contracts/examples/s3/object-created.json");
+    const INPUT_BUCKET: &str = "streaming-video-input";
+    const SOURCE_KEY: &str =
+        "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4";
+
+    fn expected_work_item() -> WorkItem {
+        WorkItem {
+            bucket: INPUT_BUCKET.to_owned(),
+            key: SOURCE_KEY.to_owned(),
+            video_id: "018f47a2-45c2-7a84-b84f-5f6dd7b5910a".into(),
+            job_id: "018f47a2-4699-7892-9fc0-fbe46d3bbd67".into(),
+        }
+    }
+
+    fn notification(event_name: &str) -> String {
+        format!(
+            r#"{{"Records":[{{"eventName":"{event_name}","s3":{{"bucket":{{"name":"{INPUT_BUCKET}"}},"object":{{"key":"{SOURCE_KEY}"}}}}}}]}}"#
+        )
+    }
+
+    #[test]
+    fn canonical_fixture_produces_the_expected_work_item() {
+        assert_eq!(
+            parse_notification(FIXTURE, INPUT_BUCKET).unwrap(),
+            [expected_work_item()]
+        );
+    }
+
+    #[test]
+    fn accepts_delivered_object_created_event_names() {
+        for event_name in [
+            "ObjectCreated:Put",
+            "ObjectCreated:Post",
+            "ObjectCreated:Copy",
+            "ObjectCreated:CompleteMultipartUpload",
+        ] {
+            assert_eq!(
+                parse_notification(&notification(event_name), INPUT_BUCKET).unwrap(),
+                [expected_work_item()],
+                "{event_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_configuration_prefixed_and_non_created_event_names() {
+        for event_name in [
+            "s3:ObjectCreated:Put",
+            "ObjectCreated:",
+            "ObjectRemoved:Delete",
+        ] {
+            assert_eq!(
+                parse_notification(&notification(event_name), INPUT_BUCKET).unwrap(),
+                [],
+                "{event_name}"
+            );
+        }
+    }
 }
