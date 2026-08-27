@@ -573,6 +573,10 @@ dependencies = [
 name = "worker"
 version = "0.1.0"
 dependencies = [
+ "encoding",
+ "persistence",
+ "queue",
+ "storage",
  "tokio",
  "tracing",
  "tracing-subscriber",

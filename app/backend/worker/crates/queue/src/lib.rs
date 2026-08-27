@@ -1,14 +1,18 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! Queue ports.  The worker depends on these capabilities, not on an SQS SDK.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    pub receipt_handle: String,
+    pub body: String,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueError(pub String);
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+pub trait Receive {
+    fn receive(&mut self) -> Result<Option<Message>, QueueError>;
+}
+
+pub trait Delete {
+    fn delete(&mut self, receipt_handle: &str) -> Result<(), QueueError>;
 }

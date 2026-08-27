@@ -1,14 +1,12 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Job state ports.  State transitions are deliberately separate so callers
+//! cannot accidentally treat a claim or failure as a successful completion.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistenceError(pub String);
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+pub trait JobState {
+    fn claim(&mut self, job_id: &str, video_id: &str) -> Result<bool, PersistenceError>;
+    fn mark_processing(&mut self, job_id: &str) -> Result<(), PersistenceError>;
+    fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError>;
+    fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError>;
 }
