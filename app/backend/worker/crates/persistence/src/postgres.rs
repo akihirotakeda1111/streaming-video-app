@@ -64,7 +64,7 @@ impl<D> PostgresJobState<D> {
 impl<D: Database> PostgresJobState<D> {
     fn set_status(&mut self, job_id: &str, status: JobStatus) -> Result<(), PersistenceError> {
         let changed = self.database.execute(
-            "UPDATE jobs SET status = $1, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $2::uuid",
+            "UPDATE jobs SET status = $1, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $2::text::uuid",
             &[&status.as_contract_value(), &job_id],
         ).map_err(map_error)?;
         require_one(changed)
@@ -76,7 +76,7 @@ impl<D: Database> JobState for PostgresJobState<D> {
         let changed = self
             .database
             .execute(
-                "UPDATE jobs SET status = 'QUEUED', updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid AND video_id = $2::uuid AND status = 'UPLOADING'",
+                "UPDATE jobs SET status = 'QUEUED', updated_at = CURRENT_TIMESTAMP WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND status = 'UPLOADING'",
                 &[&job_id, &video_id],
             )
             .map_err(map_error)?;
@@ -99,7 +99,7 @@ impl<D: Database> JobState for PostgresJobState<D> {
 
     fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError> {
         let changed = self.database.execute(
-            "UPDATE jobs SET status = $1, failure_code = $2, failure_message = $3, updated_at = NOW() WHERE id = $4::uuid",
+            "UPDATE jobs SET status = $1, failure_code = $2, failure_message = $3, updated_at = NOW() WHERE id = $4::text::uuid",
             &[&JobStatus::Failed.as_contract_value(), &"ENCODING_FAILED", &reason, &job_id],
         ).map_err(map_error)?;
         require_one(changed)
@@ -171,8 +171,8 @@ mod tests {
         let statement = &jobs.database.statements[0];
         assert!(statement.contains("UPDATE jobs SET status = 'QUEUED'"));
         assert!(statement.contains("updated_at = CURRENT_TIMESTAMP"));
-        assert!(statement.contains("id = $1::uuid"));
-        assert!(statement.contains("video_id = $2::uuid"));
+        assert!(statement.contains("id = $1::text::uuid"));
+        assert!(statement.contains("video_id = $2::text::uuid"));
         assert!(statement.contains("status = 'UPLOADING'"));
     }
 
@@ -192,6 +192,6 @@ mod tests {
         let statement = &jobs.database.statements[0];
         assert!(statement.contains("failure_code = $2"));
         assert!(statement.contains("failure_message = $3"));
-        assert!(statement.contains("id = $4::uuid"));
+        assert!(statement.contains("id = $4::text::uuid"));
     }
 }
