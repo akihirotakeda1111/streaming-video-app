@@ -71,7 +71,14 @@ func getVideoHandler(service *VideoStatusService) http.HandlerFunc {
 			VideoID: video.VideoID, FileName: video.FileName, ContentType: video.ContentType,
 			SizeBytes: video.SizeBytes,
 			Job:       videoStatusJobResponse{JobID: video.Job.JobID, Status: video.Job.Status, Failure: failure},
-			CreatedAt: video.CreatedAt, UpdatedAt: video.UpdatedAt,
+			CreatedAt: video.CreatedAt, UpdatedAt: videoStatusUpdatedAt(video),
 		})
 	}
+}
+
+func videoStatusUpdatedAt(video persistence.Video) time.Time {
+	if video.Job.UpdatedAt.After(video.UpdatedAt) {
+		return video.Job.UpdatedAt
+	}
+	return video.UpdatedAt
 }
