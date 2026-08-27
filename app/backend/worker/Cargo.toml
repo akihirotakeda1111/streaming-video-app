@@ -8,3 +8,9 @@ members = [
     "crates/storage",
     "crates/persistence",
 ]
+
+[workspace.dependencies]
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = "2.5"
