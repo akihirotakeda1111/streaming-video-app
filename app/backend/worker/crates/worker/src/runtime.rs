@@ -15,7 +15,7 @@ pub trait MessageProcessor: Clone + Send + Sync + 'static {
     fn process(
         &self,
         message: Message,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 #[derive(Debug)]
@@ -76,6 +76,14 @@ where
         tokio::select! {
             biased;
             _ = shutdown.changed() => break,
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(completed) = completed {
+                    record_completion(completed, &mut result);
+                    if result.is_err() {
+                        break 'receiving;
+                    }
+                }
+            }
             received = receiver.receive() => match received {
                 Ok(Some(message)) => {
                     let message_processor = processor.clone();
@@ -115,6 +123,8 @@ mod tests {
     use std::{
         collections::VecDeque,
         convert::Infallible,
+        error::Error,
+        fmt,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -216,6 +226,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn process_failures_are_returned_below_the_concurrency_limit() {
+        #[derive(Clone, Debug)]
+        struct ProcessFailure(&'static str);
+
+        impl fmt::Display for ProcessFailure {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+
+        impl Error for ProcessFailure {}
+
+        #[derive(Clone)]
+        struct FailingProcessor;
+
+        impl MessageProcessor for FailingProcessor {
+            type Error = ProcessFailure;
+
+            async fn process(&self, _message: Message) -> Result<(), Self::Error> {
+                Err(ProcessFailure("encode failed"))
+            }
+        }
+
+        let receiver = ScriptedReceiver {
+            replies: VecDeque::from([Ok(Some(message("one")))]),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let (_stop, shutdown) = watch::channel(false);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run(receiver, FailingProcessor, shutdown, 2),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(error, RunError::Process(ProcessFailure(message)) if message == "encode failed")
+        );
     }
 
     #[tokio::test]
