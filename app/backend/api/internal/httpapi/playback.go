@@ -3,6 +3,7 @@ package httpapi
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -81,7 +82,20 @@ func buildManifestURL(endpoint, bucket string, videoID, jobID persistence.Canoni
 	if err != nil || base.Scheme == "" || base.Host == "" {
 		return "", fmt.Errorf("output S3 endpoint is invalid")
 	}
-	base.Path = strings.TrimRight(base.Path, "/") + "/" + url.PathEscape(bucket) +
-		"/videos/" + url.PathEscape(string(videoID)) + "/jobs/" + url.PathEscape(string(jobID)) + "/hls/index.m3u8"
+	objectPath := "/videos/" + url.PathEscape(string(videoID)) + "/jobs/" + url.PathEscape(string(jobID)) + "/hls/index.m3u8"
+	prefix := strings.TrimRight(base.Path, "/")
+	if isVirtualHostedS3Endpoint(base.Host, bucket) {
+		base.Path = prefix + objectPath
+	} else {
+		base.Path = prefix + "/" + url.PathEscape(bucket) + objectPath
+	}
 	return base.String(), nil
+}
+
+func isVirtualHostedS3Endpoint(host, bucket string) bool {
+	hostname := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostname = h
+	}
+	return strings.HasPrefix(strings.ToLower(hostname), strings.ToLower(bucket)+".s3.")
 }
