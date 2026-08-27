@@ -68,6 +68,8 @@ paths:
                   externalValue: ../examples/api/get-video-response.json
                 completed:
                   externalValue: ../examples/api/get-video-completed-response.json
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -95,6 +97,8 @@ paths:
               examples:
                 default:
                   externalValue: ../examples/api/get-playback-response.json
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
