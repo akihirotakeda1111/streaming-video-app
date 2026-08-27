@@ -2873,6 +2873,7 @@ dependencies = [
  "encoding",
  "persistence",
  "queue",
+ "serde_json",
  "storage",
  "tokio",
  "tracing",
