@@ -122,10 +122,16 @@ pub fn validate_hls_output(work_directory: impl AsRef<Path>) -> Result<HlsOutput
     let playlist = work_directory.join("index.m3u8");
     let root = fs::canonicalize(work_directory)?;
     let playlist_text = fs::read_to_string(&playlist)?;
+    let mut lines = playlist_text.lines();
+    if lines.next().map(str::trim) != Some("#EXTM3U") {
+        return Err(HlsError::InvalidPlaylist(
+            "playlist must start with #EXTM3U".into(),
+        ));
+    }
     let mut segments = Vec::new();
     let mut expected_segment = 0_u32;
 
-    for raw_line in playlist_text.lines() {
+    for raw_line in lines {
         let reference = raw_line.trim();
         if reference.is_empty() {
             continue;
@@ -265,5 +271,15 @@ mod tests {
         );
         let reason = invalid_reason(&directory);
         assert!(reason.contains("unsupported URI-bearing tag"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_playlists_that_do_not_start_with_extm3u() {
+        let directory = layout("segment-00000.ts\n", &["segment-00000.ts"]);
+        let reason = invalid_reason(&directory);
+        assert!(
+            reason.contains("playlist must start with #EXTM3U"),
+            "{reason}"
+        );
     }
 }
