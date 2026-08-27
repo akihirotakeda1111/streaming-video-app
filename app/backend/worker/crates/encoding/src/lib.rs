@@ -123,11 +123,19 @@ pub fn validate_hls_output(work_directory: impl AsRef<Path>) -> Result<HlsOutput
     let root = fs::canonicalize(work_directory)?;
     let playlist_text = fs::read_to_string(&playlist)?;
     let mut segments = Vec::new();
-    let mut first_segment = true;
+    let mut expected_segment = 0_u32;
 
     for raw_line in playlist_text.lines() {
         let reference = raw_line.trim();
-        if reference.is_empty() || reference.starts_with('#') {
+        if reference.is_empty() {
+            continue;
+        }
+        if reference.starts_with('#') {
+            if tag_has_uri_attribute(reference) {
+                return Err(HlsError::InvalidPlaylist(format!(
+                    "unsupported URI-bearing tag: {reference:?}"
+                )));
+            }
             continue;
         }
         let path = Path::new(reference);
@@ -150,12 +158,13 @@ pub fn validate_hls_output(work_directory: impl AsRef<Path>) -> Result<HlsOutput
                 "unexpected media filename: {reference:?}"
             )));
         }
-        if first_segment && reference != "segment-00000.ts" {
-            return Err(HlsError::InvalidPlaylist(
-                "first media segment must be segment-00000.ts".into(),
-            ));
+        let expected_reference = format!("segment-{expected_segment:05}.ts");
+        if reference != expected_reference {
+            return Err(HlsError::InvalidPlaylist(format!(
+                "expected media segment {expected_reference:?}"
+            )));
         }
-        first_segment = false;
+        expected_segment += 1;
 
         let file = fs::canonicalize(work_directory.join(path)).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -195,4 +204,66 @@ fn is_segment_filename(reference: &str) -> bool {
     number.len() == 5 && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+fn tag_has_uri_attribute(tag: &str) -> bool {
+    tag.to_ascii_uppercase().contains("URI=")
+}
+
 pub mod runtime;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(playlist: &str, segments: &[&str]) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("index.m3u8"), playlist).unwrap();
+        for segment in segments {
+            fs::write(directory.path().join(segment), b"ts").unwrap();
+        }
+        directory
+    }
+
+    fn invalid_reason(directory: &tempfile::TempDir) -> String {
+        match validate_hls_output(directory.path()) {
+            Err(HlsError::InvalidPlaylist(reason)) => reason,
+            other => panic!("expected invalid playlist, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_zero_based_sequential_segments() {
+        let directory = layout(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nsegment-00000.ts\n#EXTINF:6.0,\nsegment-00001.ts\n#EXT-X-ENDLIST\n",
+            &["segment-00000.ts", "segment-00001.ts"],
+        );
+        let output = validate_hls_output(directory.path()).unwrap();
+        assert_eq!(output.segments.len(), 2);
+    }
+
+    #[test]
+    fn rejects_duplicate_skipped_and_out_of_order_segments() {
+        for playlist in [
+            "#EXTM3U\nsegment-00000.ts\nsegment-00000.ts\n",
+            "#EXTM3U\nsegment-00000.ts\nsegment-00002.ts\n",
+            "#EXTM3U\nsegment-00001.ts\n",
+        ] {
+            let directory =
+                layout(playlist, &["segment-00000.ts", "segment-00001.ts", "segment-00002.ts"]);
+            let reason = invalid_reason(&directory);
+            assert!(
+                reason.contains("expected media segment"),
+                "{playlist:?} -> {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_uri_bearing_tags() {
+        let directory = layout(
+            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://example.com/key\"\nsegment-00000.ts\n",
+            &["segment-00000.ts"],
+        );
+        let reason = invalid_reason(&directory);
+        assert!(reason.contains("unsupported URI-bearing tag"), "{reason}");
+    }
+}
