@@ -31,11 +31,6 @@ trait Database {
         statement: &str,
         parameters: &[&(dyn ToSql + Sync)],
     ) -> Result<u64, postgres::Error>;
-    fn exists(
-        &mut self,
-        statement: &str,
-        parameters: &[&(dyn ToSql + Sync)],
-    ) -> Result<bool, postgres::Error>;
 }
 
 impl Database for Client {
@@ -45,14 +40,6 @@ impl Database for Client {
         parameters: &[&(dyn ToSql + Sync)],
     ) -> Result<u64, postgres::Error> {
         Client::execute(self, statement, parameters)
-    }
-
-    fn exists(
-        &mut self,
-        statement: &str,
-        parameters: &[&(dyn ToSql + Sync)],
-    ) -> Result<bool, postgres::Error> {
-        self.query_one(statement, parameters)?.try_get(0)
     }
 }
 
@@ -86,10 +73,20 @@ impl<D: Database> PostgresJobState<D> {
 
 impl<D: Database> JobState for PostgresJobState<D> {
     fn claim(&mut self, job_id: &str, video_id: &str) -> Result<bool, PersistenceError> {
-        self.database.exists(
-            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1::uuid AND video_id = $2::uuid AND status = $3)",
-            &[&job_id, &video_id, &JobStatus::Queued.as_contract_value()],
-        ).map_err(map_error)
+        let changed = self
+            .database
+            .execute(
+                "UPDATE jobs SET status = 'QUEUED', updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid AND video_id = $2::uuid AND status = 'UPLOADING'",
+                &[&job_id, &video_id],
+            )
+            .map_err(map_error)?;
+        match changed {
+            1 => Ok(true),
+            0 => Ok(false),
+            count => Err(PersistenceError(format!(
+                "updated {count} jobs; expected one"
+            ))),
+        }
     }
 
     fn mark_processing(&mut self, job_id: &str) -> Result<(), PersistenceError> {
@@ -127,10 +124,18 @@ fn map_error(error: postgres::Error) -> PersistenceError {
 mod tests {
     use super::*;
 
-    #[derive(Default)]
     struct FakeDatabase {
         statements: Vec<String>,
-        exists: bool,
+        changed: u64,
+    }
+
+    impl Default for FakeDatabase {
+        fn default() -> Self {
+            Self {
+                statements: Vec::new(),
+                changed: 1,
+            }
+        }
     }
 
     impl Database for FakeDatabase {
@@ -140,16 +145,7 @@ mod tests {
             _parameters: &[&(dyn ToSql + Sync)],
         ) -> Result<u64, postgres::Error> {
             self.statements.push(statement.into());
-            Ok(1)
-        }
-
-        fn exists(
-            &mut self,
-            statement: &str,
-            _parameters: &[&(dyn ToSql + Sync)],
-        ) -> Result<bool, postgres::Error> {
-            self.statements.push(statement.into());
-            Ok(self.exists)
+            Ok(self.changed)
         }
     }
 
@@ -169,16 +165,24 @@ mod tests {
     }
 
     #[test]
-    fn job_and_video_identifiers_are_both_used_for_claim_lookup() {
-        let mut jobs = PostgresJobState::new(FakeDatabase {
-            exists: true,
-            ..Default::default()
-        });
+    fn claim_uses_conditional_upload_to_queued_update() {
+        let mut jobs = PostgresJobState::new(FakeDatabase::default());
         assert!(jobs.claim("job-id", "video-id").unwrap());
         let statement = &jobs.database.statements[0];
+        assert!(statement.contains("UPDATE jobs SET status = 'QUEUED'"));
+        assert!(statement.contains("updated_at = CURRENT_TIMESTAMP"));
         assert!(statement.contains("id = $1::uuid"));
         assert!(statement.contains("video_id = $2::uuid"));
-        assert!(statement.contains("status = $3"));
+        assert!(statement.contains("status = 'UPLOADING'"));
+    }
+
+    #[test]
+    fn zero_row_claim_is_a_safe_no_op() {
+        let mut jobs = PostgresJobState::new(FakeDatabase {
+            changed: 0,
+            ..FakeDatabase::default()
+        });
+        assert!(!jobs.claim("job-id", "video-id").unwrap());
     }
 
     #[test]
