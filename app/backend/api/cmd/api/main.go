@@ -4,15 +4,12 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/bootstrap"
 	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/config"
-	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/httpapi"
 )
 
 const (
@@ -26,28 +23,23 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, os.LookupEnv, bootstrap.Dependencies{}); err != nil {
+	if err := run(ctx, os.LookupEnv, defaultRuntimeFactories()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, lookupEnv config.LookupEnvFunc, deps bootstrap.Dependencies) error {
+func run(ctx context.Context, lookupEnv config.LookupEnvFunc, factories runtimeFactories) error {
 	cfg, err := config.Load(lookupEnv)
 	if err != nil {
 		return err
 	}
 
-	if deps.Server == nil {
-		deps.Server = &http.Server{
-			Addr:              cfg.HTTPAddr,
-			Handler:           httpapi.NewRouter(),
-			ReadHeaderTimeout: readHeaderTimeout,
-			ReadTimeout:       readTimeout,
-			WriteTimeout:      writeTimeout,
-			IdleTimeout:       idleTimeout,
-		}
+	runtime, db, err := buildRuntime(ctx, cfg, factories)
+	if err != nil {
+		return err
 	}
+	defer db.Close()
 
-	return bootstrap.New(cfg, deps).Start(ctx)
+	return runtime.Start(ctx)
 }
