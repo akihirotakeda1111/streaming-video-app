@@ -26,7 +26,10 @@ pub enum Call {
         key: String,
         contents: Vec<u8>,
     },
-    Claim(String),
+    Claim {
+        job_id: String,
+        video_id: String,
+    },
     MarkProcessing(String),
     MarkCompleted(String),
     MarkFailed {
@@ -81,18 +84,22 @@ impl FakeQueue {
 impl Receive for FakeQueue {
     fn receive(&mut self) -> Result<Option<Message>, QueueError> {
         self.log.push(Call::Receive);
-        self.receive_failures
-            .pop_front()
-            .map_or_else(|| Ok(self.messages.pop_front()), |e| Err(QueueError(e)))
+        if let Some(error) = self.receive_failures.pop_front() {
+            return Err(QueueError(error));
+        }
+        Ok(self.messages.front().cloned())
     }
 }
 
 impl Delete for FakeQueue {
     fn delete(&mut self, receipt_handle: &str) -> Result<(), QueueError> {
         self.log.push(Call::Delete(receipt_handle.into()));
-        self.delete_failures
-            .pop_front()
-            .map_or(Ok(()), |e| Err(QueueError(e)))
+        if let Some(error) = self.delete_failures.pop_front() {
+            return Err(QueueError(error));
+        }
+        self.messages
+            .retain(|message| message.receipt_handle != receipt_handle);
+        Ok(())
     }
 }
 
@@ -162,8 +169,11 @@ impl Write for FakeStorage {
 #[derive(Debug)]
 pub struct FakeJobState {
     pub log: CallLog,
-    pub claims: Vec<(String, bool)>,
-    failures: VecDeque<String>,
+    pub claims: Vec<(String, String, bool)>,
+    claim_failures: VecDeque<String>,
+    processing_failures: VecDeque<String>,
+    completed_failures: VecDeque<String>,
+    mark_failed_failures: VecDeque<String>,
 }
 
 impl FakeJobState {
@@ -171,46 +181,63 @@ impl FakeJobState {
         Self {
             log,
             claims: Vec::new(),
-            failures: VecDeque::new(),
+            claim_failures: VecDeque::new(),
+            processing_failures: VecDeque::new(),
+            completed_failures: VecDeque::new(),
+            mark_failed_failures: VecDeque::new(),
         }
     }
-    pub fn add_claim(&mut self, job_id: &str, claimed: bool) {
-        self.claims.push((job_id.into(), claimed));
+    pub fn add_claim(&mut self, job_id: &str, video_id: &str, claimed: bool) {
+        self.claims
+            .push((job_id.into(), video_id.into(), claimed));
     }
-    pub fn fail_next(&mut self, message: impl Into<String>) {
-        self.failures.push_back(message.into());
+    pub fn fail_claim(&mut self, message: impl Into<String>) {
+        self.claim_failures.push_back(message.into());
     }
-    fn result(&mut self) -> Result<(), PersistenceError> {
-        self.failures
-            .pop_front()
-            .map_or(Ok(()), |e| Err(PersistenceError(e)))
+    pub fn fail_mark_processing(&mut self, message: impl Into<String>) {
+        self.processing_failures.push_back(message.into());
+    }
+    pub fn fail_mark_completed(&mut self, message: impl Into<String>) {
+        self.completed_failures.push_back(message.into());
+    }
+    pub fn fail_mark_failed(&mut self, message: impl Into<String>) {
+        self.mark_failed_failures.push_back(message.into());
     }
 }
 
+fn take_failure(failures: &mut VecDeque<String>) -> Result<(), PersistenceError> {
+    failures
+        .pop_front()
+        .map_or(Ok(()), |e| Err(PersistenceError(e)))
+}
+
 impl JobState for FakeJobState {
-    fn claim(&mut self, job_id: &str) -> Result<bool, PersistenceError> {
-        self.log.push(Call::Claim(job_id.into()));
-        self.result()?;
+    fn claim(&mut self, job_id: &str, video_id: &str) -> Result<bool, PersistenceError> {
+        self.log.push(Call::Claim {
+            job_id: job_id.into(),
+            video_id: video_id.into(),
+        });
+        take_failure(&mut self.claim_failures)?;
         Ok(self
             .claims
             .iter()
-            .find(|(id, _)| id == job_id)
-            .map_or(true, |(_, claimed)| *claimed))
+            .find(|(id, vid, _)| id == job_id && vid == video_id)
+            .map_or(true, |(_, _, claimed)| *claimed))
     }
     fn mark_processing(&mut self, job_id: &str) -> Result<(), PersistenceError> {
         self.log.push(Call::MarkProcessing(job_id.into()));
-        self.result()
+        take_failure(&mut self.processing_failures)
     }
     fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError> {
         self.log.push(Call::MarkCompleted(job_id.into()));
-        self.result()
+        take_failure(&mut self.completed_failures)
     }
     fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError> {
         self.log.push(Call::MarkFailed {
             job_id: job_id.into(),
             reason: reason.into(),
         });
-        self.result()
+        take_failure(&mut self.mark_failed_failures)
     }
 }
 
@@ -255,5 +282,61 @@ impl Execute for FakeProcessExecutor {
         self.failures
             .pop_front()
             .map_or_else(|| Ok(self.output.clone()), |e| Err(ProcessError(e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use persistence::JobState;
+    use queue::{Delete, Message, Receive};
+
+    fn message(receipt_handle: &str) -> Message {
+        Message {
+            receipt_handle: receipt_handle.into(),
+            body: "body".into(),
+        }
+    }
+
+    #[test]
+    fn queue_redelivers_until_delete_succeeds() {
+        let mut queue = FakeQueue::new(CallLog::default());
+        queue.push_message(message("r1"));
+
+        assert_eq!(queue.receive().unwrap().unwrap().receipt_handle, "r1");
+        assert_eq!(queue.receive().unwrap().unwrap().receipt_handle, "r1");
+
+        queue.fail_delete("delete failed");
+        assert!(queue.delete("r1").is_err());
+        assert_eq!(queue.receive().unwrap().unwrap().receipt_handle, "r1");
+
+        queue.delete("r1").unwrap();
+        assert!(queue.receive().unwrap().is_none());
+    }
+
+    #[test]
+    fn claim_records_job_and_video_ids() {
+        let log = CallLog::default();
+        let mut jobs = FakeJobState::new(log.clone());
+        jobs.add_claim("job-1", "video-1", true);
+
+        assert!(jobs.claim("job-1", "video-1").unwrap());
+        assert_eq!(
+            log.calls(),
+            [Call::Claim {
+                job_id: "job-1".into(),
+                video_id: "video-1".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn job_state_failures_are_operation_specific() {
+        let mut jobs = FakeJobState::new(CallLog::default());
+        jobs.fail_mark_processing("processing failed");
+
+        assert!(jobs.claim("job-1", "video-1").unwrap());
+        assert!(jobs.mark_processing("job-1").is_err());
+        jobs.mark_completed("job-1").unwrap();
     }
 }
