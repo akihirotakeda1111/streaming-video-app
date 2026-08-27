@@ -19,9 +19,9 @@ func NewRouterWithVideoCreation(service *VideoCreationService) http.Handler {
 }
 
 // NewRouterWithServices builds the routes with the injected API services.
-func NewRouterWithServices(creation *VideoCreationService, status *VideoStatusService) http.Handler {
+func NewRouterWithServices(creation *VideoCreationService, status *VideoStatusService, playback ...*VideoPlaybackService) http.Handler {
 	mux := http.NewServeMux()
-	RegisterContractRoutesWithServices(mux, creation, status)
+	RegisterContractRoutesWithServices(mux, creation, status, playback...)
 	return withRequestSizeLimit(mux)
 }
 
@@ -35,7 +35,7 @@ func RegisterContractRoutesWithVideoCreation(mux *http.ServeMux, service *VideoC
 }
 
 // RegisterContractRoutesWithServices registers the API routes onto a mux.
-func RegisterContractRoutesWithServices(mux *http.ServeMux, creation *VideoCreationService, status *VideoStatusService) {
+func RegisterContractRoutesWithServices(mux *http.ServeMux, creation *VideoCreationService, status *VideoStatusService, playback ...*VideoPlaybackService) {
 	mux.HandleFunc("GET /api/v1/health", healthHandler)
 	if creation != nil {
 		mux.HandleFunc("POST /api/v1/videos", createVideoHandler(creation))
@@ -43,11 +43,19 @@ func RegisterContractRoutesWithServices(mux *http.ServeMux, creation *VideoCreat
 	if status != nil {
 		mux.HandleFunc("GET /api/v1/videos/{videoId}", getVideoHandler(status))
 	}
+	if len(playback) > 0 && playback[0] != nil {
+		mux.HandleFunc("GET /api/v1/videos/{videoId}/playback", getVideoPlaybackHandler(playback[0]))
+	}
 }
 
 // NewRouterWithVideoStatus builds the routes needed to read video status.
 func NewRouterWithVideoStatus(repo persistence.Repository) http.Handler {
 	return NewRouterWithServices(nil, NewVideoStatusService(repo))
+}
+
+// NewRouterWithVideoPlayback builds the route needed to resolve HLS playback.
+func NewRouterWithVideoPlayback(repo persistence.Repository, outputBucket, outputEndpoint string) http.Handler {
+	return NewRouterWithServices(nil, nil, NewVideoPlaybackService(repo, outputBucket, outputEndpoint))
 }
 
 func withRequestSizeLimit(next http.Handler) http.Handler {
