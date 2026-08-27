@@ -109,6 +109,9 @@ func buildRuntime(ctx context.Context, cfg config.Config, factories runtimeFacto
 	if err != nil {
 		return nil, nil, fmt.Errorf("load AWS configuration: %w", err)
 	}
+	if err := verifyAWSCredentials(checkCtx, awsCfg); err != nil {
+		return nil, nil, fmt.Errorf("retrieve AWS credentials: %w", err)
+	}
 	repo, err := factories.newRepository(db)
 	if err != nil || repo == nil {
 		if err == nil {
@@ -131,6 +134,16 @@ func buildRuntime(ctx context.Context, cfg config.Config, factories runtimeFacto
 	}
 	ok = true
 	return bootstrap.New(cfg, bootstrap.Dependencies{Server: server}), db, nil
+}
+
+func verifyAWSCredentials(ctx context.Context, cfg aws.Config) error {
+	if cfg.Credentials == nil {
+		return errors.New("AWS credentials provider is required")
+	}
+	if _, err := cfg.Credentials.Retrieve(ctx); err != nil {
+		return err
+	}
+	return nil
 }
 
 func verifySchema(ctx context.Context, db databaseHandle) error {

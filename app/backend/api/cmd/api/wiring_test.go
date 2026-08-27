@@ -30,7 +30,7 @@ func TestBuildRuntimeWiresCreateVideoRoute(t *testing.T) {
 		},
 		loadAWSConfig: func(_ context.Context, region string) (aws.Config, error) {
 			gotRegion = region
-			return aws.Config{}, nil
+			return testAWSConfig(), nil
 		},
 		newRepository: func(databaseHandle) (persistence.Repository, error) { return fakeRepository{}, nil },
 		newPresigner: func(_ aws.Config, bucket string) (httpapi.UploadPresigner, error) {
@@ -63,21 +63,31 @@ func TestBuildRuntimeWiresCreateVideoRoute(t *testing.T) {
 }
 
 func TestBuildRuntimeFailsBeforeServerAndClosesDatabase(t *testing.T) {
+	retrieveErr := errors.New("no credentials")
 	tests := []struct {
 		name    string
 		db      *fakeDatabase
 		loadErr error
+		awsCfg  aws.Config
 	}{
 		{name: "connectivity", db: &fakeDatabase{pingErr: errors.New("offline")}},
 		{name: "schema", db: &fakeDatabase{videos: true, jobs: false}},
 		{name: "aws config", db: &fakeDatabase{videos: true, jobs: true}, loadErr: errors.New("bad aws config")},
+		{name: "aws credentials missing", db: &fakeDatabase{videos: true, jobs: true}},
+		{
+			name:   "aws credentials retrieve",
+			db:     &fakeDatabase{videos: true, jobs: true},
+			awsCfg: aws.Config{Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) { return aws.Credentials{}, retrieveErr })},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			serverBuilt := false
 			factories := runtimeFactories{
-				openDatabase:  func(string) (databaseHandle, error) { return tt.db, nil },
-				loadAWSConfig: func(context.Context, string) (aws.Config, error) { return aws.Config{}, tt.loadErr },
+				openDatabase: func(string) (databaseHandle, error) { return tt.db, nil },
+				loadAWSConfig: func(context.Context, string) (aws.Config, error) {
+					return tt.awsCfg, tt.loadErr
+				},
 				newRepository: func(databaseHandle) (persistence.Repository, error) { return fakeRepository{}, nil },
 				newPresigner:  func(aws.Config, string) (httpapi.UploadPresigner, error) { return fakePresigner{}, nil },
 				newHTTPServer: func(string, http.Handler) bootstrap.HTTPServer { serverBuilt = true; return &capturingServer{} },
@@ -97,6 +107,14 @@ func TestBuildRuntimeFailsBeforeServerAndClosesDatabase(t *testing.T) {
 
 func testConfig() config.Config {
 	return config.Config{HTTPAddr: "127.0.0.1:8080", DatabaseURL: "postgres://db/app", AWSRegion: "ap-northeast-1", InputBucket: "video-input-test"}
+}
+
+func testAWSConfig() aws.Config {
+	return aws.Config{
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "AKID", SecretAccessKey: "SECRET", Source: "test"}, nil
+		}),
+	}
 }
 
 type fakeDatabase struct {
