@@ -130,15 +130,44 @@ fn validate_postgres_url(value: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_region(value: &str) -> Result<(), ConfigError> {
-    let valid = (1..=32).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if valid {
+    if is_aws_region(value) {
         Ok(())
     } else {
         Err(ConfigError::invalid(AWS_REGION, "is malformed"))
     }
+}
+
+fn is_aws_region(value: &str) -> bool {
+    if !(2..=32).contains(&value.len()) {
+        return false;
+    }
+    let Some((prefix, number)) = value.rsplit_once('-') else {
+        return false;
+    };
+    if number.as_bytes().first() == Some(&b'0')
+        || number.is_empty()
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+        || number.parse::<u32>().ok().is_none_or(|n| n == 0)
+    {
+        return false;
+    }
+
+    let mut parts = prefix.split('-');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if first.is_empty() || !first.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return false;
+    }
+
+    let mut extra_alpha_parts = 0;
+    for part in parts {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_lowercase()) {
+            return false;
+        }
+        extra_alpha_parts += 1;
+    }
+    extra_alpha_parts >= 1
 }
 
 fn validate_http_url(variable: &'static str, value: &str) -> Result<(), ConfigError> {
@@ -232,5 +261,25 @@ mod tests {
         let mut values = valid();
         values.insert(OUTPUT_BUCKET, "video-input".into());
         assert!(Config::from_lookup(|name| values.get(name).cloned()).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_aws_regions() {
+        for region in ["-", "123", "a", "---", "us--east-1", "us-east-0", "ap-1"] {
+            let mut values = valid();
+            values.insert(AWS_REGION, region.into());
+            let error = Config::from_lookup(|name| values.get(name).cloned()).unwrap_err();
+            assert_eq!(error.variable, AWS_REGION, "region {region:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_structured_aws_regions() {
+        for region in ["ap-northeast-1", "us-east-1", "us-gov-west-1"] {
+            let mut values = valid();
+            values.insert(AWS_REGION, region.into());
+            Config::from_lookup(|name| values.get(name).cloned())
+                .unwrap_or_else(|_| panic!("expected {region} to be accepted"));
+        }
     }
 }
