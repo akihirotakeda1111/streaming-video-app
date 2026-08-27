@@ -217,11 +217,20 @@ impl JobState for FakeJobState {
             video_id: video_id.into(),
         });
         take_failure(&mut self.claim_failures)?;
-        Ok(self
+        let Some((_, _, claimed)) = self
             .claims
-            .iter()
+            .iter_mut()
             .find(|(id, vid, _)| id == job_id && vid == video_id)
-            .map_or(true, |(_, _, claimed)| *claimed))
+        else {
+            return Ok(false);
+        };
+
+        if *claimed {
+            *claimed = false;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
     fn mark_processing(&mut self, job_id: &str) -> Result<(), PersistenceError> {
         self.log.push(Call::MarkProcessing(job_id.into()));
@@ -332,10 +341,21 @@ mod tests {
     #[test]
     fn job_state_failures_are_operation_specific() {
         let mut jobs = FakeJobState::new(CallLog::default());
+        jobs.add_claim("job-1", "video-1", true);
         jobs.fail_mark_processing("processing failed");
 
         assert!(jobs.claim("job-1", "video-1").unwrap());
         assert!(jobs.mark_processing("job-1").is_err());
         jobs.mark_completed("job-1").unwrap();
+    }
+
+    #[test]
+    fn duplicate_claims_and_missing_jobs_are_no_ops() {
+        let mut jobs = FakeJobState::new(CallLog::default());
+        jobs.add_claim("job-1", "video-1", true);
+
+        assert!(jobs.claim("job-1", "video-1").unwrap());
+        assert!(!jobs.claim("job-1", "video-1").unwrap());
+        assert!(!jobs.claim("missing", "video-1").unwrap());
     }
 }
