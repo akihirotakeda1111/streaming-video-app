@@ -125,11 +125,14 @@ mod tests {
         assert_eq!(
             queue.api.calls,
             vec![
-                vec!["receive".into(), "https://example.test/configured".into()],
                 vec![
-                    "delete".into(),
-                    "https://example.test/configured".into(),
-                    "receipt".into()
+                    "receive".to_string(),
+                    "https://example.test/configured".to_string()
+                ],
+                vec![
+                    "delete".to_string(),
+                    "https://example.test/configured".to_string(),
+                    "receipt".to_string()
                 ],
             ]
         );
