@@ -19,6 +19,22 @@ impl MessageProcessor for Phase1Processor {
     }
 }
 
+async fn shutdown_requested() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 /// Starts the single bounded Phase 1 worker process.
 #[tokio::main]
 async fn main() {
@@ -46,8 +62,9 @@ async fn main() {
     };
     let (stop, shutdown) = watch::channel(false);
     tokio::spawn(async move {
-        if let Err(error) = tokio::signal::ctrl_c().await {
+        if let Err(error) = shutdown_requested().await {
             error!(%error, "cancellation signal failed");
+            std::process::exit(1);
         }
         let _ = stop.send(true);
     });
