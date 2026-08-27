@@ -14,6 +14,7 @@ import (
 func TestPostgresRepositoryCreateVideoCommitsBothRecords(t *testing.T) {
 	createdAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 	updatedAt := createdAt.Add(2 * time.Minute)
+	input := testCreateVideoInput(createdAt)
 	db := &fakeRepositoryDB{
 		tx: &fakeRepositoryTx{
 			rows: []fakeRow{
@@ -25,18 +26,7 @@ func TestPostgresRepositoryCreateVideoCommitsBothRecords(t *testing.T) {
 
 	repo := &PostgresRepository{db: db}
 
-	got, err := repo.CreateVideo(context.Background(), CreateVideoInput{
-		VideoID:     CanonicalUUID("11111111-1111-1111-1111-111111111111"),
-		JobID:       CanonicalUUID("22222222-2222-2222-2222-222222222222"),
-		FileName:    "sample.mp4",
-		ContentType: "video/mp4",
-		SizeBytes:   12345,
-		Upload: UploadMetadata{
-			Bucket:    "input-bucket",
-			Key:       "uploads/sample.mp4",
-			ExpiresAt: createdAt.Add(time.Hour),
-		},
-	})
+	got, err := repo.CreateVideo(context.Background(), input)
 	if err != nil {
 		t.Fatalf("CreateVideo() error = %v", err)
 	}
@@ -50,26 +40,38 @@ func TestPostgresRepositoryCreateVideoCommitsBothRecords(t *testing.T) {
 	if len(db.tx.calls) != 2 {
 		t.Fatalf("transaction call count = %d, want 2", len(db.tx.calls))
 	}
-	if !strings.Contains(db.tx.calls[0], "INSERT INTO videos") {
-		t.Fatalf("first statement = %q, want video insert", db.tx.calls[0])
+	if !strings.Contains(db.tx.calls[0].SQL, "INSERT INTO videos") {
+		t.Fatalf("first statement = %q, want video insert", db.tx.calls[0].SQL)
 	}
-	if !strings.Contains(db.tx.calls[1], "INSERT INTO jobs") {
-		t.Fatalf("second statement = %q, want job insert", db.tx.calls[1])
+	assertPlaceholders(t, db.tx.calls[0].SQL, 7)
+	assertSQLArgs(t, db.tx.calls[0].Args,
+		input.VideoID,
+		input.FileName,
+		input.ContentType,
+		input.SizeBytes,
+		input.Upload.Bucket,
+		input.Upload.Key,
+		input.Upload.ExpiresAt,
+	)
+	if !strings.Contains(db.tx.calls[1].SQL, "INSERT INTO jobs") {
+		t.Fatalf("second statement = %q, want job insert", db.tx.calls[1].SQL)
 	}
+	assertPlaceholders(t, db.tx.calls[1].SQL, 3)
+	assertSQLArgs(t, db.tx.calls[1].Args, input.JobID, input.VideoID, JobStatusUploading)
 
-	if got.VideoID != "11111111-1111-1111-1111-111111111111" {
+	if got.VideoID != input.VideoID {
 		t.Fatalf("VideoID = %q, want canonical UUID", got.VideoID)
 	}
-	if got.Job.JobID != "22222222-2222-2222-2222-222222222222" {
+	if got.Job.JobID != input.JobID {
 		t.Fatalf("Job.JobID = %q, want canonical UUID", got.Job.JobID)
 	}
 	if got.Job.Status != JobStatusUploading {
 		t.Fatalf("Job.Status = %q, want %q", got.Job.Status, JobStatusUploading)
 	}
-	if got.FileName != "sample.mp4" || got.ContentType != "video/mp4" || got.SizeBytes != 12345 {
+	if got.FileName != input.FileName || got.ContentType != input.ContentType || got.SizeBytes != input.SizeBytes {
 		t.Fatalf("CreateVideo() returned wrong video metadata: %#v", got)
 	}
-	if got.Upload.Bucket != "input-bucket" || got.Upload.Key != "uploads/sample.mp4" {
+	if got.Upload.Bucket != input.Upload.Bucket || got.Upload.Key != input.Upload.Key {
 		t.Fatalf("CreateVideo() returned wrong upload metadata: %#v", got.Upload)
 	}
 	if !got.CreatedAt.Equal(createdAt) || !got.UpdatedAt.Equal(updatedAt) {
@@ -80,7 +82,50 @@ func TestPostgresRepositoryCreateVideoCommitsBothRecords(t *testing.T) {
 	}
 }
 
+func TestPostgresRepositoryCreateVideoBeginTxFailure(t *testing.T) {
+	db := &fakeRepositoryDB{beginErr: errors.New("too many connections")}
+	repo := &PostgresRepository{db: db}
+
+	_, err := repo.CreateVideo(context.Background(), testCreateVideoInput(time.Unix(1, 0).UTC()))
+	if err == nil {
+		t.Fatal("CreateVideo() error = nil, want begin failure")
+	}
+	if !strings.Contains(err.Error(), "begin transaction") {
+		t.Fatalf("CreateVideo() error = %q, want begin failure", err)
+	}
+}
+
+func TestPostgresRepositoryCreateVideoRollsBackOnVideoInsertError(t *testing.T) {
+	db := &fakeRepositoryDB{
+		tx: &fakeRepositoryTx{
+			rows: []fakeRow{
+				{err: errors.New("video insert failed")},
+				{values: []any{time.Unix(10, 0).UTC(), time.Unix(20, 0).UTC()}},
+			},
+		},
+	}
+	repo := &PostgresRepository{db: db}
+
+	_, err := repo.CreateVideo(context.Background(), testCreateVideoInput(time.Unix(1, 0).UTC()))
+	if err == nil {
+		t.Fatal("CreateVideo() error = nil, want failure")
+	}
+	if !strings.Contains(err.Error(), "insert video") {
+		t.Fatalf("CreateVideo() error = %q, want video insert failure", err)
+	}
+	if len(db.tx.calls) != 1 || !strings.Contains(db.tx.calls[0].SQL, "INSERT INTO videos") {
+		t.Fatalf("calls = %#v, want only the video insert", db.tx.calls)
+	}
+	if !db.tx.rollbackCalled {
+		t.Fatal("CreateVideo() did not roll back after insert failure")
+	}
+	if db.tx.commitCalled {
+		t.Fatal("CreateVideo() committed after insert failure")
+	}
+}
+
 func TestPostgresRepositoryCreateVideoRollsBackOnJobInsertError(t *testing.T) {
+	input := testCreateVideoInput(time.Unix(1, 0).UTC())
 	db := &fakeRepositoryDB{
 		tx: &fakeRepositoryTx{
 			rows: []fakeRow{
@@ -92,24 +137,23 @@ func TestPostgresRepositoryCreateVideoRollsBackOnJobInsertError(t *testing.T) {
 
 	repo := &PostgresRepository{db: db}
 
-	_, err := repo.CreateVideo(context.Background(), CreateVideoInput{
-		VideoID:     CanonicalUUID("11111111-1111-1111-1111-111111111111"),
-		JobID:       CanonicalUUID("22222222-2222-2222-2222-222222222222"),
-		FileName:    "sample.mp4",
-		ContentType: "video/mp4",
-		SizeBytes:   12345,
-		Upload: UploadMetadata{
-			Bucket:    "input-bucket",
-			Key:       "uploads/sample.mp4",
-			ExpiresAt: time.Unix(30, 0).UTC(),
-		},
-	})
+	_, err := repo.CreateVideo(context.Background(), input)
 	if err == nil {
 		t.Fatal("CreateVideo() error = nil, want failure")
 	}
 	if !strings.Contains(err.Error(), "insert job") {
 		t.Fatalf("CreateVideo() error = %q, want job insert failure", err)
 	}
+	assertSQLArgs(t, db.tx.calls[0].Args,
+		input.VideoID,
+		input.FileName,
+		input.ContentType,
+		input.SizeBytes,
+		input.Upload.Bucket,
+		input.Upload.Key,
+		input.Upload.ExpiresAt,
+	)
+	assertSQLArgs(t, db.tx.calls[1].Args, input.JobID, input.VideoID, JobStatusUploading)
 	if !db.tx.rollbackCalled {
 		t.Fatal("CreateVideo() did not roll back after insert failure")
 	}
@@ -118,15 +162,43 @@ func TestPostgresRepositoryCreateVideoRollsBackOnJobInsertError(t *testing.T) {
 	}
 }
 
+func TestPostgresRepositoryCreateVideoRollsBackOnCommitError(t *testing.T) {
+	db := &fakeRepositoryDB{
+		tx: &fakeRepositoryTx{
+			rows: []fakeRow{
+				{values: []any{time.Unix(10, 0).UTC(), time.Unix(20, 0).UTC()}},
+				{values: []any{time.Unix(11, 0).UTC(), time.Unix(21, 0).UTC()}},
+			},
+			commitErr: errors.New("commit failed"),
+		},
+	}
+	repo := &PostgresRepository{db: db}
+
+	_, err := repo.CreateVideo(context.Background(), testCreateVideoInput(time.Unix(1, 0).UTC()))
+	if err == nil {
+		t.Fatal("CreateVideo() error = nil, want commit failure")
+	}
+	if !strings.Contains(err.Error(), "commit transaction") {
+		t.Fatalf("CreateVideo() error = %q, want commit failure", err)
+	}
+	if !db.tx.commitCalled {
+		t.Fatal("CreateVideo() did not attempt commit")
+	}
+	if !db.tx.rollbackCalled {
+		t.Fatal("CreateVideo() did not roll back after commit failure")
+	}
+}
+
 func TestPostgresRepositoryGetVideoReturnsAggregate(t *testing.T) {
 	createdAt := time.Date(2026, time.February, 3, 4, 5, 6, 0, time.UTC)
 	updatedAt := createdAt.Add(10 * time.Minute)
 	jobCreatedAt := createdAt.Add(1 * time.Minute)
 	jobUpdatedAt := createdAt.Add(2 * time.Minute)
+	videoID := CanonicalUUID("11111111-1111-1111-1111-111111111111")
 	db := &fakeRepositoryDB{
 		row: fakeRow{
 			values: []any{
-				CanonicalUUID("11111111-1111-1111-1111-111111111111"),
+				videoID,
 				"sample.mp4",
 				"video/mp4",
 				int64(12345),
@@ -147,16 +219,25 @@ func TestPostgresRepositoryGetVideoReturnsAggregate(t *testing.T) {
 
 	repo := &PostgresRepository{db: db}
 
-	got, err := repo.GetVideoByID(context.Background(), CanonicalUUID("11111111-1111-1111-1111-111111111111"))
+	got, err := repo.GetVideoByID(context.Background(), videoID)
 	if err != nil {
 		t.Fatalf("GetVideoByID() error = %v", err)
 	}
 
-	if got.VideoID != "11111111-1111-1111-1111-111111111111" {
+	if !strings.Contains(db.query, "FROM videos v") || !strings.Contains(db.query, "JOIN jobs j ON j.video_id = v.video_id") {
+		t.Fatalf("query = %q, want video/job aggregate", db.query)
+	}
+	assertPlaceholders(t, db.query, 1)
+	assertSQLArgs(t, db.args, videoID)
+
+	if got.VideoID != videoID {
 		t.Fatalf("VideoID = %q, want canonical UUID", got.VideoID)
 	}
 	if got.Job.JobID != "22222222-2222-2222-2222-222222222222" {
 		t.Fatalf("Job.JobID = %q, want canonical UUID", got.Job.JobID)
+	}
+	if got.Job.VideoID != videoID {
+		t.Fatalf("Job.VideoID = %q, want %q", got.Job.VideoID, videoID)
 	}
 	if got.Job.Status != JobStatusFailed {
 		t.Fatalf("Job.Status = %q, want %q", got.Job.Status, JobStatusFailed)
@@ -179,25 +260,94 @@ func TestPostgresRepositoryGetVideoReturnsAggregate(t *testing.T) {
 }
 
 func TestPostgresRepositoryGetVideoReturnsNotFound(t *testing.T) {
+	videoID := CanonicalUUID("11111111-1111-1111-1111-111111111111")
 	db := &fakeRepositoryDB{
 		row: fakeRow{err: sql.ErrNoRows},
 	}
 
 	repo := &PostgresRepository{db: db}
 
-	_, err := repo.GetVideoByID(context.Background(), CanonicalUUID("11111111-1111-1111-1111-111111111111"))
+	_, err := repo.GetVideoByID(context.Background(), videoID)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetVideoByID() error = %v, want ErrNotFound", err)
 	}
+	assertSQLArgs(t, db.args, videoID)
+}
+
+func TestPostgresRepositoryGetVideoReadFailure(t *testing.T) {
+	db := &fakeRepositoryDB{
+		row: fakeRow{err: errors.New("connection reset")},
+	}
+	repo := &PostgresRepository{db: db}
+
+	_, err := repo.GetVideoByID(context.Background(), CanonicalUUID("11111111-1111-1111-1111-111111111111"))
+	if err == nil {
+		t.Fatal("GetVideoByID() error = nil, want read failure")
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatal("GetVideoByID() returned ErrNotFound, want storage failure")
+	}
+	if !strings.Contains(err.Error(), "read video") {
+		t.Fatalf("GetVideoByID() error = %q, want read failure", err)
+	}
+}
+
+func testCreateVideoInput(createdAt time.Time) CreateVideoInput {
+	return CreateVideoInput{
+		VideoID:     CanonicalUUID("11111111-1111-1111-1111-111111111111"),
+		JobID:       CanonicalUUID("22222222-2222-2222-2222-222222222222"),
+		FileName:    "sample.mp4",
+		ContentType: "video/mp4",
+		SizeBytes:   12345,
+		Upload: UploadMetadata{
+			Bucket:    "input-bucket",
+			Key:       "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
+			ExpiresAt: createdAt.Add(time.Hour),
+		},
+	}
+}
+
+func assertSQLArgs(t *testing.T, got []any, want ...any) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("SQL args len = %d, want %d\n got %#v\nwant %#v", len(got), len(want), got, want)
+	}
+	for i := range want {
+		if !reflect.DeepEqual(got[i], want[i]) {
+			t.Fatalf("SQL arg $%d = %#v (%T), want %#v (%T)", i+1, got[i], got[i], want[i], want[i])
+		}
+	}
+}
+
+func assertPlaceholders(t *testing.T, query string, n int) {
+	t.Helper()
+	for i := 1; i <= n; i++ {
+		placeholder := fmt.Sprintf("$%d", i)
+		if !strings.Contains(query, placeholder) {
+			t.Fatalf("query missing %s: %s", placeholder, query)
+		}
+	}
+	if strings.Contains(query, fmt.Sprintf("$%d", n+1)) {
+		t.Fatalf("query has extra $%d: %s", n+1, query)
+	}
+}
+
+type capturedQuery struct {
+	SQL  string
+	Args []any
 }
 
 type fakeRepositoryDB struct {
 	beginErr error
 	tx       *fakeRepositoryTx
 	row      fakeRow
+	query    string
+	args     []any
 }
 
-func (db *fakeRepositoryDB) QueryRowContext(context.Context, string, ...any) rowScanner {
+func (db *fakeRepositoryDB) QueryRowContext(_ context.Context, query string, args ...any) rowScanner {
+	db.query = query
+	db.args = append([]any(nil), args...)
 	return db.row
 }
 
@@ -210,13 +360,14 @@ func (db *fakeRepositoryDB) BeginTx(context.Context, *sql.TxOptions) (repository
 
 type fakeRepositoryTx struct {
 	rows           []fakeRow
-	calls          []string
+	calls          []capturedQuery
+	commitErr      error
 	commitCalled   bool
 	rollbackCalled bool
 }
 
-func (tx *fakeRepositoryTx) QueryRowContext(_ context.Context, query string, _ ...any) rowScanner {
-	tx.calls = append(tx.calls, query)
+func (tx *fakeRepositoryTx) QueryRowContext(_ context.Context, query string, args ...any) rowScanner {
+	tx.calls = append(tx.calls, capturedQuery{SQL: query, Args: append([]any(nil), args...)})
 	if len(tx.rows) == 0 {
 		return fakeRow{err: fmt.Errorf("unexpected query %q", query)}
 	}
@@ -227,6 +378,9 @@ func (tx *fakeRepositoryTx) QueryRowContext(_ context.Context, query string, _ .
 
 func (tx *fakeRepositoryTx) Commit() error {
 	tx.commitCalled = true
+	if tx.commitErr != nil {
+		return tx.commitErr
+	}
 	return nil
 }
 

@@ -11,13 +11,13 @@ import (
 const testInputBucket = "input-bucket"
 
 func TestS3UploadPresignerPresignUploadForwardsCanonicalPutObject(t *testing.T) {
-	client := &fakeS3PresignClient{}
+	client := &fakeS3PresignClient{headers: sdkSignedPutHeaders()}
 	presigner := NewS3UploadPresigner(client, testInputBucket)
 
 	got, err := presigner.PresignUpload(
 		context.Background(),
 		testInputBucket,
-		"videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
+		testCanonicalSourceKey,
 		uploadContentType,
 		15*time.Minute,
 	)
@@ -32,7 +32,7 @@ func TestS3UploadPresignerPresignUploadForwardsCanonicalPutObject(t *testing.T) 
 	if client.input.Bucket != "input-bucket" {
 		t.Fatalf("Bucket = %q, want %q", client.input.Bucket, "input-bucket")
 	}
-	if client.input.Key != "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4" {
+	if client.input.Key != testCanonicalSourceKey {
 		t.Fatalf("Key = %q, want canonical source key", client.input.Key)
 	}
 	if client.input.ContentType != uploadContentType {
@@ -47,6 +47,37 @@ func TestS3UploadPresignerPresignUploadForwardsCanonicalPutObject(t *testing.T) 
 	}
 	if got.URL != "https://example.invalid/presigned" {
 		t.Fatalf("URL = %q, want %q", got.URL, "https://example.invalid/presigned")
+	}
+	assertPreservedSignedHeaders(t, got.Headers, client.headers)
+	if got.Headers.Get("Content-Type") != uploadContentType {
+		t.Fatalf("Content-Type header = %q, want %q", got.Headers.Get("Content-Type"), uploadContentType)
+	}
+}
+
+func TestS3UploadPresignerPreservesSDKSignedHeaders(t *testing.T) {
+	signed := sdkSignedPutHeaders()
+	client := &fakeS3PresignClient{headers: signed}
+	presigner := NewS3UploadPresigner(client, testInputBucket)
+
+	got, err := presigner.PresignUpload(context.Background(), testInputBucket, testCanonicalSourceKey, uploadContentType, time.Minute)
+	if err != nil {
+		t.Fatalf("PresignUpload() error = %v", err)
+	}
+
+	assertPreservedSignedHeaders(t, got.Headers, signed)
+	got.Headers.Values("X-Amz-Checksum-Crc32")[0] = "mutated"
+	if signed.Get("X-Amz-Checksum-Crc32") != "i9aeUg==" {
+		t.Fatal("returned headers aliased the SDK signed header values")
+	}
+}
+
+func TestS3UploadPresignerAddsContentTypeWhenSDKOmitsHeaders(t *testing.T) {
+	client := &fakeS3PresignClient{headers: http.Header{}}
+	presigner := NewS3UploadPresigner(client, testInputBucket)
+
+	got, err := presigner.PresignUpload(context.Background(), testInputBucket, testCanonicalSourceKey, uploadContentType, time.Minute)
+	if err != nil {
+		t.Fatalf("PresignUpload() error = %v", err)
 	}
 	if got.Headers.Get("Content-Type") != uploadContentType {
 		t.Fatalf("Content-Type header = %q, want %q", got.Headers.Get("Content-Type"), uploadContentType)
@@ -64,7 +95,7 @@ func TestS3UploadPresignerRejectsInvalidInputsBeforeClientCall(t *testing.T) {
 		{
 			name:        "empty_bucket",
 			bucket:      "",
-			key:         "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
+			key:         testCanonicalSourceKey,
 			contentType: uploadContentType,
 			expiry:      time.Minute,
 		},
@@ -85,21 +116,21 @@ func TestS3UploadPresignerRejectsInvalidInputsBeforeClientCall(t *testing.T) {
 		{
 			name:        "wrong_content_type",
 			bucket:      testInputBucket,
-			key:         "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
+			key:         testCanonicalSourceKey,
 			contentType: "video/mpeg",
 			expiry:      time.Minute,
 		},
 		{
 			name:        "nonpositive_expiry",
 			bucket:      testInputBucket,
-			key:         "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
+			key:         testCanonicalSourceKey,
 			contentType: uploadContentType,
 			expiry:      0,
 		},
 		{
 			name:        "wrong_bucket",
 			bucket:      "other-bucket",
-			key:         "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
+			key:         testCanonicalSourceKey,
 			contentType: uploadContentType,
 			expiry:      time.Minute,
 		},
@@ -129,7 +160,7 @@ func TestS3UploadPresignerPropagatesClientError(t *testing.T) {
 	_, err := presigner.PresignUpload(
 		context.Background(),
 		testInputBucket,
-		"videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4",
+		testCanonicalSourceKey,
 		uploadContentType,
 		time.Minute,
 	)
@@ -141,10 +172,40 @@ func TestS3UploadPresignerPropagatesClientError(t *testing.T) {
 	}
 }
 
+const testCanonicalSourceKey = "videos/11111111-1111-1111-1111-111111111111/jobs/22222222-2222-2222-2222-222222222222/source.mp4"
+
+func sdkSignedPutHeaders() http.Header {
+	return http.Header{
+		"Content-Type":                 []string{uploadContentType},
+		"X-Amz-Checksum-Crc32":         []string{"i9aeUg=="},
+		"X-Amz-Sdk-Checksum-Algorithm": []string{"CRC32"},
+		"X-Amz-Test":                   []string{"1"},
+	}
+}
+
+func assertPreservedSignedHeaders(t *testing.T, got, signed http.Header) {
+	t.Helper()
+	if signed.Get("X-Amz-Test") == "" {
+		t.Fatal("signed fixture is missing X-Amz-Test")
+	}
+	for name, values := range signed {
+		gotValues := got.Values(name)
+		if len(gotValues) != len(values) {
+			t.Fatalf("header %q = %v, want SDK signed values %v", name, gotValues, values)
+		}
+		for i, value := range values {
+			if gotValues[i] != value {
+				t.Fatalf("header %q = %v, want SDK signed values %v", name, gotValues, values)
+			}
+		}
+	}
+}
+
 type fakeS3PresignClient struct {
-	calls int
-	input S3PutObjectInput
-	err   error
+	calls   int
+	input   S3PutObjectInput
+	headers http.Header
+	err     error
 }
 
 func (c *fakeS3PresignClient) PresignPutObject(_ context.Context, input S3PutObjectInput) (S3PresignResult, error) {
@@ -153,11 +214,13 @@ func (c *fakeS3PresignClient) PresignPutObject(_ context.Context, input S3PutObj
 	if c.err != nil {
 		return S3PresignResult{}, c.err
 	}
+	headers := c.headers
+	if headers == nil {
+		headers = sdkSignedPutHeaders()
+	}
 
 	return S3PresignResult{
-		URL: "https://example.invalid/presigned",
-		Headers: http.Header{
-			"X-Amz-Test": []string{"1"},
-		},
+		URL:     "https://example.invalid/presigned",
+		Headers: headers,
 	}, nil
 }

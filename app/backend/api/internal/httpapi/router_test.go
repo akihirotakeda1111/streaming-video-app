@@ -65,9 +65,47 @@ func TestDecodeJSONAndBodyLimit(t *testing.T) {
 		_ = writeJSON(w, http.StatusCreated, payload)
 	}))
 
+	t.Run("valid", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/health", strings.NewReader(`{"name":"ok"}`))
+
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("empty body", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/health", strings.NewReader(""))
+
+		handler.ServeHTTP(rr, req)
+
+		assertErrorResponse(t, rr, http.StatusBadRequest, "INVALID_REQUEST")
+	})
+
 	t.Run("malformed", func(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/health", strings.NewReader(`{"name":`))
+
+		handler.ServeHTTP(rr, req)
+
+		assertErrorResponse(t, rr, http.StatusBadRequest, "INVALID_REQUEST")
+	})
+
+	t.Run("concatenated objects", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/health", strings.NewReader(`{"name":"one"}{"name":"two"}`))
+
+		handler.ServeHTTP(rr, req)
+
+		assertErrorResponse(t, rr, http.StatusBadRequest, "INVALID_REQUEST")
+	})
+
+	t.Run("trailing junk after valid json", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/health", strings.NewReader(`{"name":"ok"} not-json`))
 
 		handler.ServeHTTP(rr, req)
 

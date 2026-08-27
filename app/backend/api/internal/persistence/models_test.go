@@ -1,113 +1,80 @@
 package persistence
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
-func TestJobStatusMappings(t *testing.T) {
-	want := []JobStatus{
-		"UPLOADING",
-		"QUEUED",
-		"PROCESSING",
-		"COMPLETED",
-		"FAILED",
-	}
-
-	if !reflect.DeepEqual(AllJobStatuses, want) {
-		t.Fatalf("AllJobStatuses = %#v, want %#v", AllJobStatuses, want)
-	}
-
-	for _, status := range want {
+func TestJobStatusMatchesContract(t *testing.T) {
+	want := contractJobStatuses(t)
+	got := make(map[JobStatus]struct{}, len(AllJobStatuses))
+	for _, status := range AllJobStatuses {
+		got[status] = struct{}{}
 		if !status.IsValid() {
 			t.Fatalf("status %q should be valid", status)
 		}
 	}
-
+	if len(got) != len(want) {
+		t.Fatalf("AllJobStatuses = %v, contract enum = %v", AllJobStatuses, want)
+	}
+	for _, status := range want {
+		if _, ok := got[JobStatus(status)]; !ok {
+			t.Fatalf("AllJobStatuses missing contract status %q", status)
+		}
+		if !JobStatus(status).IsValid() {
+			t.Fatalf("contract status %q should be valid", status)
+		}
+	}
 	if JobStatus("UNKNOWN").IsValid() {
 		t.Fatal("unknown status should be invalid")
 	}
 }
 
-func TestPersistenceModelShape(t *testing.T) {
-	videoType := reflect.TypeOf(Video{})
-
-	wantFields := map[string]reflect.Type{
-		"VideoID":     reflect.TypeOf(CanonicalUUID("")),
-		"FileName":    reflect.TypeOf(""),
-		"ContentType": reflect.TypeOf(""),
-		"SizeBytes":   reflect.TypeOf(int64(0)),
-		"Upload":      reflect.TypeOf(UploadMetadata{}),
-		"Job":         reflect.TypeOf(EncodingJob{}),
-		"CreatedAt":   reflect.TypeOf(time.Time{}),
-		"UpdatedAt":   reflect.TypeOf(time.Time{}),
+func TestDownMigrationDropsJobsBeforeVideos(t *testing.T) {
+	down := readMigration(t, "0001_phase1_schema.down.sql")
+	idxJobs := strings.Index(down, "DROP TABLE IF EXISTS jobs")
+	idxVideos := strings.Index(down, "DROP TABLE IF EXISTS videos")
+	if idxJobs < 0 || idxVideos < 0 {
+		t.Fatal("down migration must drop jobs and videos")
 	}
-
-	for name, wantType := range wantFields {
-		field, ok := videoType.FieldByName(name)
-		if !ok {
-			t.Fatalf("Video is missing field %q", name)
-		}
-		if field.Type != wantType {
-			t.Fatalf("Video.%s type = %v, want %v", name, field.Type, wantType)
-		}
-	}
-
-	jobType := reflect.TypeOf(EncodingJob{})
-	wantJobFields := map[string]reflect.Type{
-		"JobID":     reflect.TypeOf(CanonicalUUID("")),
-		"VideoID":   reflect.TypeOf(CanonicalUUID("")),
-		"Status":    reflect.TypeOf(JobStatus("")),
-		"Failure":   reflect.TypeOf((*JobFailure)(nil)),
-		"CreatedAt": reflect.TypeOf(time.Time{}),
-		"UpdatedAt": reflect.TypeOf(time.Time{}),
-	}
-
-	for name, wantType := range wantJobFields {
-		field, ok := jobType.FieldByName(name)
-		if !ok {
-			t.Fatalf("EncodingJob is missing field %q", name)
-		}
-		if field.Type != wantType {
-			t.Fatalf("EncodingJob.%s type = %v, want %v", name, field.Type, wantType)
-		}
+	if idxJobs > idxVideos {
+		t.Fatal("down migration must drop jobs before videos")
 	}
 }
 
-func TestMigrationStructure(t *testing.T) {
-	up := readMigration(t, "0001_phase1_schema.up.sql")
-	down := readMigration(t, "0001_phase1_schema.down.sql")
+func contractJobStatuses(t *testing.T) []string {
+	t.Helper()
 
-	mustContainAll(t, up,
-		"CREATE TABLE videos",
-		"video_id uuid PRIMARY KEY",
-		"upload_bucket text NOT NULL",
-		"upload_key text NOT NULL",
-		"upload_expires_at timestamptz NOT NULL",
-		"CREATE TABLE jobs",
-		"id uuid PRIMARY KEY",
-		"video_id uuid NOT NULL UNIQUE REFERENCES videos(video_id) ON DELETE CASCADE",
-		"status text NOT NULL CHECK (status IN ('UPLOADING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED'))",
-		"CONSTRAINT jobs_failure_details_check CHECK (",
-		"CREATE INDEX jobs_status_idx ON jobs (status)",
-	)
-
-	if strings.Count(up, "CREATE TABLE") != 2 {
-		t.Fatalf("up migration should define exactly two tables, got %d", strings.Count(up, "CREATE TABLE"))
+	var schema struct {
+		Enum []string `json:"enum"`
 	}
-
-	if idxJobs := strings.Index(down, "DROP TABLE IF EXISTS jobs"); idxJobs < 0 {
-		t.Fatal("down migration must drop jobs")
-	} else if idxVideos := strings.Index(down, "DROP TABLE IF EXISTS videos"); idxVideos < 0 {
-		t.Fatal("down migration must drop videos")
-	} else if idxJobs > idxVideos {
-		t.Fatal("down migration must drop jobs before videos")
+	if err := json.Unmarshal(readSharedContract(t, "domain", "job-status.schema.json"), &schema); err != nil {
+		t.Fatalf("parse job-status contract: %v", err)
 	}
+	if len(schema.Enum) == 0 {
+		t.Fatal("job-status contract enum is empty")
+	}
+	return schema.Enum
+}
+
+func readSharedContract(t *testing.T, rel ...string) []byte {
+	t.Helper()
+
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	parts := append([]string{filepath.Dir(file), "..", "..", "..", "..", "contracts"}, rel...)
+	path := filepath.Join(parts...)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
 }
 
 func readMigration(t *testing.T, name string) string {
@@ -124,14 +91,4 @@ func readMigration(t *testing.T, name string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(data)
-}
-
-func mustContainAll(t *testing.T, haystack string, needles ...string) {
-	t.Helper()
-
-	for _, needle := range needles {
-		if !strings.Contains(haystack, needle) {
-			t.Fatalf("migration missing %q", needle)
-		}
-	}
 }

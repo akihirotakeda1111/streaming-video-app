@@ -18,11 +18,20 @@ func TestLoadConfigValid(t *testing.T) {
 	if cfg.HTTPAddr != "0.0.0.0:8080" {
 		t.Fatalf("HTTPAddr = %q, want %q", cfg.HTTPAddr, "0.0.0.0:8080")
 	}
+	if cfg.DatabaseURL != "postgres://user:pass@localhost:5432/app?sslmode=disable" {
+		t.Fatalf("DatabaseURL = %q", cfg.DatabaseURL)
+	}
+	if cfg.AWSRegion != "ap-northeast-1" {
+		t.Fatalf("AWSRegion = %q", cfg.AWSRegion)
+	}
 	if cfg.InputBucket != "streaming-video-input-dev" {
 		t.Fatalf("InputBucket = %q, want %q", cfg.InputBucket, "streaming-video-input-dev")
 	}
 	if cfg.OutputBucket != "streaming-video-output-dev" {
 		t.Fatalf("OutputBucket = %q, want %q", cfg.OutputBucket, "streaming-video-output-dev")
+	}
+	if cfg.OutputS3Endpoint != "http://localhost:4566" {
+		t.Fatalf("OutputS3Endpoint = %q", cfg.OutputS3Endpoint)
 	}
 }
 
