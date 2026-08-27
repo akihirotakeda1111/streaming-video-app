@@ -129,7 +129,8 @@ func buildRuntime(ctx context.Context, cfg config.Config, factories runtimeFacto
 	}
 
 	service := httpapi.NewVideoCreationService(repo, presigner, cfg.InputBucket)
-	server := factories.newHTTPServer(cfg.HTTPAddr, httpapi.NewRouterWithVideoCreation(service))
+	status := httpapi.NewVideoStatusService(repo)
+	server := factories.newHTTPServer(cfg.HTTPAddr, httpapi.NewRouterWithServices(service, status))
 	if server == nil {
 		return nil, nil, errors.New("construct HTTP server: server is nil")
 	}
