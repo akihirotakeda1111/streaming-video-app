@@ -234,12 +234,27 @@ jobs:
         run: python agent/scripts/run-work-unit.py --spec "${{ needs.parse-spec.outputs.spec_path }}" --report-dir "${{ runner.temp }}/agent-report"
 
       - name: Upload work report
+        id: upload-work-report
         if: ${{ !cancelled() }}
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: agent-work-${{ needs.parse-spec.outputs.task_id }}
           path: ${{ runner.temp }}/agent-report
           if-no-files-found: error
+
+      - name: Wait before retrying work report upload
+        if: ${{ !cancelled() && steps.upload-work-report.outcome == 'failure' }}
+        run: sleep 120
+
+      - name: Retry work report upload
+        if: ${{ !cancelled() && steps.upload-work-report.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-work-${{ needs.parse-spec.outputs.task_id }}
+          path: ${{ runner.temp }}/agent-report
+          if-no-files-found: error
+          overwrite: true
 
   deliver:
     name: Deliver commit and pull request
