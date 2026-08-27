@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+tokio.workspace = true
