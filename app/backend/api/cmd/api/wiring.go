@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -158,7 +159,7 @@ func verifySchema(ctx context.Context, db databaseHandle) error {
 }
 
 type s3PresignAPI interface {
-	PresignPutObject(context.Context, *s3.PutObjectInput, ...func(*s3.PresignOptions)) (*s3.PresignedHTTPRequest, error)
+	PresignPutObject(context.Context, *s3.PutObjectInput, ...func(*s3.PresignOptions)) (*v4.PresignedHTTPRequest, error)
 }
 
 type s3PresignAdapter struct{ client s3PresignAPI }
