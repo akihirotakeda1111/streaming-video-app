@@ -1,7 +1,10 @@
 //! Process execution port.  An executable and argv are kept as separate
 //! values so no shell command needs to be constructed.
 
-use std::path::PathBuf;
+use std::{
+    fs, io,
+    path::{Component, Path, PathBuf},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
@@ -30,6 +33,166 @@ pub struct ProcessError(pub String);
 
 pub trait Execute {
     fn execute(&mut self, command: Command) -> Result<Output, ProcessError>;
+}
+
+/// The files produced by one HLS encode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HlsOutput {
+    pub playlist: PathBuf,
+    pub segments: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub enum HlsError {
+    Process(ProcessError),
+    Failed(i32),
+    Filesystem(io::Error),
+    InvalidPlaylist(String),
+}
+
+impl std::fmt::Display for HlsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Process(error) => write!(formatter, "run ffmpeg: {}", error.0),
+            Self::Failed(status) => write!(formatter, "ffmpeg exited with status {status}"),
+            Self::Filesystem(error) => write!(formatter, "HLS output: {error}"),
+            Self::InvalidPlaylist(reason) => write!(formatter, "invalid HLS playlist: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for HlsError {}
+
+impl From<ProcessError> for HlsError {
+    fn from(error: ProcessError) -> Self {
+        Self::Process(error)
+    }
+}
+
+impl From<io::Error> for HlsError {
+    fn from(error: io::Error) -> Self {
+        Self::Filesystem(error)
+    }
+}
+
+/// Run ffmpeg with the worker's fixed HLS output layout and verify the result.
+pub fn encode_hls<E: Execute>(
+    executor: &mut E,
+    ffmpeg_path: impl Into<PathBuf>,
+    work_directory: impl AsRef<Path>,
+) -> Result<HlsOutput, HlsError> {
+    let work_directory = work_directory.as_ref();
+    let source = work_directory.join("source.mp4");
+    let playlist = work_directory.join("index.m3u8");
+    let segments = work_directory.join("segment-%05d.ts");
+    let command = Command::new(
+        ffmpeg_path,
+        vec![
+            "-y".into(),
+            "-i".into(),
+            source.to_string_lossy().into_owned(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-f".into(),
+            "hls".into(),
+            "-start_number".into(),
+            "0".into(),
+            "-hls_time".into(),
+            "6".into(),
+            "-hls_playlist_type".into(),
+            "vod".into(),
+            "-hls_segment_filename".into(),
+            segments.to_string_lossy().into_owned(),
+            playlist.to_string_lossy().into_owned(),
+        ],
+    );
+
+    let output = executor.execute(command)?;
+    if output.status != 0 {
+        return Err(HlsError::Failed(output.status));
+    }
+    validate_hls_output(work_directory)
+}
+
+/// Validate an ffmpeg HLS result without trusting paths supplied by the playlist.
+pub fn validate_hls_output(work_directory: impl AsRef<Path>) -> Result<HlsOutput, HlsError> {
+    let work_directory = work_directory.as_ref();
+    let playlist = work_directory.join("index.m3u8");
+    let root = fs::canonicalize(work_directory)?;
+    let playlist_text = fs::read_to_string(&playlist)?;
+    let mut segments = Vec::new();
+    let mut first_segment = true;
+
+    for raw_line in playlist_text.lines() {
+        let reference = raw_line.trim();
+        if reference.is_empty() || reference.starts_with('#') {
+            continue;
+        }
+        let path = Path::new(reference);
+        if path.is_absolute()
+            || reference.starts_with("//")
+            || reference.contains("://")
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(HlsError::InvalidPlaylist(format!(
+                "media reference is not a safe relative path: {reference:?}"
+            )));
+        }
+        if !is_segment_filename(reference) {
+            return Err(HlsError::InvalidPlaylist(format!(
+                "unexpected media filename: {reference:?}"
+            )));
+        }
+        if first_segment && reference != "segment-00000.ts" {
+            return Err(HlsError::InvalidPlaylist(
+                "first media segment must be segment-00000.ts".into(),
+            ));
+        }
+        first_segment = false;
+
+        let file = fs::canonicalize(work_directory.join(path)).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                HlsError::InvalidPlaylist(format!("referenced segment is missing: {reference:?}"))
+            } else {
+                HlsError::Filesystem(error)
+            }
+        })?;
+        if !file.starts_with(&root) {
+            return Err(HlsError::InvalidPlaylist(format!(
+                "media reference escapes work directory: {reference:?}"
+            )));
+        }
+        if !file.is_file() {
+            return Err(HlsError::InvalidPlaylist(format!(
+                "media reference is not a file: {reference:?}"
+            )));
+        }
+        segments.push(file);
+    }
+
+    if segments.is_empty() {
+        return Err(HlsError::InvalidPlaylist(
+            "playlist contains no media segments".into(),
+        ));
+    }
+    Ok(HlsOutput { playlist, segments })
+}
+
+fn is_segment_filename(reference: &str) -> bool {
+    let Some(number) = reference
+        .strip_prefix("segment-")
+        .and_then(|value| value.strip_suffix(".ts"))
+    else {
+        return false;
+    };
+    number.len() == 5 && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 pub mod runtime;
