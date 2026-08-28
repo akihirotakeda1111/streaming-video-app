@@ -12,10 +12,7 @@ pub const PHASE1_MAX_CONCURRENCY: usize = 2;
 pub trait MessageProcessor: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
-    fn process(
-        &self,
-        message: Message,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn process(&self, message: Message) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 #[derive(Debug)]

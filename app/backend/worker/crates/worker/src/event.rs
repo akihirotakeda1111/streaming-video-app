@@ -45,8 +45,7 @@ pub fn parse_notification(
 
 fn parse_record(record: &Value, configured_input_bucket: &str) -> Option<WorkItem> {
     let event_name = record.get("eventName")?.as_str()?;
-    if !event_name.starts_with("ObjectCreated:")
-        || event_name["ObjectCreated:".len()..].is_empty()
+    if !event_name.starts_with("ObjectCreated:") || event_name["ObjectCreated:".len()..].is_empty()
     {
         return None;
     }
