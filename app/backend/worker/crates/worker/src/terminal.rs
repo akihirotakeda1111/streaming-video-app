@@ -182,8 +182,10 @@ where
 
         for item in &owned {
             if let Err(failure) = self.process_owned(item) {
-                self.fail_owned(&item.job_id, failure.clone())?;
-                return Err(TerminalError(failure));
+                self.fail_owned(&item.job_id, failure)?;
+                // Do not acknowledge, and do not fail the worker process. Phase 1
+                // has no retry policy; visibility timeout redelivers the message.
+                return Ok(());
             }
         }
 
