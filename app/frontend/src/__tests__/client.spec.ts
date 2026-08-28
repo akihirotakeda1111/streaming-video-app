@@ -89,6 +89,39 @@ describe('video API client', () => {
     ).rejects.toBeInstanceOf(ContractError)
   })
 
+  it('uploads the file with the injected fetcher and returned request', async () => {
+    const file = new File(['video'], 'movie.mp4', { type: 'video/mp4' })
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(response(createResponse, 201))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+    const client = createVideoApiClient({ apiBaseUrl: 'https://api.example/api/v1' }, fetcher)
+    const created = await client.createVideo({ fileName: 'movie.mp4', contentType: 'video/mp4', sizeBytes: 10 })
+
+    await client.uploadFile(file, created)
+
+    expect(fetcher).toHaveBeenNthCalledWith(2, created.upload.url, {
+      method: created.upload.method,
+      headers: created.upload.headers,
+      body: file,
+    })
+  })
+
+  it('turns unsuccessful uploads into ApiError without calling the API origin', async () => {
+    const file = new File(['video'], 'movie.mp4', { type: 'video/mp4' })
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(response(createResponse, 201))
+      .mockResolvedValueOnce(new Response(null, { status: 403 }))
+    const client = createVideoApiClient({ apiBaseUrl: 'https://api.example/api/v1' }, fetcher)
+    const created = await client.createVideo({ fileName: 'movie.mp4', contentType: 'video/mp4', sizeBytes: 10 })
+
+    await expect(client.uploadFile(file, created)).rejects.toEqual(
+      expect.objectContaining({ name: 'ApiError', status: 403 }),
+    )
+    expect(fetcher.mock.calls[1]?.[0]).toBe(created.upload.url)
+  })
+
   it('rejects timezone-less timestamps', async () => {
     const client = createVideoApiClient(
       { apiBaseUrl: 'https://api.example' },

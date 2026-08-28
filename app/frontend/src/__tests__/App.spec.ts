@@ -105,9 +105,12 @@ describe('App workflow shell', () => {
     expect(wrapper.get('[data-workflow-state="error"]').text()).toContain('createVideo is not wired')
   })
 
-  it('sends create metadata and retains the upload instructions without starting upload', async () => {
+  it('uploads the selected file to the create response and stops before polling', async () => {
     const file = mp4('clip.mp4', 'abcdef')
-    const workflowActions = actions()
+    const created = createdResponse()
+    const workflowActions = actions({
+      createVideo: vi.fn().mockResolvedValue(created),
+    })
     const wrapper = mount(App, { props: { workflowActions } })
 
     await chooseFiles(wrapper, [file])
@@ -120,14 +123,15 @@ describe('App workflow shell', () => {
       contentType: 'video/mp4',
       sizeBytes: file.size,
     })
-    expect(workflowActions.uploadFile).not.toHaveBeenCalled()
+    expect(workflowActions.uploadFile).toHaveBeenCalledOnce()
+    expect(workflowActions.uploadFile).toHaveBeenCalledWith(file, created)
     expect(workflowActions.getVideoStatus).not.toHaveBeenCalled()
     expect(workflowActions.getPlayback).not.toHaveBeenCalled()
-    expect(wrapper.get('[data-workflow-state="created"]').text()).toContain('Video created')
+    expect(wrapper.get('[data-workflow-state="processing"]').text()).toContain('Processing')
     expect(wrapper.get('[aria-label="Video creation result"]').text()).toContain(videoId)
     expect(wrapper.get('[aria-label="Video creation result"]').text()).toContain(jobId)
     expect(wrapper.get('[aria-label="Video creation result"]').text()).toContain('PUT https://upload.example/source.mp4')
-    expect((wrapper.vm as { createdVideo: CreateVideoResponse | null }).createdVideo).toEqual(createdResponse())
+    expect((wrapper.vm as { createdVideo: CreateVideoResponse | null }).createdVideo).toEqual(created)
   })
 
   it('shows an actionable error and does not upload when create fails', async () => {
@@ -169,11 +173,51 @@ describe('App workflow shell', () => {
     finishCreate(createdResponse())
     await flushPromises()
 
-    expect(workflowActions.uploadFile).not.toHaveBeenCalled()
-    expect(wrapper.find('[data-workflow-state="created"]').exists()).toBe(true)
+    expect(workflowActions.uploadFile).toHaveBeenCalledOnce()
+    expect(wrapper.find('[data-workflow-state="processing"]').exists()).toBe(true)
   })
 
-  it('does not retain create results after disposal', async () => {
+  it('prevents duplicate submissions while uploading', async () => {
+    let finishUpload!: () => void
+    const workflowActions = actions({
+      uploadFile: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            finishUpload = resolve
+          }),
+      ),
+    })
+    const wrapper = mount(App, { props: { workflowActions } })
+    await chooseFiles(wrapper, [mp4()])
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    await wrapper.get('form').trigger('submit')
+
+    expect(workflowActions.createVideo).toHaveBeenCalledOnce()
+    expect(workflowActions.uploadFile).toHaveBeenCalledOnce()
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.find('[data-workflow-state="uploading"]').exists()).toBe(true)
+
+    finishUpload()
+    await flushPromises()
+  })
+
+  it('shows an actionable error and does not poll when upload fails', async () => {
+    const workflowActions = actions({
+      uploadFile: vi.fn().mockRejectedValue(new ApiError('Upload failed with status 403', 403)),
+    })
+    const wrapper = mount(App, { props: { workflowActions } })
+
+    await chooseFiles(wrapper, [mp4()])
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.get('[data-workflow-state="error"]').text()).toContain('Upload failed with status 403')
+    expect(workflowActions.getVideoStatus).not.toHaveBeenCalled()
+    expect(workflowActions.getPlayback).not.toHaveBeenCalled()
+  })
+
+  it('does not start upload after disposal during create', async () => {
     let finishCreate!: (value: CreateVideoResponse) => void
     const workflowActions = actions({
       createVideo: vi.fn(
