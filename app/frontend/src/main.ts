@@ -7,9 +7,13 @@ import App from './App.vue'
 import router from './router'
 import './assets/main.css'
 
+const apiClient = createVideoApiClient()
 const app = createApp(App, {
   workflowActions: {
-    createVideo: (request: CreateVideoRequest) => createVideoApiClient().createVideo(request),
+    createVideo: (request: CreateVideoRequest) => apiClient.createVideo(request),
+    uploadFile: (file, response) => apiClient.uploadFile(file, response),
+    getVideoStatus: (videoId) => apiClient.getVideoStatus(videoId),
+    getPlayback: (videoId) => apiClient.getPlayback(videoId),
   },
 })
 

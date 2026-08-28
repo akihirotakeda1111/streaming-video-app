@@ -46,9 +46,30 @@ export class NetworkError extends ApiClientError {
 
 export interface VideoApiClient {
   createVideo(request: CreateVideoRequest): Promise<CreateVideoResponse>
+  uploadFile(file: File, response: CreateVideoResponse): Promise<void>
   getVideo(videoId: string): Promise<VideoResponse>
   getVideoStatus(videoId: string): Promise<VideoResponse>
   getPlayback(videoId: string): Promise<PlaybackResponse>
+}
+
+export async function uploadFileToPresignedRequest(
+  file: File,
+  response: CreateVideoResponse,
+  fetcher: Fetcher = globalThis.fetch.bind(globalThis),
+): Promise<void> {
+  let result: Response
+  try {
+    result = await fetcher(response.upload.url, {
+      method: response.upload.method,
+      headers: response.upload.headers,
+      body: file,
+    })
+  } catch (error) {
+    throw asNetworkError(error)
+  }
+  if (!result.ok) {
+    throw new ApiClientError(`Upload failed with status ${result.status}`, 'api', result.status)
+  }
 }
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -230,6 +251,7 @@ export function createVideoApiClient(
 
   return {
     createVideo: (requestBody) => request('/videos', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody) }, parseCreateVideoResponse),
+    uploadFile: (file, response) => uploadFileToPresignedRequest(file, response),
     getVideo: (videoId) => request(`/videos/${encodeURIComponent(videoId)}`, { method: 'GET' }, parseVideoResponse),
     getVideoStatus: (videoId) => request(`/videos/${encodeURIComponent(videoId)}`, { method: 'GET' }, parseVideoResponse),
     getPlayback: (videoId) => request(`/videos/${encodeURIComponent(videoId)}/playback`, { method: 'GET' }, parsePlaybackResponse),
