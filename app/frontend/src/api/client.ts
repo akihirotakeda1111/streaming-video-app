@@ -70,9 +70,14 @@ function uuid(value: unknown, field: string): string {
   return result
 }
 
+const rfc3339DateTimePattern =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
+
 function dateTime(value: unknown, field: string): string {
   const result = requiredString(value, field)
-  if (Number.isNaN(Date.parse(result))) throw new ContractError(`Invalid ${field}`)
+  if (!rfc3339DateTimePattern.test(result) || Number.isNaN(Date.parse(result))) {
+    throw new ContractError(`Invalid ${field}`)
+  }
   return result
 }
 
