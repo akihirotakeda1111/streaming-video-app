@@ -24,4 +24,36 @@ describe('E2E fixtures and diagnostics', () => {
       expect.objectContaining({ origin: 'https://api.example', path: '/videos/123', status: 201, jobId: 'job-1' }),
     )
   })
+
+  it('redacts recognized credential fields unconditionally', () => {
+    expect(safeDiagnostic({ accessToken: 'supersecret', password: 'hunter2' })).toEqual({
+      accessToken: '[REDACTED]',
+      password: '[REDACTED]',
+    })
+  })
+
+  it('redacts malformed URL-like text without recursing', () => {
+    expect(() => redactText('https://%')).not.toThrow()
+    expect(() => redactUrl('https://?token=secret')).not.toThrow()
+    expect(redactText('failed https://?token=secret')).toBe('failed [REDACTED]')
+    expect(redactUrl('https://%')).toBe('[REDACTED]')
+  })
+
+  it('redacts quoted secrets including spaces', () => {
+    const text = redactText('password="first second" secret=\'a b\'')
+    expect(text).toBe('password="[REDACTED]" secret=\'[REDACTED]\'')
+    expect(text).not.toContain('first')
+    expect(text).not.toContain('second')
+  })
+
+  it('redacts nested credential values before serialization', () => {
+    const diagnostic = safeDiagnostic({
+      request: { headers: { authorization: 'Bearer abc' } },
+      uploadUrl: 'https://s3.example/video.mp4?X-Amz-Signature=abc',
+    })
+    expect(diagnostic).toEqual({
+      request: { headers: { authorization: '[REDACTED]' } },
+      uploadUrl: 'https://s3.example/video.mp4',
+    })
+  })
 })

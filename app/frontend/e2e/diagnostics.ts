@@ -2,7 +2,11 @@ import { readFile } from 'node:fs/promises'
 import type { TestInfo } from '@playwright/test'
 
 const REDACTED = '[REDACTED]'
-const SECRET_FIELDS = /("?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|x-amz-[a-z-]+)"?\s*[:=]\s*["']?)([^\s,"'}]+)/gi
+const PRESERVED_KEYS = new Set(['origin', 'path', 'status', 'videoId', 'jobId'])
+const CREDENTIAL_KEY = /authorization|token|password|secret|credential|api[_-]?key/i
+const URL_KEY = /url/i
+const SECRET_FIELDS =
+  /("?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|x-amz-[a-z-]+)"?\s*[:=]\s*)(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s,"'}]+))/gi
 const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi
 
 /** Keeps only URL origin and path; presigned query strings never enter artifacts. */
@@ -11,7 +15,16 @@ export function redactUrl(value: string): string {
     const url = new URL(value)
     return `${url.origin}${url.pathname}`
   } catch {
-    return redactText(value)
+    const stripped = value.replace(/[?#][\s\S]*/, '')
+    if (stripped !== value) {
+      try {
+        const url = new URL(stripped)
+        return `${url.origin}${url.pathname}`
+      } catch {
+        return REDACTED
+      }
+    }
+    return REDACTED
   }
 }
 
@@ -19,7 +32,14 @@ export function redactUrl(value: string): string {
 export function redactText(value: string): string {
   let redacted = value.replace(/https?:\/\/[^\s"']+/gi, (url) => redactUrl(url))
   redacted = redacted.replace(BEARER, `Bearer ${REDACTED}`)
-  return redacted.replace(SECRET_FIELDS, `$1${REDACTED}`)
+  return redacted.replace(
+    SECRET_FIELDS,
+    (_match, prefix: string, doubleQuoted: string | undefined, singleQuoted: string | undefined) => {
+      if (doubleQuoted !== undefined) return `${prefix}"${REDACTED}"`
+      if (singleQuoted !== undefined) return `${prefix}'${REDACTED}'`
+      return `${prefix}${REDACTED}`
+    },
+  )
 }
 
 export interface SafeDiagnostic {
@@ -32,20 +52,42 @@ export interface SafeDiagnostic {
   [key: string]: unknown
 }
 
-/** Produces a JSON-safe diagnostic record with URLs and credential-like fields redacted. */
-export function safeDiagnostic(input: SafeDiagnostic): SafeDiagnostic {
+function sanitizeUnknown(value: unknown): unknown {
+  if (value === undefined) return undefined
+  if (typeof value === 'string') return redactText(value)
+  if (Array.isArray(value)) return value.map(sanitizeUnknown)
+  if (typeof value === 'object' && value !== null) return sanitizeRecord(value as Record<string, unknown>)
+  return value
+}
+
+function sanitizeRecord(input: Record<string, unknown>): SafeDiagnostic {
   const output: SafeDiagnostic = {}
   for (const [key, value] of Object.entries(input)) {
     if (value === undefined) continue
-    if (/url|authorization|token|password|secret|credential|api[_-]?key/i.test(key)) {
-      output[key] = typeof value === 'string' ? redactUrl(value) : REDACTED
-    } else if (typeof value === 'string') {
-      output[key] = redactText(value)
-    } else {
+
+    if (PRESERVED_KEYS.has(key)) {
       output[key] = value
+      continue
     }
+
+    if (CREDENTIAL_KEY.test(key)) {
+      output[key] = REDACTED
+      continue
+    }
+
+    if (typeof value === 'string') {
+      output[key] = URL_KEY.test(key) ? redactUrl(value) : redactText(value)
+      continue
+    }
+
+    output[key] = sanitizeUnknown(value)
   }
   return output
+}
+
+/** Produces a JSON-safe diagnostic record with URLs and credential-like fields redacted. */
+export function safeDiagnostic(input: SafeDiagnostic): SafeDiagnostic {
+  return sanitizeRecord(input)
 }
 
 export async function attachSafeDiagnostic(testInfo: TestInfo, name: string, diagnostic: SafeDiagnostic): Promise<void> {
