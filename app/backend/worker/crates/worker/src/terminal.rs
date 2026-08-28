@@ -180,13 +180,17 @@ where
             return Ok(());
         }
 
+        let mut failed = false;
         for item in &owned {
             if let Err(failure) = self.process_owned(item) {
                 self.fail_owned(&item.job_id, failure)?;
+                failed = true;
+            }
+        }
+        if failed {
                 // Do not acknowledge, and do not fail the worker process. Phase 1
                 // has no retry policy; visibility timeout redelivers the message.
                 return Ok(());
-            }
         }
 
         // Acknowledgement is last. In particular, a delete failure must not
