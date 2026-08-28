@@ -56,4 +56,28 @@ describe('E2E fixtures and diagnostics', () => {
       uploadUrl: 'https://s3.example/video.mp4',
     })
   })
+
+  it('redacts complete cookie header values', () => {
+    expect(
+      safeDiagnostic({
+        request: { headers: { cookie: 'session=abc', 'set-cookie': 'session=abc' } },
+      }),
+    ).toEqual({
+      request: { headers: { cookie: '[REDACTED]', 'set-cookie': '[REDACTED]' } },
+    })
+    expect(redactText('Cookie: session=abc')).toBe('Cookie: [REDACTED]')
+    expect(redactText('Set-Cookie: session=abc')).toBe('Set-Cookie: [REDACTED]')
+  })
+
+  it('redacts complete non-Bearer authorization values', () => {
+    expect(redactText('Authorization: Basic dXNlcjpwYXNz')).toBe('Authorization: [REDACTED]')
+    expect(redactText('Proxy-Authorization: Basic dXNlcjpwYXNz')).toBe('Proxy-Authorization: [REDACTED]')
+  })
+
+  it('strips query strings from preserved origin and path', () => {
+    expect(safeDiagnostic({ origin: 'https://api.example?token=secret', path: '/videos/123?token=secret' })).toEqual({
+      origin: 'https://api.example',
+      path: '/videos/123',
+    })
+  })
 })
