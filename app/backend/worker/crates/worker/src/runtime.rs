@@ -324,4 +324,35 @@ mod tests {
         processor.gate.notify_waiters();
         task.await.unwrap().unwrap();
     }
+
+    #[tokio::test]
+    async fn panicking_task_is_returned_as_a_task_error() {
+        #[derive(Clone)]
+        struct PanicProcessor;
+
+        impl MessageProcessor for PanicProcessor {
+            type Error = Infallible;
+
+            async fn process(&self, _message: Message) -> Result<(), Self::Error> {
+                panic!("encode task panicked");
+            }
+        }
+
+        let receiver = ScriptedReceiver {
+            replies: VecDeque::from([Ok(Some(message("one")))]),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let (_stop, shutdown) = watch::channel(false);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run(receiver, PanicProcessor, shutdown, 1),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(error, RunError::Task(ref join) if join.is_panic()),
+            "{error}"
+        );
+    }
 }

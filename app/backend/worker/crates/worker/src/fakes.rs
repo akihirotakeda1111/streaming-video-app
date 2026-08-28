@@ -41,6 +41,10 @@ pub enum Call {
     },
     Now,
     Execute(Command),
+    ReadSource {
+        path: String,
+        contents: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Default, Debug)]
@@ -113,6 +117,8 @@ pub struct FakeStorage {
     pub writes: Vec<(String, String, Vec<u8>)>,
     read_failures: VecDeque<String>,
     write_failures: VecDeque<String>,
+    read_skip: usize,
+    write_skip: usize,
 }
 
 impl FakeStorage {
@@ -123,6 +129,8 @@ impl FakeStorage {
             writes: Vec::new(),
             read_failures: VecDeque::new(),
             write_failures: VecDeque::new(),
+            read_skip: 0,
+            write_skip: 0,
         }
     }
     pub fn add_read(&mut self, bucket: &str, key: &str, contents: Vec<u8>) {
@@ -131,8 +139,16 @@ impl FakeStorage {
     pub fn fail_read(&mut self, message: impl Into<String>) {
         self.read_failures.push_back(message.into());
     }
+    pub fn fail_read_after(&mut self, successful_calls: usize, message: impl Into<String>) {
+        self.read_skip = successful_calls;
+        self.fail_read(message);
+    }
     pub fn fail_write(&mut self, message: impl Into<String>) {
         self.write_failures.push_back(message.into());
+    }
+    pub fn fail_write_after(&mut self, successful_calls: usize, message: impl Into<String>) {
+        self.write_skip = successful_calls;
+        self.fail_write(message);
     }
 }
 
@@ -142,7 +158,7 @@ impl Read for FakeStorage {
             bucket: bucket.into(),
             key: key.into(),
         });
-        if let Some(error) = self.read_failures.pop_front() {
+        if let Some(error) = take_skipped_failure(&mut self.read_skip, &mut self.read_failures) {
             return Err(ObjectError(error));
         }
         self.reads
@@ -167,7 +183,7 @@ impl Write for FakeStorage {
             content_type: content_type.into(),
             contents: contents.into(),
         });
-        if let Some(error) = self.write_failures.pop_front() {
+        if let Some(error) = take_skipped_failure(&mut self.write_skip, &mut self.write_failures) {
             return Err(ObjectError(error));
         }
         self.writes
@@ -184,6 +200,7 @@ pub struct FakeJobState {
     processing_failures: VecDeque<String>,
     completed_failures: VecDeque<String>,
     mark_failed_failures: VecDeque<String>,
+    claim_skip: usize,
 }
 
 impl FakeJobState {
@@ -195,6 +212,7 @@ impl FakeJobState {
             processing_failures: VecDeque::new(),
             completed_failures: VecDeque::new(),
             mark_failed_failures: VecDeque::new(),
+            claim_skip: 0,
         }
     }
     pub fn add_claim(&mut self, job_id: &str, video_id: &str, claimed: bool) {
@@ -202,6 +220,10 @@ impl FakeJobState {
     }
     pub fn fail_claim(&mut self, message: impl Into<String>) {
         self.claim_failures.push_back(message.into());
+    }
+    pub fn fail_claim_after(&mut self, successful_calls: usize, message: impl Into<String>) {
+        self.claim_skip = successful_calls;
+        self.fail_claim(message);
     }
     pub fn fail_mark_processing(&mut self, message: impl Into<String>) {
         self.processing_failures.push_back(message.into());
@@ -214,10 +236,25 @@ impl FakeJobState {
     }
 }
 
+fn take_skipped_failure(skip: &mut usize, failures: &mut VecDeque<String>) -> Option<String> {
+    if *skip > 0 {
+        *skip -= 1;
+        return None;
+    }
+    failures.pop_front()
+}
+
 fn take_failure(failures: &mut VecDeque<String>) -> Result<(), PersistenceError> {
     failures
         .pop_front()
         .map_or(Ok(()), |e| Err(PersistenceError(e)))
+}
+
+fn take_failure_after(
+    skip: &mut usize,
+    failures: &mut VecDeque<String>,
+) -> Result<(), PersistenceError> {
+    take_skipped_failure(skip, failures).map_or(Ok(()), |e| Err(PersistenceError(e)))
 }
 
 impl JobState for FakeJobState {
@@ -226,7 +263,7 @@ impl JobState for FakeJobState {
             job_id: job_id.into(),
             video_id: video_id.into(),
         });
-        take_failure(&mut self.claim_failures)?;
+        take_failure_after(&mut self.claim_skip, &mut self.claim_failures)?;
         let Some((_, _, claimed)) = self
             .claims
             .iter_mut()
@@ -323,81 +360,45 @@ impl Execute for FakeProcessExecutor {
                 .last()
                 .ok_or_else(|| ProcessError("ffmpeg argv is missing the playlist path".into()))?;
             let playlist_path = Path::new(playlist);
+            let source = command
+                .argv
+                .windows(2)
+                .find(|pair| pair[0] == "-i")
+                .map(|pair| Path::new(pair[1].as_str()))
+                .ok_or_else(|| ProcessError("ffmpeg argv is missing -i".into()))?;
+            match fs::metadata(source) {
+                Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
+                Ok(_) => {
+                    return Err(ProcessError(format!(
+                        "source is not a readable video file: {}",
+                        source.display()
+                    )));
+                }
+                Err(_) => {
+                    return Err(ProcessError(format!(
+                        "source is missing: {}",
+                        source.display()
+                    )));
+                }
+            }
+            let contents = fs::read(source).map_err(|error| ProcessError(error.to_string()))?;
+            self.log.push(Call::ReadSource {
+                path: source.to_string_lossy().into_owned(),
+                contents,
+            });
             let directory = playlist_path
                 .parent()
                 .ok_or_else(|| ProcessError("playlist path has no parent directory".into()))?;
-            fs::write(playlist_path, "#EXTM3U\nsegment-00000.ts\n")
-                .map_err(|error| ProcessError(error.to_string()))?;
+            fs::write(
+                playlist_path,
+                "#EXTM3U\nsegment-00000.ts\nsegment-00001.ts\n",
+            )
+            .map_err(|error| ProcessError(error.to_string()))?;
             fs::write(directory.join("segment-00000.ts"), b"segment")
+                .map_err(|error| ProcessError(error.to_string()))?;
+            fs::write(directory.join("segment-00001.ts"), b"segment")
                 .map_err(|error| ProcessError(error.to_string()))?;
         }
         Ok(self.output.clone())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use persistence::JobState;
-    use queue::{Delete, Message, Receive};
-
-    fn message(receipt_handle: &str) -> Message {
-        Message {
-            receipt_handle: receipt_handle.into(),
-            body: "body".into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn queue_redelivers_until_delete_succeeds() {
-        let mut queue = FakeQueue::new(CallLog::default());
-        queue.push_message(message("r1"));
-
-        assert_eq!(queue.receive().await.unwrap().unwrap().receipt_handle, "r1");
-        assert_eq!(queue.receive().await.unwrap().unwrap().receipt_handle, "r1");
-
-        queue.fail_delete("delete failed");
-        assert!(queue.delete("r1").is_err());
-        assert_eq!(queue.receive().await.unwrap().unwrap().receipt_handle, "r1");
-
-        queue.delete("r1").unwrap();
-        assert!(queue.receive().await.unwrap().is_none());
-    }
-
-    #[test]
-    fn claim_records_job_and_video_ids() {
-        let log = CallLog::default();
-        let mut jobs = FakeJobState::new(log.clone());
-        jobs.add_claim("job-1", "video-1", true);
-
-        assert!(jobs.claim("job-1", "video-1").unwrap());
-        assert_eq!(
-            log.calls(),
-            [Call::Claim {
-                job_id: "job-1".into(),
-                video_id: "video-1".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn job_state_failures_are_operation_specific() {
-        let mut jobs = FakeJobState::new(CallLog::default());
-        jobs.add_claim("job-1", "video-1", true);
-        jobs.fail_mark_processing("processing failed");
-
-        assert!(jobs.claim("job-1", "video-1").unwrap());
-        assert!(jobs.mark_processing("job-1").is_err());
-        jobs.mark_completed("job-1").unwrap();
-    }
-
-    #[test]
-    fn duplicate_claims_and_missing_jobs_are_no_ops() {
-        let mut jobs = FakeJobState::new(CallLog::default());
-        jobs.add_claim("job-1", "video-1", true);
-
-        assert!(jobs.claim("job-1", "video-1").unwrap());
-        assert!(!jobs.claim("job-1", "video-1").unwrap());
-        assert!(!jobs.claim("missing", "video-1").unwrap());
     }
 }

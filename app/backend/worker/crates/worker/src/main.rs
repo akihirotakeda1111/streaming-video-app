@@ -101,3 +101,47 @@ async fn main() {
     }
     info!("worker shut down");
 }
+
+#[cfg(test)]
+mod tests {
+    const DOCKERFILE: &str = include_str!("../../../Dockerfile");
+    const README: &str = include_str!("../../../README.md");
+
+    #[test]
+    fn dockerfile_bundles_pinned_ffmpeg_and_ffprobe_for_an_unprivileged_worker() {
+        assert!(DOCKERFILE.contains("FROM mwader/static-ffmpeg:7.1.1 AS media-tools"));
+        assert!(DOCKERFILE.contains("COPY --from=media-tools /ffmpeg /usr/local/bin/ffmpeg"));
+        assert!(DOCKERFILE.contains("COPY --from=media-tools /ffprobe /usr/local/bin/ffprobe"));
+        assert!(DOCKERFILE.contains(
+            "COPY --from=builder /source/target/release/worker /usr/local/bin/video-worker"
+        ));
+        assert!(DOCKERFILE.contains("ENV FFMPEG_PATH=/usr/local/bin/ffmpeg"));
+        assert!(DOCKERFILE.contains("TMPDIR=/tmp/video-worker"));
+        assert!(
+            DOCKERFILE
+                .contains("/usr/local/bin/ffmpeg -version && /usr/local/bin/ffprobe -version")
+        );
+        assert!(DOCKERFILE.contains("USER worker"));
+        assert!(DOCKERFILE.contains("ENTRYPOINT [\"/usr/local/bin/video-worker\"]"));
+    }
+
+    #[test]
+    fn documented_image_matches_startup_configuration() {
+        assert!(README.contains("mwader/static-ffmpeg:7.1.1"));
+        assert!(README.contains("/usr/local/bin/ffmpeg"));
+        assert!(README.contains("ffprobe"));
+        assert!(README.contains("FFMPEG_PATH"));
+        assert!(README.contains("unprivileged `worker`"));
+        let production = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(production.contains("worker::Config::from_env"));
+        assert!(production.contains("tracing_subscriber::fmt"));
+        assert!(production.contains(".json()"));
+        assert!(production.contains("PHASE1_MAX_CONCURRENCY"));
+        assert!(production.contains("TerminalProcessor::new"));
+        assert!(production.contains("ProcessExecutor"));
+        assert!(!production.contains("password"));
+    }
+}

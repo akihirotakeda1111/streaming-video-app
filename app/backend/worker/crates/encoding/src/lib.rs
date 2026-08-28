@@ -220,6 +220,78 @@ pub mod runtime;
 mod tests {
     use super::*;
 
+    struct FakeProcess {
+        commands: Vec<Command>,
+        status: i32,
+        write_hls: bool,
+    }
+
+    impl FakeProcess {
+        fn succeeding() -> Self {
+            Self {
+                commands: Vec::new(),
+                status: 0,
+                write_hls: true,
+            }
+        }
+
+        fn exiting(status: i32) -> Self {
+            Self {
+                commands: Vec::new(),
+                status,
+                write_hls: false,
+            }
+        }
+    }
+
+    impl Execute for FakeProcess {
+        fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
+            if self.write_hls {
+                let playlist = Path::new(command.argv.last().expect("playlist path"));
+                fs::write(playlist, "#EXTM3U\nsegment-00000.ts\n").unwrap();
+                fs::write(playlist.parent().unwrap().join("segment-00000.ts"), b"ts").unwrap();
+            }
+            self.commands.push(command);
+            Ok(Output {
+                status: self.status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn expected_hls_argv(work_directory: &Path) -> Vec<String> {
+        vec![
+            "-y".into(),
+            "-i".into(),
+            work_directory
+                .join("source.mp4")
+                .to_string_lossy()
+                .into_owned(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-f".into(),
+            "hls".into(),
+            "-start_number".into(),
+            "0".into(),
+            "-hls_time".into(),
+            "6".into(),
+            "-hls_playlist_type".into(),
+            "vod".into(),
+            "-hls_segment_filename".into(),
+            work_directory
+                .join("segment-%05d.ts")
+                .to_string_lossy()
+                .into_owned(),
+            work_directory
+                .join("index.m3u8")
+                .to_string_lossy()
+                .into_owned(),
+        ]
+    }
+
     fn layout(playlist: &str, segments: &[&str]) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("index.m3u8"), playlist).unwrap();
@@ -229,10 +301,29 @@ mod tests {
         directory
     }
 
-    fn invalid_reason(directory: &tempfile::TempDir) -> String {
-        match validate_hls_output(directory.path()) {
+    fn invalid_reason(directory: impl AsRef<Path>) -> String {
+        match validate_hls_output(directory.as_ref()) {
             Err(HlsError::InvalidPlaylist(reason)) => reason,
             other => panic!("expected invalid playlist, got {other:?}"),
+        }
+    }
+
+    fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(original, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (original, link);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "symlinks are not supported",
+            ))
         }
     }
 
@@ -253,8 +344,10 @@ mod tests {
             "#EXTM3U\nsegment-00000.ts\nsegment-00002.ts\n",
             "#EXTM3U\nsegment-00001.ts\n",
         ] {
-            let directory =
-                layout(playlist, &["segment-00000.ts", "segment-00001.ts", "segment-00002.ts"]);
+            let directory = layout(
+                playlist,
+                &["segment-00000.ts", "segment-00001.ts", "segment-00002.ts"],
+            );
             let reason = invalid_reason(&directory);
             assert!(
                 reason.contains("expected media segment"),
@@ -281,5 +374,105 @@ mod tests {
             reason.contains("playlist must start with #EXTM3U"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn encode_hls_passes_fixed_argv_paths_and_segment_pattern() {
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("source.mp4"), b"video").unwrap();
+        let mut executor = FakeProcess::succeeding();
+
+        let output = encode_hls(&mut executor, "ffmpeg", work.path()).unwrap();
+        assert_eq!(executor.commands.len(), 1);
+        assert_eq!(executor.commands[0].executable, PathBuf::from("ffmpeg"));
+        assert_eq!(executor.commands[0].argv, expected_hls_argv(work.path()));
+        assert_eq!(output.playlist, work.path().join("index.m3u8"));
+        assert_eq!(output.segments.len(), 1);
+    }
+
+    #[test]
+    fn encode_hls_rejects_nonzero_ffmpeg_status() {
+        let work = tempfile::tempdir().unwrap();
+        let mut executor = FakeProcess::exiting(1);
+
+        match encode_hls(&mut executor, "ffmpeg", work.path()) {
+            Err(HlsError::Failed(1)) => {}
+            other => panic!("expected Failed(1), got {other:?}"),
+        }
+        assert_eq!(executor.commands[0].executable, PathBuf::from("ffmpeg"));
+        assert_eq!(executor.commands[0].argv, expected_hls_argv(work.path()));
+        assert!(!work.path().join("index.m3u8").exists());
+    }
+
+    #[test]
+    fn rejects_absolute_paths_urls_and_parent_traversal() {
+        let absolute = if cfg!(windows) {
+            r"C:\segment-00000.ts"
+        } else {
+            "/segment-00000.ts"
+        };
+        for reference in [
+            absolute,
+            "https://example.com/segment-00000.ts",
+            "file:///segment-00000.ts",
+            "//cdn.example/segment-00000.ts",
+            "../segment-00000.ts",
+            "foo/../segment-00000.ts",
+        ] {
+            let directory = layout(&format!("#EXTM3U\n{reference}\n"), &[]);
+            let reason = invalid_reason(&directory);
+            assert!(
+                reason.contains("not a safe relative path"),
+                "{reference:?} -> {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_symlink_escaping_work_directory() {
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside.ts");
+        fs::write(&target, b"ts").unwrap();
+        if let Err(error) = symlink_file(&target, &work.path().join("segment-00000.ts")) {
+            eprintln!("skipping symlink test: {error}");
+            return;
+        }
+        fs::write(
+            work.path().join("index.m3u8"),
+            "#EXTM3U\nsegment-00000.ts\n",
+        )
+        .unwrap();
+        let reason = invalid_reason(work.path());
+        assert!(reason.contains("escapes work directory"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_missing_empty_and_non_file_segments() {
+        let missing = layout("#EXTM3U\nsegment-00000.ts\n", &[]);
+        let missing_reason = invalid_reason(&missing);
+        assert!(
+            missing_reason.contains("referenced segment is missing"),
+            "{missing_reason}"
+        );
+
+        for playlist in ["#EXTM3U\n", "#EXTM3U\n#EXT-X-ENDLIST\n"] {
+            let empty = layout(playlist, &[]);
+            let reason = invalid_reason(&empty);
+            assert!(
+                reason.contains("playlist contains no media segments"),
+                "{playlist:?} -> {reason}"
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("index.m3u8"),
+            "#EXTM3U\nsegment-00000.ts\n",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("segment-00000.ts")).unwrap();
+        let reason = invalid_reason(&directory);
+        assert!(reason.contains("media reference is not a file"), "{reason}");
     }
 }

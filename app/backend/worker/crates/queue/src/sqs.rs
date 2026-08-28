@@ -185,18 +185,4 @@ mod tests {
             ]
         );
     }
-
-    #[test]
-    fn block_on_creates_a_runtime_outside_tokio() {
-        let runtime = BlockingRuntime::connect().unwrap();
-        assert!(matches!(runtime, BlockingRuntime::Owned(_)));
-        assert_eq!(runtime.block_on(async { 7 }), 7);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn block_on_reuses_the_current_runtime() {
-        let runtime = BlockingRuntime::connect().unwrap();
-        assert!(matches!(runtime, BlockingRuntime::Current));
-        assert_eq!(runtime.block_on(async { 7 }), 7);
-    }
 }

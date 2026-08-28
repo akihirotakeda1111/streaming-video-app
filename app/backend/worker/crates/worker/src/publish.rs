@@ -161,9 +161,60 @@ mod tests {
             .collect();
         assert_eq!(writes.len(), 1);
         assert!(
+            matches!(&writes[0], Call::Write { key, .. } if key.ends_with("segment-00000.ts")),
+            "{writes:?}"
+        );
+        assert!(
             !writes
                 .iter()
                 .any(|call| matches!(call, Call::Write { key, .. } if key.ends_with("index.m3u8")))
+        );
+    }
+
+    #[test]
+    fn later_segment_failure_prevents_manifest_publication() {
+        let (_directory, output) = output();
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        storage.fail_write_after(1, "second segment upload failed");
+
+        assert!(publish_hls(&mut storage, "video-output", VIDEO_ID, JOB_ID, &output).is_err());
+        let keys: Vec<_> = storage
+            .writes
+            .iter()
+            .map(|(_, key, _)| key.clone())
+            .collect();
+        assert_eq!(
+            keys,
+            [format!(
+                "videos/{VIDEO_ID}/jobs/{JOB_ID}/hls/segment-00000.ts"
+            )]
+        );
+        assert!(
+            log.calls().iter().all(
+                |call| !matches!(call, Call::Write { key, .. } if key.ends_with("index.m3u8"))
+            )
+        );
+    }
+
+    #[test]
+    fn manifest_write_failure_does_not_publish_the_playlist() {
+        let (_directory, output) = output();
+        let mut storage = FakeStorage::new(CallLog::default());
+        storage.fail_write_after(2, "manifest upload failed");
+
+        assert!(publish_hls(&mut storage, "video-output", VIDEO_ID, JOB_ID, &output).is_err());
+        let keys: Vec<_> = storage
+            .writes
+            .iter()
+            .map(|(_, key, _)| key.clone())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                format!("videos/{VIDEO_ID}/jobs/{JOB_ID}/hls/segment-00000.ts"),
+                format!("videos/{VIDEO_ID}/jobs/{JOB_ID}/hls/segment-00001.ts"),
+            ]
         );
     }
 }

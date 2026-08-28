@@ -78,6 +78,24 @@ fn parse_record(record: &Value, configured_input_bucket: &str) -> Option<WorkIte
     })
 }
 
+#[cfg(test)]
+pub(crate) fn source_key(video_id: &str, job_id: &str) -> String {
+    format!("videos/{video_id}/jobs/{job_id}/source.mp4")
+}
+
+#[cfg(test)]
+pub(crate) fn records_notification(records: &[(&str, &str, &str)]) -> String {
+    let encoded: Vec<String> = records
+        .iter()
+        .map(|(event_name, bucket, key)| {
+            format!(
+                r#"{{"eventName":"{event_name}","s3":{{"bucket":{{"name":"{bucket}"}},"object":{{"key":"{key}"}}}}}}"#
+            )
+        })
+        .collect();
+    format!(r#"{{"Records":[{}]}}"#, encoded.join(","))
+}
+
 fn form_decode(value: &str) -> Result<String, ()> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -123,25 +141,28 @@ fn canonical_uuid(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    const FIXTURE: &str =
-        include_str!("../../../../../contracts/examples/s3/object-created.json");
+    const FIXTURE: &str = include_str!("../../../../../contracts/examples/s3/object-created.json");
     const INPUT_BUCKET: &str = "streaming-video-input";
-    const SOURCE_KEY: &str =
-        "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4";
+    const VIDEO_ID: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910a";
+    const JOB_ID: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd67";
+    const VIDEO_ID_2: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910b";
+    const JOB_ID_2: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd68";
 
     fn expected_work_item() -> WorkItem {
+        work_item(VIDEO_ID, JOB_ID)
+    }
+
+    fn work_item(video_id: &str, job_id: &str) -> WorkItem {
         WorkItem {
             bucket: INPUT_BUCKET.to_owned(),
-            key: SOURCE_KEY.to_owned(),
-            video_id: "018f47a2-45c2-7a84-b84f-5f6dd7b5910a".into(),
-            job_id: "018f47a2-4699-7892-9fc0-fbe46d3bbd67".into(),
+            key: source_key(video_id, job_id),
+            video_id: video_id.into(),
+            job_id: job_id.into(),
         }
     }
 
     fn notification(event_name: &str) -> String {
-        format!(
-            r#"{{"Records":[{{"eventName":"{event_name}","s3":{{"bucket":{{"name":"{INPUT_BUCKET}"}},"object":{{"key":"{SOURCE_KEY}"}}}}}}]}}"#
-        )
+        records_notification(&[(event_name, INPUT_BUCKET, &source_key(VIDEO_ID, JOB_ID))])
     }
 
     #[test]
@@ -181,5 +202,103 @@ mod tests {
                 "{event_name}"
             );
         }
+    }
+
+    #[test]
+    fn evaluates_every_record_independently() {
+        let key = source_key(VIDEO_ID, JOB_ID);
+        let key_2 = source_key(VIDEO_ID_2, JOB_ID_2);
+        let body = records_notification(&[
+            ("ObjectCreated:Put", INPUT_BUCKET, &key),
+            ("ObjectCreated:Copy", INPUT_BUCKET, &key_2),
+        ]);
+
+        assert_eq!(
+            parse_notification(&body, INPUT_BUCKET).unwrap(),
+            [work_item(VIDEO_ID, JOB_ID), work_item(VIDEO_ID_2, JOB_ID_2)]
+        );
+    }
+
+    #[test]
+    fn invalid_records_do_not_suppress_later_valid_records() {
+        let key = source_key(VIDEO_ID, JOB_ID);
+        let key_2 = source_key(VIDEO_ID_2, JOB_ID_2);
+        let malformed = "videos/not-a-uuid/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4";
+        let extra = format!("videos/{VIDEO_ID}/jobs/{JOB_ID}/extra/source.mp4");
+        let wrong_suffix = format!("videos/{VIDEO_ID}/jobs/{JOB_ID}/source.mov");
+        let body = records_notification(&[
+            ("ObjectRemoved:Delete", INPUT_BUCKET, &key),
+            ("ObjectCreated:Put", "other-bucket", &key),
+            ("ObjectCreated:Put", INPUT_BUCKET, malformed),
+            ("ObjectCreated:Put", INPUT_BUCKET, &extra),
+            ("ObjectCreated:Put", INPUT_BUCKET, &wrong_suffix),
+            ("ObjectCreated:Put", INPUT_BUCKET, &key),
+            ("ObjectCreated:Post", INPUT_BUCKET, &key_2),
+        ]);
+
+        assert_eq!(
+            parse_notification(&body, INPUT_BUCKET).unwrap(),
+            [work_item(VIDEO_ID, JOB_ID), work_item(VIDEO_ID_2, JOB_ID_2)]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_uuids_wrong_prefix_suffix_and_extra_path_components() {
+        for key in [
+            "videos/018F47A2-45C2-7A84-B84F-5F6DD7B5910A/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4",
+            "videos/not-a-uuid/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4",
+            "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd6/source.mp4",
+            "clips/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4",
+            "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/job/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4",
+            "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mov",
+            "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4/extra",
+            "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/extra/source.mp4",
+        ] {
+            assert_eq!(
+                parse_notification(&notification_with_key(key), INPUT_BUCKET).unwrap(),
+                [],
+                "{key}"
+            );
+        }
+    }
+
+    fn notification_with_key(key: &str) -> String {
+        records_notification(&[("ObjectCreated:Put", INPUT_BUCKET, key)])
+    }
+
+    #[test]
+    fn form_decodes_plus_and_percent_encoding_before_validation() {
+        let encoded = format!(
+            "videos/018f47a2%2d45c2%2d7a84%2db84f%2d5f6dd7b5910a/jobs/018f47a2%2d4699%2d7892%2d9fc0%2dfbe46d3bbd67/source%2emp4"
+        );
+        assert_eq!(
+            parse_notification(&notification_with_key(&encoded), INPUT_BUCKET).unwrap(),
+            [expected_work_item()]
+        );
+
+        let plus_rejected = "videos/018f47a2+45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4";
+        assert_eq!(
+            parse_notification(&notification_with_key(plus_rejected), INPUT_BUCKET).unwrap(),
+            []
+        );
+        assert_eq!(
+            parse_notification(
+                &notification_with_key("videos/%ZZ/jobs/x/source.mp4"),
+                INPUT_BUCKET
+            )
+            .unwrap(),
+            []
+        );
+    }
+
+    #[test]
+    fn test_event_is_not_an_encoding_request() {
+        assert!(
+            parse_notification(
+                r#"{"Service":"Amazon S3","Event":"s3:TestEvent"}"#,
+                INPUT_BUCKET
+            )
+            .is_err()
+        );
     }
 }

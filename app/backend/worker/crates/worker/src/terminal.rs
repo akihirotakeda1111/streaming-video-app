@@ -188,9 +188,9 @@ where
             }
         }
         if failed {
-                // Do not acknowledge, and do not fail the worker process. Phase 1
-                // has no retry policy; visibility timeout redelivers the message.
-                return Ok(());
+            // Do not acknowledge, and do not fail the worker process. Phase 1
+            // has no retry policy; visibility timeout redelivers the message.
+            return Ok(());
         }
 
         // Acknowledgement is last. In particular, a delete failure must not
@@ -206,6 +206,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::records_notification;
     use crate::fakes::{Call, CallLog, FakeJobState, FakeProcessExecutor, FakeQueue, FakeStorage};
 
     const EVENT: &str = include_str!("../../../../../contracts/examples/s3/object-created.json");
@@ -214,6 +215,9 @@ mod tests {
     const VIDEO: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910a";
     const JOB: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd67";
     const KEY: &str = "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4";
+    const VIDEO_2: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910b";
+    const JOB_2: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd68";
+    const KEY_2: &str = "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910b/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd68/source.mp4";
 
     fn message() -> Message {
         Message {
@@ -365,5 +369,490 @@ mod tests {
         let calls = log.calls();
         assert!(calls.iter().any(|c| matches!(c, Call::MarkCompleted(_))));
         assert!(!calls.iter().any(|c| matches!(c, Call::MarkFailed { .. })));
+    }
+
+    fn successful_write_keys(
+        processor: &TerminalProcessor<FakeJobState, FakeStorage, FakeProcessExecutor, FakeQueue>,
+    ) -> Vec<String> {
+        processor
+            .storage
+            .lock()
+            .unwrap()
+            .writes
+            .iter()
+            .map(|(_, key, _)| key.clone())
+            .collect()
+    }
+
+    fn failed_without_completion_or_delete(calls: &[Call]) {
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, Call::MarkFailed { reason, .. } if !reason.is_empty())),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::MarkCompleted(_))),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::Delete(_))),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_segment_publish_failure_does_not_complete_or_delete() {
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let p = processor(log.clone(), root.path());
+        p.storage
+            .lock()
+            .unwrap()
+            .fail_write_after(1, "second segment failed");
+
+        p.process(message()).await.unwrap();
+        let calls = log.calls();
+        failed_without_completion_or_delete(&calls);
+        let keys = successful_write_keys(&p);
+        assert_eq!(
+            keys.iter()
+                .filter(|key| key.ends_with(".ts") || key.ends_with("index.m3u8"))
+                .count(),
+            1,
+            "{keys:?}"
+        );
+        assert!(
+            keys.iter().any(|key| key.ends_with("segment-00000.ts")),
+            "{keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|key| key.ends_with("index.m3u8")),
+            "{keys:?}"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn manifest_publish_failure_does_not_complete_or_delete() {
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let p = processor(log.clone(), root.path());
+        p.storage
+            .lock()
+            .unwrap()
+            .fail_write_after(2, "manifest upload failed");
+
+        p.process(message()).await.unwrap();
+        let calls = log.calls();
+        failed_without_completion_or_delete(&calls);
+        let keys = successful_write_keys(&p);
+        assert!(
+            keys.iter().any(|key| key.ends_with("segment-00000.ts")),
+            "{keys:?}"
+        );
+        assert!(
+            keys.iter().any(|key| key.ends_with("segment-00001.ts")),
+            "{keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|key| key.ends_with("index.m3u8")),
+            "{keys:?}"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn downloaded_source_is_source_mp4_with_object_bytes() {
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let p = processor(log.clone(), root.path());
+        p.process(message()).await.unwrap();
+        let sources: Vec<_> = log
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::ReadSource { path, contents } => Some((path, contents)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(
+            std::path::Path::new(&sources[0].0).file_name().unwrap(),
+            "source.mp4"
+        );
+        assert_eq!(sources[0].1, b"video");
+    }
+
+    #[tokio::test]
+    async fn mark_failed_persistence_failure_surfaces_without_delete() {
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let p = processor(log.clone(), root.path());
+        p.storage.lock().unwrap().fail_read("no source");
+        p.jobs.lock().unwrap().fail_mark_failed("catalog down");
+
+        let error = p.process(message()).await.unwrap_err();
+        assert!(
+            error.0.contains("catalog down") && error.0.contains("FAILED"),
+            "{error}"
+        );
+        let calls = log.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::MarkCompleted(_))),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::Delete(_))),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_directory_create_failure_marks_failed_without_delete() {
+        let log = CallLog::default();
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let p = processor(log.clone(), blocker.path());
+        p.process(message()).await.unwrap();
+        let calls = log.calls();
+        failed_without_completion_or_delete(&calls);
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                Call::MarkFailed { reason, .. } if reason.contains("create work directory")
+            )),
+            "{calls:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn work_directory_removal_failure_does_not_complete_or_delete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use encoding::{Command, Output, ProcessError};
+
+        struct FreezingExecutor;
+
+        impl Execute for FreezingExecutor {
+            fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
+                let playlist = PathBuf::from(command.argv.last().expect("playlist"));
+                let directory = playlist.parent().expect("playlist parent");
+                let source = command
+                    .argv
+                    .windows(2)
+                    .find(|pair| pair[0] == "-i")
+                    .map(|pair| PathBuf::from(&pair[1]))
+                    .expect("-i");
+                let _ = fs::read(&source).map_err(|error| ProcessError(error.to_string()))?;
+                fs::write(&playlist, "#EXTM3U\nsegment-00000.ts\nsegment-00001.ts\n")
+                    .map_err(|error| ProcessError(error.to_string()))?;
+                fs::write(directory.join("segment-00000.ts"), b"segment")
+                    .map_err(|error| ProcessError(error.to_string()))?;
+                fs::write(directory.join("segment-00001.ts"), b"segment")
+                    .map_err(|error| ProcessError(error.to_string()))?;
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o555))
+                    .map_err(|error| ProcessError(error.to_string()))?;
+                Ok(Output {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut jobs = FakeJobState::new(log.clone());
+        jobs.add_claim(JOB, VIDEO, true);
+        let mut storage = FakeStorage::new(log.clone());
+        storage.add_read(INPUT, KEY, b"video".to_vec());
+        let p = TerminalProcessor::new(
+            jobs,
+            storage,
+            FreezingExecutor,
+            FakeQueue::new(log.clone()),
+            INPUT,
+            OUTPUT_BUCKET,
+            "ffmpeg",
+            root.path(),
+        );
+        p.process(message()).await.unwrap();
+        let calls = log.calls();
+        failed_without_completion_or_delete(&calls);
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                Call::MarkFailed { reason, .. } if reason.contains("remove work directory")
+            )),
+            "{calls:?}"
+        );
+        for entry in fs::read_dir(root.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn two_job_message() -> Message {
+        Message {
+            receipt_handle: "receipt".into(),
+            body: records_notification(&[
+                ("ObjectCreated:Put", INPUT, KEY),
+                ("ObjectCreated:Put", INPUT, KEY_2),
+            ]),
+        }
+    }
+
+    fn two_job_processor(
+        log: CallLog,
+        root: &std::path::Path,
+    ) -> TerminalProcessor<FakeJobState, FakeStorage, FakeProcessExecutor, FakeQueue> {
+        let mut jobs = FakeJobState::new(log.clone());
+        jobs.add_claim(JOB, VIDEO, true);
+        jobs.add_claim(JOB_2, VIDEO_2, true);
+        let mut storage = FakeStorage::new(log.clone());
+        storage.add_read(INPUT, KEY, b"video".to_vec());
+        storage.add_read(INPUT, KEY_2, b"video".to_vec());
+        TerminalProcessor::new(
+            jobs,
+            storage,
+            FakeProcessExecutor::stub_hls(log.clone()),
+            FakeQueue::new(log),
+            INPUT,
+            OUTPUT_BUCKET,
+            "ffmpeg",
+            root,
+        )
+    }
+
+    #[tokio::test]
+    async fn two_owned_jobs_both_complete_then_delete() {
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let p = two_job_processor(log.clone(), root.path());
+
+        p.process(two_job_message()).await.unwrap();
+        let calls = log.calls();
+        let first_claim = call_index(
+            &calls,
+            |c| matches!(c, Call::Claim { job_id, .. } if job_id == JOB),
+        );
+        let second_claim = call_index(
+            &calls,
+            |c| matches!(c, Call::Claim { job_id, .. } if job_id == JOB_2),
+        );
+        let first_processing = call_index(
+            &calls,
+            |c| matches!(c, Call::MarkProcessing(id) if id == JOB),
+        );
+        let first_completed = call_index(
+            &calls,
+            |c| matches!(c, Call::MarkCompleted(id) if id == JOB),
+        );
+        let second_completed = call_index(
+            &calls,
+            |c| matches!(c, Call::MarkCompleted(id) if id == JOB_2),
+        );
+        let deleted = call_index(
+            &calls,
+            |c| matches!(c, Call::Delete(handle) if handle == "receipt"),
+        );
+        assert!(
+            first_claim < second_claim
+                && second_claim < first_processing
+                && first_completed < second_completed
+                && second_completed < deleted,
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| matches!(c, Call::MarkFailed { .. })));
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn first_job_failure_still_processes_the_second_job() {
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let p = two_job_processor(log.clone(), root.path());
+        p.storage.lock().unwrap().fail_read("no source");
+
+        p.process(two_job_message()).await.unwrap();
+        let calls = log.calls();
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, Call::MarkFailed { job_id, reason } if job_id == JOB && !reason.is_empty())
+            ),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, Call::MarkCompleted(id) if id == JOB_2)),
+            "{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::MarkCompleted(id) if id == JOB)),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::Delete(_))),
+            "{calls:?}"
+        );
+        assert_eq!(
+            p.jobs.lock().unwrap().claims,
+            [
+                (JOB.to_owned(), VIDEO.to_owned(), false),
+                (JOB_2.to_owned(), VIDEO_2.to_owned(), false),
+            ]
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+
+        p.process(two_job_message()).await.unwrap();
+        let redelivery = log.calls();
+        assert_eq!(
+            redelivery
+                .iter()
+                .filter(|c| matches!(
+                    c,
+                    Call::MarkProcessing(_)
+                        | Call::MarkCompleted(_)
+                        | Call::MarkFailed { .. }
+                        | Call::Delete(_)
+                ))
+                .count(),
+            calls
+                .iter()
+                .filter(|c| matches!(
+                    c,
+                    Call::MarkProcessing(_)
+                        | Call::MarkCompleted(_)
+                        | Call::MarkFailed { .. }
+                        | Call::Delete(_)
+                ))
+                .count(),
+            "{redelivery:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_job_failure_keeps_the_first_completed_without_delete() {
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let p = two_job_processor(log.clone(), root.path());
+        p.storage.lock().unwrap().fail_read_after(1, "no source");
+
+        p.process(two_job_message()).await.unwrap();
+        let calls = log.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, Call::MarkCompleted(id) if id == JOB)),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, Call::MarkFailed { job_id, reason } if job_id == JOB_2 && !reason.is_empty())
+            ),
+            "{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::MarkFailed { job_id, .. } if job_id == JOB)),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::Delete(_))),
+            "{calls:?}"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn mixed_invalid_and_already_claimed_records_process_only_owned_jobs() {
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut jobs = FakeJobState::new(log.clone());
+        jobs.add_claim(JOB, VIDEO, false);
+        jobs.add_claim(JOB_2, VIDEO_2, true);
+        let mut storage = FakeStorage::new(log.clone());
+        storage.add_read(INPUT, KEY_2, b"video".to_vec());
+        let p = TerminalProcessor::new(
+            jobs,
+            storage,
+            FakeProcessExecutor::stub_hls(log.clone()),
+            FakeQueue::new(log.clone()),
+            INPUT,
+            OUTPUT_BUCKET,
+            "ffmpeg",
+            root.path(),
+        );
+        let message = Message {
+            receipt_handle: "receipt".into(),
+            body: records_notification(&[
+                ("ObjectRemoved:Delete", INPUT, KEY),
+                ("ObjectCreated:Put", INPUT, KEY),
+                ("ObjectCreated:Put", "other-bucket", KEY_2),
+                ("ObjectCreated:Put", INPUT, KEY_2),
+            ]),
+        };
+
+        p.process(message).await.unwrap();
+        let calls = log.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::MarkProcessing(id) if id == JOB)),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, Call::MarkCompleted(id) if id == JOB_2)),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, Call::Delete(handle) if handle == "receipt")),
+            "{calls:?}"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn claim_error_after_first_job_does_not_process_any_owned_work() {
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let p = two_job_processor(log.clone(), root.path());
+        p.jobs
+            .lock()
+            .unwrap()
+            .fail_claim_after(1, "connection reset");
+
+        let error = p.process(two_job_message()).await.unwrap_err();
+        assert!(error.0.contains("claim notification"), "{error}");
+        let calls = log.calls();
+        assert_eq!(
+            calls,
+            [
+                Call::Claim {
+                    job_id: JOB.into(),
+                    video_id: VIDEO.into(),
+                },
+                Call::Claim {
+                    job_id: JOB_2.into(),
+                    video_id: VIDEO_2.into(),
+                },
+            ]
+        );
+        assert_eq!(
+            p.jobs.lock().unwrap().claims,
+            [
+                (JOB.to_owned(), VIDEO.to_owned(), false),
+                (JOB_2.to_owned(), VIDEO_2.to_owned(), true),
+            ]
+        );
     }
 }

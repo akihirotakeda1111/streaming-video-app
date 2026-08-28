@@ -297,4 +297,100 @@ mod tests {
                 .unwrap_or_else(|_| panic!("expected {region} to be accepted"));
         }
     }
+
+    fn load(values: &HashMap<&'static str, String>) -> Result<Config, ConfigError> {
+        Config::from_lookup(|name| values.get(name).cloned())
+    }
+
+    #[test]
+    fn trims_whitespace_and_rejects_blank_required_values() {
+        let mut values = valid();
+        values.insert(
+            DATABASE_URL,
+            "  postgres://user:password@localhost/video  ".into(),
+        );
+        values.insert(QUEUE_URL, "\thttps://sqs.example.test/queue\n".into());
+        let config = load(&values).unwrap();
+        assert_eq!(
+            config.database_url,
+            "postgres://user:password@localhost/video"
+        );
+        assert_eq!(config.queue_url, "https://sqs.example.test/queue");
+
+        for variable in [
+            DATABASE_URL,
+            AWS_REGION,
+            QUEUE_URL,
+            INPUT_BUCKET,
+            OUTPUT_BUCKET,
+            FFMPEG_PATH,
+            TEMPORARY_DIRECTORY,
+        ] {
+            let mut blank = valid();
+            blank.insert(variable, "   ".into());
+            let error = load(&blank).unwrap_err();
+            assert_eq!(error.variable, variable, "{variable}");
+            assert_eq!(error.reason, "is required");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_postgres_and_queue_urls() {
+        for (variable, value, reason) in [
+            (DATABASE_URL, "not-a-url", "is malformed"),
+            (
+                DATABASE_URL,
+                "http://localhost/video",
+                "must be a PostgreSQL URL",
+            ),
+            (DATABASE_URL, "postgres://", "must be a PostgreSQL URL"),
+            (QUEUE_URL, "not-a-url", "is malformed"),
+            (
+                QUEUE_URL,
+                "ftp://sqs.example.test/queue",
+                "must be an HTTP(S) URL",
+            ),
+            (QUEUE_URL, "https://", "is malformed"),
+            (QUEUE_URL, "file:///tmp/queue", "must be an HTTP(S) URL"),
+        ] {
+            let mut values = valid();
+            values.insert(variable, value.into());
+            let error = load(&values).unwrap_err();
+            assert_eq!(error.variable, variable, "{variable}={value}");
+            assert_eq!(error.reason, reason, "{variable}={value}");
+        }
+
+        let mut values = valid();
+        values.insert(DATABASE_URL, "postgresql://localhost/video".into());
+        load(&values).unwrap();
+        values.insert(QUEUE_URL, "http://sqs.example.test/queue".into());
+        load(&values).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_s3_bucket_names() {
+        let too_long = "a".repeat(64);
+        for bucket in [
+            "ab",
+            too_long.as_str(),
+            "Video-input",
+            "192.168.0.1",
+            "foo..bar",
+            "foo.-bar",
+            "foo-.bar",
+            "-leading",
+            "trailing-",
+            ".leading",
+            "trailing.",
+        ] {
+            let mut values = valid();
+            values.insert(INPUT_BUCKET, bucket.into());
+            let error = load(&values).unwrap_err();
+            assert_eq!(error.variable, INPUT_BUCKET, "{bucket}");
+            assert_eq!(
+                error.reason, "must be a valid lowercase S3 bucket name",
+                "{bucket}"
+            );
+        }
+    }
 }

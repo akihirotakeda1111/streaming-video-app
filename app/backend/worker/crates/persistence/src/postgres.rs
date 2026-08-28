@@ -133,18 +133,22 @@ fn map_error(error: postgres::Error) -> PersistenceError {
 }
 
 #[cfg(test)]
+#[path = "postgres_live.rs"]
+mod live;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     struct FakeDatabase {
-        statements: Vec<String>,
+        parameters: Vec<Vec<String>>,
         changed: u64,
     }
 
     impl Default for FakeDatabase {
         fn default() -> Self {
             Self {
-                statements: Vec::new(),
+                parameters: Vec::new(),
                 changed: 1,
             }
         }
@@ -153,12 +157,17 @@ mod tests {
     impl Database for FakeDatabase {
         fn execute(
             &mut self,
-            statement: &str,
-            _parameters: &[&(dyn ToSql + Sync)],
+            _statement: &str,
+            parameters: &[&str],
         ) -> Result<u64, postgres::Error> {
-            self.statements.push(statement.into());
+            self.parameters
+                .push(parameters.iter().map(|value| (*value).to_owned()).collect());
             Ok(self.changed)
         }
+    }
+
+    fn jobs() -> PostgresJobState<FakeDatabase> {
+        PostgresJobState::new(FakeDatabase::default())
     }
 
     #[test]
@@ -177,15 +186,31 @@ mod tests {
     }
 
     #[test]
-    fn claim_uses_conditional_upload_to_queued_update() {
-        let mut jobs = PostgresJobState::new(FakeDatabase::default());
-        assert!(jobs.claim("job-id", "video-id").unwrap());
-        let statement = &jobs.database.statements[0];
-        assert!(statement.contains("UPDATE jobs SET status = 'QUEUED'"));
-        assert!(statement.contains("updated_at = CURRENT_TIMESTAMP"));
-        assert!(statement.contains("id = $1::text::uuid"));
-        assert!(statement.contains("video_id = $2::text::uuid"));
-        assert!(statement.contains("status = 'UPLOADING'"));
+    fn driver_bindings_use_contract_values_in_call_order() {
+        let mut claim = jobs();
+        assert!(claim.claim("job-id", "video-id").unwrap());
+        assert_eq!(claim.database.parameters, [["job-id", "video-id"]]);
+
+        let mut processing = jobs();
+        processing.mark_processing("job-id").unwrap();
+        assert_eq!(
+            processing.database.parameters,
+            [["PROCESSING", "job-id", "QUEUED"]]
+        );
+
+        let mut completed = jobs();
+        completed.mark_completed("job-id").unwrap();
+        assert_eq!(
+            completed.database.parameters,
+            [["COMPLETED", "job-id", "PROCESSING"]]
+        );
+
+        let mut failed = jobs();
+        failed.mark_failed("job-id", "ffmpeg exited").unwrap();
+        assert_eq!(
+            failed.database.parameters,
+            [["FAILED", "ENCODING_FAILED", "ffmpeg exited", "job-id"]]
+        );
     }
 
     #[test]
@@ -198,12 +223,13 @@ mod tests {
     }
 
     #[test]
-    fn failure_update_populates_contract_required_details() {
-        let mut jobs = PostgresJobState::new(FakeDatabase::default());
-        jobs.mark_failed("job-id", "ffmpeg exited").unwrap();
-        let statement = &jobs.database.statements[0];
-        assert!(statement.contains("failure_code = $2"));
-        assert!(statement.contains("failure_message = $3"));
-        assert!(statement.contains("id = $4::text::uuid"));
+    fn zero_row_status_change_is_an_error() {
+        let mut jobs = PostgresJobState::new(FakeDatabase {
+            changed: 0,
+            ..FakeDatabase::default()
+        });
+        assert!(jobs.mark_processing("job-id").is_err());
+        assert!(jobs.mark_completed("job-id").is_err());
+        assert!(jobs.mark_failed("job-id", "ffmpeg exited").is_err());
     }
 }

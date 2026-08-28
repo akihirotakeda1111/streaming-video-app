@@ -224,16 +224,19 @@ pub fn claim_notification<J: JobState>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::WorkItem;
+    use crate::event::{WorkItem, records_notification, source_key};
     use crate::fakes::{Call, CallLog, FakeJobState, FakeStorage};
+    use crate::runtime::MessageProcessor;
 
-    const FIXTURE: &str =
-        include_str!("../../../../../contracts/examples/s3/object-created.json");
+    const FIXTURE: &str = include_str!("../../../../../contracts/examples/s3/object-created.json");
     const INPUT_BUCKET: &str = "streaming-video-input";
     const VIDEO_ID: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910a";
     const JOB_ID: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd67";
-    const SOURCE_KEY: &str =
-        "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4";
+    const VIDEO_ID_2: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910b";
+    const JOB_ID_2: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd68";
+    const VIDEO_ID_3: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910c";
+    const JOB_ID_3: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd69";
+    const SOURCE_KEY: &str = "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4";
 
     fn expected_work_item() -> WorkItem {
         WorkItem {
@@ -291,9 +294,11 @@ mod tests {
         let mut jobs = FakeJobState::new(log.clone());
         jobs.add_claim(JOB_ID, VIDEO_ID, false);
 
-        assert!(claim_notification(&mut jobs, FIXTURE, INPUT_BUCKET)
-            .unwrap()
-            .is_empty());
+        assert!(
+            claim_notification(&mut jobs, FIXTURE, INPUT_BUCKET)
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             claim_notification(&mut jobs, FIXTURE, "other-bucket")
                 .unwrap()
@@ -324,9 +329,11 @@ mod tests {
         jobs.add_claim(JOB_ID, VIDEO_ID, false);
         let storage = FakeStorage::new(log.clone());
 
-        assert!(claim_notification(&mut jobs, FIXTURE, INPUT_BUCKET)
-            .unwrap()
-            .is_empty());
+        assert!(
+            claim_notification(&mut jobs, FIXTURE, INPUT_BUCKET)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             log.calls(),
             [Call::Claim {
@@ -349,9 +356,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(claim_notification(&mut jobs, "not-json", INPUT_BUCKET)
-            .unwrap()
-            .is_empty());
+        assert!(
+            claim_notification(&mut jobs, "not-json", INPUT_BUCKET)
+                .unwrap()
+                .is_empty()
+        );
         assert!(log.calls().is_empty());
     }
 
@@ -405,9 +414,191 @@ mod tests {
             let jobs = processor.jobs.lock().expect("job state lock");
             jobs.claims.clone()
         };
+        assert_eq!(remaining, [(JOB_ID.to_owned(), VIDEO_ID.to_owned(), false)]);
+    }
+
+    fn work_item(video_id: &str, job_id: &str) -> WorkItem {
+        WorkItem {
+            bucket: INPUT_BUCKET.to_owned(),
+            key: source_key(video_id, job_id),
+            video_id: video_id.into(),
+            job_id: job_id.into(),
+        }
+    }
+
+    fn two_record_body() -> String {
+        let key_2 = source_key(VIDEO_ID_2, JOB_ID_2);
+        records_notification(&[
+            ("ObjectCreated:Put", INPUT_BUCKET, SOURCE_KEY),
+            ("ObjectCreated:Put", INPUT_BUCKET, &key_2),
+        ])
+    }
+
+    #[test]
+    fn claims_every_uploading_job_in_a_multi_record_notification() {
+        let log = CallLog::default();
+        let mut jobs = FakeJobState::new(log.clone());
+        jobs.add_claim(JOB_ID, VIDEO_ID, true);
+        jobs.add_claim(JOB_ID_2, VIDEO_ID_2, true);
+        let body = two_record_body();
+
         assert_eq!(
-            remaining,
-            [(JOB_ID.to_owned(), VIDEO_ID.to_owned(), false)]
+            claim_notification(&mut jobs, &body, INPUT_BUCKET).unwrap(),
+            [work_item(VIDEO_ID, JOB_ID), work_item(VIDEO_ID_2, JOB_ID_2)]
         );
+        assert_eq!(
+            claim_notification(&mut jobs, &body, INPUT_BUCKET).unwrap(),
+            []
+        );
+        assert_eq!(
+            log.calls(),
+            [
+                Call::Claim {
+                    job_id: JOB_ID.into(),
+                    video_id: VIDEO_ID.into(),
+                },
+                Call::Claim {
+                    job_id: JOB_ID_2.into(),
+                    video_id: VIDEO_ID_2.into(),
+                },
+                Call::Claim {
+                    job_id: JOB_ID.into(),
+                    video_id: VIDEO_ID.into(),
+                },
+                Call::Claim {
+                    job_id: JOB_ID_2.into(),
+                    video_id: VIDEO_ID_2.into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_invalid_and_already_claimed_records_and_owns_the_rest() {
+        let log = CallLog::default();
+        let mut jobs = FakeJobState::new(log.clone());
+        jobs.add_claim(JOB_ID, VIDEO_ID, false);
+        jobs.add_claim(JOB_ID_2, VIDEO_ID_2, true);
+        let key_2 = source_key(VIDEO_ID_2, JOB_ID_2);
+        let body = records_notification(&[
+            ("ObjectRemoved:Delete", INPUT_BUCKET, SOURCE_KEY),
+            ("ObjectCreated:Put", INPUT_BUCKET, SOURCE_KEY),
+            ("ObjectCreated:Put", "other-bucket", &key_2),
+            ("ObjectCreated:Put", INPUT_BUCKET, &key_2),
+        ]);
+
+        assert_eq!(
+            claim_notification(&mut jobs, &body, INPUT_BUCKET).unwrap(),
+            [work_item(VIDEO_ID_2, JOB_ID_2)]
+        );
+        assert_eq!(
+            log.calls(),
+            [
+                Call::Claim {
+                    job_id: JOB_ID.into(),
+                    video_id: VIDEO_ID.into(),
+                },
+                Call::Claim {
+                    job_id: JOB_ID_2.into(),
+                    video_id: VIDEO_ID_2.into(),
+                },
+            ]
+        );
+        assert_eq!(
+            jobs.claims,
+            [
+                (JOB_ID.to_owned(), VIDEO_ID.to_owned(), false),
+                (JOB_ID_2.to_owned(), VIDEO_ID_2.to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn database_error_on_a_later_claim_stops_without_claiming_remaining_jobs() {
+        let log = CallLog::default();
+        let mut jobs = FakeJobState::new(log.clone());
+        jobs.add_claim(JOB_ID, VIDEO_ID, true);
+        jobs.add_claim(JOB_ID_2, VIDEO_ID_2, true);
+        jobs.add_claim(JOB_ID_3, VIDEO_ID_3, true);
+        jobs.fail_claim_after(1, "connection reset");
+        let key_2 = source_key(VIDEO_ID_2, JOB_ID_2);
+        let key_3 = source_key(VIDEO_ID_3, JOB_ID_3);
+        let body = records_notification(&[
+            ("ObjectCreated:Put", INPUT_BUCKET, SOURCE_KEY),
+            ("ObjectCreated:Put", INPUT_BUCKET, &key_2),
+            ("ObjectCreated:Put", INPUT_BUCKET, &key_3),
+        ]);
+
+        assert_eq!(
+            claim_notification(&mut jobs, &body, INPUT_BUCKET)
+                .unwrap_err()
+                .0,
+            "connection reset"
+        );
+        assert_eq!(
+            log.calls(),
+            [
+                Call::Claim {
+                    job_id: JOB_ID.into(),
+                    video_id: VIDEO_ID.into(),
+                },
+                Call::Claim {
+                    job_id: JOB_ID_2.into(),
+                    video_id: VIDEO_ID_2.into(),
+                },
+            ]
+        );
+        assert_eq!(
+            jobs.claims,
+            [
+                (JOB_ID.to_owned(), VIDEO_ID.to_owned(), false),
+                (JOB_ID_2.to_owned(), VIDEO_ID_2.to_owned(), true),
+                (JOB_ID_3.to_owned(), VIDEO_ID_3.to_owned(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn work_directory_source_is_exactly_source_mp4_with_downloaded_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let work = JobDirectory::create(root.path(), JOB_ID).unwrap();
+        work.write_source(b"exact-source-bytes").unwrap();
+        let path = work.directory.path().join(LOCAL_SOURCE_FILENAME);
+        assert_eq!(path.file_name().unwrap(), "source.mp4");
+        assert_eq!(fs::read(&path).unwrap(), b"exact-source-bytes");
+        assert!(path.starts_with(work.directory.path()));
+        assert!(path.starts_with(root.path()));
+    }
+
+    #[tokio::test]
+    async fn processing_download_claims_then_marks_processing_then_reads_canonical_object() {
+        let log = CallLog::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut storage = FakeStorage::new(log.clone());
+        storage.add_read(INPUT_BUCKET, SOURCE_KEY, b"exact-source-bytes".to_vec());
+        let processor = ProcessingDownloadProcessor::new(
+            uploading_jobs(log.clone()),
+            storage,
+            INPUT_BUCKET,
+            root.path(),
+        );
+
+        processor.process(fixture_message()).await.unwrap();
+        let calls = log.calls();
+        let claim = calls
+            .iter()
+            .position(|call| matches!(call, Call::Claim { job_id, .. } if job_id == JOB_ID))
+            .unwrap();
+        let processing = calls
+            .iter()
+            .position(|call| matches!(call, Call::MarkProcessing(id) if id == JOB_ID))
+            .unwrap();
+        let download = calls
+            .iter()
+            .position(
+                |call| matches!(call, Call::Read { bucket, key } if bucket == INPUT_BUCKET && key == SOURCE_KEY),
+            )
+            .unwrap();
+        assert!(claim < processing && processing < download, "{calls:?}");
     }
 }
