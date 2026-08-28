@@ -6,10 +6,13 @@ import { redactText, redactUrl, safeDiagnostic } from './diagnostics'
 describe('E2E fixtures and diagnostics', () => {
   it('generates and cleans up a video/mp4 fixture', async () => {
     const fixture = await generateMp4Fixture()
-    expect(fixture.contentType).toBe('video/mp4')
-    expect(fixture.sizeBytes).toBeGreaterThan(0)
-    await access(fixture.path)
-    await fixture.cleanup()
+    try {
+      expect(fixture.contentType).toBe('video/mp4')
+      expect(fixture.sizeBytes).toBeGreaterThan(0)
+      await access(fixture.path)
+    } finally {
+      await fixture.cleanup()
+    }
     await expect(access(fixture.path)).rejects.toThrow()
   })
 
