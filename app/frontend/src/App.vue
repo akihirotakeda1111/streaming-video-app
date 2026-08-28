@@ -57,7 +57,7 @@ function setError(message: string) {
 
 function selectFile(event: Event) {
   const files = (event.target as HTMLInputElement).files
-  selectedFile.value = files?.length === 1 ? files[0] : null
+  selectedFile.value = files?.length === 1 ? (files[0] ?? null) : null
   playback.value = null
   errorMessage.value = ''
   if (!selectedFile.value) {
