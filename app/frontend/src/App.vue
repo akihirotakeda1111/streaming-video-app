@@ -44,9 +44,6 @@ const defaultActions: WorkflowActions = {
 }
 
 const actions = computed(() => ({ ...defaultActions, ...props.workflowActions }))
-const continuesWorkflow = computed(() =>
-  Boolean(props.workflowActions?.uploadFile && props.workflowActions?.getVideoStatus && props.workflowActions?.getPlayback),
-)
 const active = computed(() => state.value === 'creating')
 const stateLabel = computed(() =>
   ({ idle: 'Ready to upload', creating: 'Creating video', created: 'Video created', uploading: 'Uploading', processing: 'Processing', ready: 'Ready to play', error: 'Upload error' })[
@@ -123,14 +120,6 @@ async function submit() {
     const created = await actions.value.createVideo({ fileName: file.name, contentType: 'video/mp4', sizeBytes: file.size })
     if (disposed) return
     createdVideo.value = created
-    if (continuesWorkflow.value) {
-      state.value = 'uploading'
-      await actions.value.uploadFile(file, created)
-      if (disposed) return
-      state.value = 'processing'
-      await checkStatus(created.videoId)
-      return
-    }
     state.value = 'created'
   } catch (error: unknown) {
     if (!disposed) setError(errorMessageFor(error))
