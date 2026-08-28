@@ -7,6 +7,15 @@ import type { WorkflowActions } from '../App.vue'
 import { ApiError } from '../api/client'
 import type { CreateVideoResponse, PlaybackResponse, VideoResponse } from '../api/contracts'
 
+const videojsMock = vi.hoisted(() =>
+  vi.fn(() => ({
+    dispose: vi.fn(),
+    error: vi.fn((): { message: string } | null => null),
+    on: vi.fn(),
+  })),
+)
+vi.mock('video.js', () => ({ default: videojsMock }))
+
 const videoId = '018f47a2-45c2-7a84-b84f-5f6dd7b5910a'
 const jobId = '018f47a2-4699-7892-9fc0-fbe46d3bbd67'
 
@@ -70,10 +79,29 @@ function actions(overrides: Partial<WorkflowActions> = {}): WorkflowActions {
   }
 }
 
+function createPlayerMock() {
+  const player = {
+    dispose: vi.fn(),
+    error: vi.fn((): { message: string } | null => null),
+    on: vi.fn(),
+  }
+  videojsMock.mockReturnValue(player)
+  return player
+}
+
+async function reachReady(wrapper: ReturnType<typeof mount>) {
+  await chooseFiles(wrapper, [mp4()])
+  await wrapper.get('form').trigger('submit')
+  await flushPromises()
+  await vi.advanceTimersByTimeAsync(1000)
+  await flushPromises()
+}
+
 describe('App workflow shell', () => {
   afterEach(() => {
     vi.useRealTimers()
     vi.restoreAllMocks()
+    videojsMock.mockClear()
   })
 
   it('mounts the upload shell', () => {
@@ -241,7 +269,7 @@ describe('App workflow shell', () => {
     expect(wrapper.find('[data-workflow-state="creating"]').exists()).toBe(true)
   })
 
-  it('polls contract statuses and stops on COMPLETED without requesting playback', async () => {
+  it('polls contract statuses and requests playback only after COMPLETED', async () => {
     const workflowActions = actions({
       getVideoStatus: vi
         .fn()
@@ -270,9 +298,17 @@ describe('App workflow shell', () => {
     await vi.advanceTimersByTimeAsync(1000)
     await flushPromises()
     expect(wrapper.get('[data-job-status]').text()).toContain('COMPLETED')
-    expect(wrapper.find('[data-workflow-state="processing"]').exists()).toBe(true)
-    expect(workflowActions.getPlayback).not.toHaveBeenCalled()
-    expect(wrapper.find('[aria-label="Uploaded video"]').exists()).toBe(false)
+    expect(wrapper.find('[data-workflow-state="ready"]').exists()).toBe(true)
+    expect(workflowActions.getPlayback).toHaveBeenCalledOnce()
+    expect(workflowActions.getPlayback).toHaveBeenCalledWith(videoId)
+    expect(videojsMock).toHaveBeenCalledWith(
+      expect.any(HTMLVideoElement),
+      expect.objectContaining({
+        controls: true,
+        sources: [{ src: 'https://cdn.example/index.m3u8', type: 'application/vnd.apple.mpegurl' }],
+      }),
+    )
+    expect(wrapper.find('[aria-label="Uploaded video"]').exists()).toBe(true)
 
     await vi.advanceTimersByTimeAsync(1000)
     await flushPromises()
@@ -323,5 +359,46 @@ describe('App workflow shell', () => {
     expect(workflowActions.getPlayback).not.toHaveBeenCalled()
     expect(wrapper.get('[data-job-status]').text()).toContain('UPLOADING')
     expect(wrapper.find('[data-workflow-state="processing"]').exists()).toBe(true)
+  })
+
+  it('shows a visible alert when the player emits an error', async () => {
+    const player = createPlayerMock()
+    player.error.mockReturnValue({ message: 'The media could not be loaded.' })
+    vi.useFakeTimers()
+    const wrapper = mount(App, { props: { workflowActions: actions(), pollIntervalMs: 1000 } })
+
+    await reachReady(wrapper)
+
+    const errorHandler = player.on.mock.calls.find(([event]) => event === 'error')?.[1]
+    expect(errorHandler).toEqual(expect.any(Function))
+    ;(errorHandler as () => void)()
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('The media could not be loaded.')
+    expect(wrapper.find('[data-workflow-state="error"]').exists()).toBe(true)
+  })
+
+  it('disposes the player when the selected video is replaced', async () => {
+    const player = createPlayerMock()
+    vi.useFakeTimers()
+    const wrapper = mount(App, { props: { workflowActions: actions(), pollIntervalMs: 1000 } })
+
+    await reachReady(wrapper)
+    expect(videojsMock).toHaveBeenCalledOnce()
+
+    await chooseFiles(wrapper, [mp4('other.mp4')])
+
+    expect(player.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('disposes the player on unmount', async () => {
+    const player = createPlayerMock()
+    vi.useFakeTimers()
+    const wrapper = mount(App, { props: { workflowActions: actions(), pollIntervalMs: 1000 } })
+
+    await reachReady(wrapper)
+    wrapper.unmount()
+
+    expect(player.dispose).toHaveBeenCalledOnce()
   })
 })
