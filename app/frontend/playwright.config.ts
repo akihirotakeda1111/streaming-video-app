@@ -13,6 +13,7 @@ import { e2eConfig } from './e2e/config'
  */
 export default defineConfig({
   testDir: './e2e',
+  testIgnore: '**/*.test.ts',
   /* Maximum time one test can run for. */
   timeout:
     e2eConfig.timeouts.navigation +
