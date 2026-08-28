@@ -35,6 +35,23 @@ function stripQueryAndFragment(value: string): string {
   return index === -1 ? value : value.slice(0, index)
 }
 
+function sanitizeOrigin(value: string): string {
+  try {
+    return new URL(value).origin
+  } catch {
+    return stripQueryAndFragment(value)
+  }
+}
+
+function sanitizePath(value: string): string {
+  try {
+    const url = new URL(value)
+    return `${url.origin}${url.pathname}`
+  } catch {
+    return stripQueryAndFragment(value)
+  }
+}
+
 /** Redacts URL query strings and common credential-shaped values while retaining IDs. */
 export function redactText(value: string): string {
   let redacted = value.replace(/https?:\/\/[^\s"']+/gi, (url) => redactUrl(url))
@@ -75,8 +92,13 @@ function sanitizeRecord(input: Record<string, unknown>): SafeDiagnostic {
     if (value === undefined) continue
 
     if (PRESERVED_KEYS.has(key)) {
-      output[key] =
-        (key === 'origin' || key === 'path') && typeof value === 'string' ? stripQueryAndFragment(value) : value
+      if (key === 'origin' && typeof value === 'string') {
+        output[key] = sanitizeOrigin(value)
+      } else if (key === 'path' && typeof value === 'string') {
+        output[key] = sanitizePath(value)
+      } else {
+        output[key] = value
+      }
       continue
     }
 

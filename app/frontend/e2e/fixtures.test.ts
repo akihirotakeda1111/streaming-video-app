@@ -80,4 +80,16 @@ describe('E2E fixtures and diagnostics', () => {
       path: '/videos/123',
     })
   })
+
+  it('redacts userinfo from preserved origin and path', () => {
+    expect(
+      safeDiagnostic({
+        origin: 'https://user:pass@example.com',
+        path: 'https://user:pass@example.com/videos/123?token=secret',
+      }),
+    ).toEqual({
+      origin: 'https://example.com',
+      path: 'https://example.com/videos/123',
+    })
+  })
 })
