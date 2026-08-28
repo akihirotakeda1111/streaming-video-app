@@ -202,7 +202,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fakes::{Call, CallLog, FakeJobState, FakeQueue, FakeStorage};
+    use crate::fakes::{Call, CallLog, FakeJobState, FakeProcessExecutor, FakeQueue, FakeStorage};
 
     const EVENT: &str = include_str!("../../../../../contracts/examples/s3/object-created.json");
     const INPUT: &str = "streaming-video-input";
@@ -221,8 +221,7 @@ mod tests {
     fn processor(
         log: CallLog,
         root: &std::path::Path,
-    ) -> TerminalProcessor<FakeJobState, FakeStorage, encoding::runtime::ProcessExecutor, FakeQueue>
-    {
+    ) -> TerminalProcessor<FakeJobState, FakeStorage, FakeProcessExecutor, FakeQueue> {
         let mut jobs = FakeJobState::new(log.clone());
         jobs.add_claim(JOB, VIDEO, true);
         let mut storage = FakeStorage::new(log.clone());
@@ -230,48 +229,70 @@ mod tests {
         TerminalProcessor::new(
             jobs,
             storage,
-            encoding::runtime::ProcessExecutor,
+            FakeProcessExecutor::stub_hls(log.clone()),
             FakeQueue::new(log),
             INPUT,
             OUTPUT_BUCKET,
-            successful_executor_script(root),
+            "ffmpeg",
             root,
         )
     }
 
-    fn successful_executor_script(root: &std::path::Path) -> PathBuf {
-        let script = root.join("ffmpeg");
-        fs::write(&script, "#!/bin/sh\nfor out do :; done\ndir=$(dirname \"$out\")\nprintf '#EXTM3U\\nsegment-00000.ts\\n' > \"$out\"\nprintf segment > \"$dir/segment-00000.ts\"\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        script
+    fn call_index(calls: &[Call], predicate: impl Fn(&Call) -> bool) -> usize {
+        calls
+            .iter()
+            .position(predicate)
+            .unwrap_or_else(|| panic!("missing expected call in {calls:?}"))
     }
 
     #[tokio::test]
-    async fn full_order_is_manifest_then_completed_then_delete_and_cleans_up() {
+    async fn full_order_is_claim_through_delete_and_cleans_up() {
         let log = CallLog::default();
         let root = tempfile::tempdir().unwrap();
         let p = processor(log.clone(), root.path());
 
         p.process(message()).await.unwrap();
         let calls = log.calls();
-        let manifest = calls
-            .iter()
-            .position(|c| matches!(c, Call::Write { key, .. } if key.ends_with("index.m3u8")))
-            .unwrap();
-        let completed = calls
-            .iter()
-            .position(|c| matches!(c, Call::MarkCompleted(_)))
-            .unwrap();
-        let deleted = calls
-            .iter()
-            .position(|c| matches!(c, Call::Delete(_)))
-            .unwrap();
-        assert!(manifest < completed && completed < deleted, "{calls:?}");
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1); // only the script remains
+        let claim = call_index(
+            &calls,
+            |c| matches!(c, Call::Claim { job_id, video_id } if job_id == JOB && video_id == VIDEO),
+        );
+        let processing = call_index(
+            &calls,
+            |c| matches!(c, Call::MarkProcessing(id) if id == JOB),
+        );
+        let download = call_index(
+            &calls,
+            |c| matches!(c, Call::Read { bucket, key } if bucket == INPUT && key == KEY),
+        );
+        let encode = call_index(&calls, |c| matches!(c, Call::Execute(_)));
+        let segment = call_index(
+            &calls,
+            |c| matches!(c, Call::Write { key, .. } if key.ends_with("segment-00000.ts")),
+        );
+        let manifest = call_index(
+            &calls,
+            |c| matches!(c, Call::Write { key, .. } if key.ends_with("index.m3u8")),
+        );
+        let completed = call_index(
+            &calls,
+            |c| matches!(c, Call::MarkCompleted(id) if id == JOB),
+        );
+        let deleted = call_index(
+            &calls,
+            |c| matches!(c, Call::Delete(handle) if handle == "receipt"),
+        );
+        assert!(
+            claim < processing
+                && processing < download
+                && download < encode
+                && encode < segment
+                && segment < manifest
+                && manifest < completed
+                && completed < deleted,
+            "{calls:?}"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -283,7 +304,7 @@ mod tests {
         let p = TerminalProcessor::new(
             jobs,
             FakeStorage::new(log.clone()),
-            encoding::runtime::ProcessExecutor,
+            FakeProcessExecutor::stub_hls(log.clone()),
             FakeQueue::new(log.clone()),
             INPUT,
             OUTPUT_BUCKET,
@@ -299,16 +320,16 @@ mod tests {
         for boundary in ["processing", "download", "encode", "publish", "complete"] {
             let log = CallLog::default();
             let root = tempfile::tempdir().unwrap();
-            let mut p = processor(log.clone(), root.path());
+            let p = processor(log.clone(), root.path());
             match boundary {
                 "processing" => p.jobs.lock().unwrap().fail_mark_processing("no processing"),
                 "download" => p.storage.lock().unwrap().fail_read("no source"),
-                "encode" => p.ffmpeg_path = root.path().join("missing-ffmpeg"),
+                "encode" => p.executor.lock().unwrap().fail_next("no ffmpeg"),
                 "publish" => p.storage.lock().unwrap().fail_write("no upload"),
                 "complete" => p.jobs.lock().unwrap().fail_mark_completed("no completion"),
                 _ => unreachable!(),
             }
-            assert!(p.process(message()).await.is_err(), "{boundary}");
+            assert!(p.process(message()).await.is_ok(), "{boundary}");
             let calls = log.calls();
             assert!(
                 calls
@@ -326,14 +347,7 @@ mod tests {
                     "{boundary}: {calls:?}"
                 );
             }
-            let remaining: Vec<_> = fs::read_dir(root.path())
-                .unwrap()
-                .map(|e| e.unwrap().file_name())
-                .collect();
-            assert!(
-                remaining.iter().all(|name| name == "ffmpeg"),
-                "{boundary}: {remaining:?}"
-            );
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0, "{boundary}");
         }
     }
 
