@@ -112,11 +112,7 @@ async function checkStatus(videoId: string, generation: number) {
     return
   }
   if (result.job.status === 'COMPLETED') {
-    const nextPlayback = await actions.value.getPlayback(videoId)
-    if (disposed || generation !== workflowGeneration) return
     clearTimer()
-    playback.value = nextPlayback
-    state.value = 'ready'
     return
   }
   if (!disposed && generation === workflowGeneration) scheduleStatusCheck(videoId, generation)
