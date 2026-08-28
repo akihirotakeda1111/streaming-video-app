@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, ref } from 'vue'
 
 import type { VideoApiClient } from './api/client'
-import type { CreateVideoResponse, PlaybackResponse, VideoResponse } from './api/contracts'
+import type { CreateVideoResponse, PlaybackResponse, VideoResponse, VideoStatus } from './api/contracts'
 
 export type WorkflowState = 'idle' | 'creating' | 'created' | 'uploading' | 'processing' | 'ready' | 'error'
 
@@ -26,9 +26,11 @@ const selectedFile = ref<File | null>(null)
 const createdVideo = ref<CreateVideoResponse | null>(null)
 const errorMessage = ref('')
 const playback = ref<PlaybackResponse | null>(null)
+const jobStatus = ref<VideoStatus | null>(null)
 const input = ref<HTMLInputElement | null>(null)
 let pollTimer: ReturnType<typeof setTimeout> | undefined
 let disposed = false
+let workflowGeneration = 0
 
 function unwired(name: keyof WorkflowActions): () => Promise<never> {
   return async () => {
@@ -57,10 +59,13 @@ function setError(message: string) {
 }
 
 function selectFile(event: Event) {
+  workflowGeneration += 1
+  clearTimer()
   const files = (event.target as HTMLInputElement).files
   selectedFile.value = files?.length === 1 ? (files[0] ?? null) : null
   createdVideo.value = null
   playback.value = null
+  jobStatus.value = null
   errorMessage.value = ''
   if (!selectedFile.value) {
     if (files?.length) setError('Please select one MP4 video file.')
@@ -80,28 +85,41 @@ function clearTimer() {
   pollTimer = undefined
 }
 
-async function checkStatus(videoId: string) {
-  if (disposed) return
+function pollingInterval() {
+  return Math.min(Math.max(1, props.pollIntervalMs), 30_000)
+}
+
+function scheduleStatusCheck(videoId: string, generation: number) {
+  clearTimer()
+  pollTimer = setTimeout(() => {
+    void checkStatus(videoId, generation).catch((error: unknown) => {
+      if (!disposed && generation === workflowGeneration) {
+        clearTimer()
+        setError(errorMessageFor(error))
+      }
+    })
+  }, pollingInterval())
+}
+
+async function checkStatus(videoId: string, generation: number) {
+  if (disposed || generation !== workflowGeneration) return
   const result: VideoResponse = await actions.value.getVideoStatus(videoId)
-  if (disposed) return
-  if (result.job.status === 'FAILED') throw new Error(result.job.failure?.message ?? 'Video processing failed.')
-  if (result.job.status === 'COMPLETED') {
-    const nextPlayback = await actions.value.getPlayback(videoId)
-    if (disposed) return
-    playback.value = nextPlayback
-    state.value = 'ready'
+  if (disposed || generation !== workflowGeneration) return
+  jobStatus.value = result.job.status
+  if (result.job.status === 'FAILED') {
+    clearTimer()
+    setError(`${result.job.failure?.code ?? 'PROCESSING_FAILED'}: ${result.job.failure?.message ?? 'Video processing failed.'}`)
     return
   }
-  if (disposed) return
-  pollTimer = setTimeout(() => {
-    void checkStatus(videoId).catch((error: unknown) => {
-      if (!disposed) setError(errorMessageFor(error))
-    })
-  }, props.pollIntervalMs)
+  if (result.job.status === 'COMPLETED') {
+    clearTimer()
+    return
+  }
+  if (!disposed && generation === workflowGeneration) scheduleStatusCheck(videoId, generation)
 }
 
 async function submit() {
-  if (active.value) return
+  if (disposed || active.value) return
   if (!selectedFile.value) {
     setError('Choose an MP4 video before uploading.')
     return
@@ -111,21 +129,26 @@ async function submit() {
     setError('Only non-empty MP4 video files are supported.')
     return
   }
+  workflowGeneration += 1
+  const generation = workflowGeneration
   clearTimer()
   errorMessage.value = ''
   playback.value = null
   createdVideo.value = null
+  jobStatus.value = null
   try {
     state.value = 'creating'
     const created = await actions.value.createVideo({ fileName: file.name, contentType: 'video/mp4', sizeBytes: file.size })
-    if (disposed) return
+    if (disposed || generation !== workflowGeneration) return
     createdVideo.value = created
+    jobStatus.value = created.job.status
     state.value = 'uploading'
     await actions.value.uploadFile(file, created)
-    if (disposed) return
+    if (disposed || generation !== workflowGeneration) return
     state.value = 'processing'
+    scheduleStatusCheck(created.videoId, generation)
   } catch (error: unknown) {
-    if (!disposed) setError(errorMessageFor(error))
+    if (!disposed && generation === workflowGeneration) setError(errorMessageFor(error))
   }
 }
 
@@ -135,6 +158,7 @@ function errorMessageFor(error: unknown) {
 
 function dispose() {
   disposed = true
+  workflowGeneration += 1
   clearTimer()
 }
 
@@ -154,6 +178,7 @@ defineExpose({ createdVideo, dispose, state })
       <p class="hint">MP4 files only. Select one video.</p>
       <button type="submit" :disabled="active">{{ active ? 'Working…' : 'Upload video' }}</button>
       <p class="status" role="status" aria-live="polite">{{ stateLabel }}</p>
+      <p v-if="jobStatus" data-job-status>Job status: {{ jobStatus }}</p>
       <p v-if="errorMessage" class="error" role="alert">{{ errorMessage }}</p>
       <section v-if="createdVideo" class="create-result" aria-label="Video creation result">
         <p>Video ID: {{ createdVideo.videoId }}</p>
