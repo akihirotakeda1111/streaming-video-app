@@ -3,6 +3,8 @@
 
 use std::{
     collections::VecDeque,
+    fs,
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -279,6 +281,7 @@ pub struct FakeProcessExecutor {
     pub log: CallLog,
     pub output: Output,
     failures: VecDeque<String>,
+    write_hls: bool,
 }
 impl FakeProcessExecutor {
     pub fn new(log: CallLog, output: Output) -> Self {
@@ -286,6 +289,22 @@ impl FakeProcessExecutor {
             log,
             output,
             failures: VecDeque::new(),
+            write_hls: false,
+        }
+    }
+    /// Records `Execute` and writes a minimal valid HLS layout next to the
+    /// playlist path ffmpeg would have produced. Used so encode tests do not
+    /// spawn a real process.
+    pub fn stub_hls(log: CallLog) -> Self {
+        Self {
+            log,
+            output: Output {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            failures: VecDeque::new(),
+            write_hls: true,
         }
     }
     pub fn fail_next(&mut self, message: impl Into<String>) {
@@ -294,10 +313,25 @@ impl FakeProcessExecutor {
 }
 impl Execute for FakeProcessExecutor {
     fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
-        self.log.push(Call::Execute(command));
-        self.failures
-            .pop_front()
-            .map_or_else(|| Ok(self.output.clone()), |e| Err(ProcessError(e)))
+        self.log.push(Call::Execute(command.clone()));
+        if let Some(error) = self.failures.pop_front() {
+            return Err(ProcessError(error));
+        }
+        if self.write_hls {
+            let playlist = command
+                .argv
+                .last()
+                .ok_or_else(|| ProcessError("ffmpeg argv is missing the playlist path".into()))?;
+            let playlist_path = Path::new(playlist);
+            let directory = playlist_path
+                .parent()
+                .ok_or_else(|| ProcessError("playlist path has no parent directory".into()))?;
+            fs::write(playlist_path, "#EXTM3U\nsegment-00000.ts\n")
+                .map_err(|error| ProcessError(error.to_string()))?;
+            fs::write(directory.join("segment-00000.ts"), b"segment")
+                .map_err(|error| ProcessError(error.to_string()))?;
+        }
+        Ok(self.output.clone())
     }
 }
 
