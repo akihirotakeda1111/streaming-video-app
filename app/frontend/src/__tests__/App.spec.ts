@@ -105,7 +105,7 @@ describe('App workflow shell', () => {
     expect(wrapper.get('[data-workflow-state="error"]').text()).toContain('createVideo is not wired')
   })
 
-  it('uploads the selected file to the create response and stops before polling', async () => {
+  it('uploads the selected file to the create response and delays the first status poll', async () => {
     const file = mp4('clip.mp4', 'abcdef')
     const created = createdResponse()
     const workflowActions = actions({
@@ -239,5 +239,89 @@ describe('App workflow shell', () => {
     expect(workflowActions.uploadFile).not.toHaveBeenCalled()
     expect((wrapper.vm as { createdVideo: CreateVideoResponse | null }).createdVideo).toBeNull()
     expect(wrapper.find('[data-workflow-state="creating"]').exists()).toBe(true)
+  })
+
+  it('polls contract statuses and stops on COMPLETED without requesting playback', async () => {
+    const workflowActions = actions({
+      getVideoStatus: vi
+        .fn()
+        .mockResolvedValueOnce(videoResponse('PROCESSING'))
+        .mockResolvedValueOnce(videoResponse('QUEUED'))
+        .mockResolvedValueOnce(videoResponse('COMPLETED')),
+    })
+    vi.useFakeTimers()
+    const wrapper = mount(App, { props: { workflowActions, pollIntervalMs: 1000 } })
+
+    await chooseFiles(wrapper, [mp4()])
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.get('[data-job-status]').text()).toContain('UPLOADING')
+    expect(workflowActions.getVideoStatus).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+    expect(wrapper.get('[data-job-status]').text()).toContain('PROCESSING')
+
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+    expect(wrapper.get('[data-job-status]').text()).toContain('QUEUED')
+
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+    expect(wrapper.get('[data-job-status]').text()).toContain('COMPLETED')
+    expect(wrapper.find('[data-workflow-state="processing"]').exists()).toBe(true)
+    expect(workflowActions.getPlayback).not.toHaveBeenCalled()
+    expect(wrapper.find('[aria-label="Uploaded video"]').exists()).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+    expect(workflowActions.getVideoStatus).toHaveBeenCalledTimes(3)
+    expect(workflowActions.getVideoStatus).toHaveBeenCalledWith(videoId)
+  })
+
+  it('renders FAILED details and never requests playback', async () => {
+    const workflowActions = actions({
+      getVideoStatus: vi.fn().mockResolvedValue(videoResponse('FAILED')),
+    })
+    vi.useFakeTimers()
+    const wrapper = mount(App, { props: { workflowActions, pollIntervalMs: 1000 } })
+
+    await chooseFiles(wrapper, [mp4()])
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+
+    expect(wrapper.get('[data-workflow-state="error"]').text()).toContain('ENCODING_FAILED: encode failed')
+    expect(wrapper.get('[data-job-status]').text()).toContain('FAILED')
+    expect(workflowActions.getPlayback).not.toHaveBeenCalled()
+  })
+
+  it('ignores in-flight status after disposal', async () => {
+    let finishStatus!: (value: VideoResponse) => void
+    const workflowActions = actions({
+      getVideoStatus: vi.fn(
+        () =>
+          new Promise<VideoResponse>((resolve) => {
+            finishStatus = resolve
+          }),
+      ),
+    })
+    vi.useFakeTimers()
+    const wrapper = mount(App, { props: { workflowActions, pollIntervalMs: 1000 } })
+    await chooseFiles(wrapper, [mp4()])
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+
+    ;(wrapper.vm as { dispose: () => void }).dispose()
+    finishStatus(videoResponse('COMPLETED'))
+    await flushPromises()
+
+    expect(workflowActions.getPlayback).not.toHaveBeenCalled()
+    expect(wrapper.get('[data-job-status]').text()).toContain('UPLOADING')
+    expect(wrapper.find('[data-workflow-state="processing"]').exists()).toBe(true)
   })
 })
