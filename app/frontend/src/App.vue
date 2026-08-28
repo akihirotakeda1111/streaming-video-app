@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref } from 'vue'
+import videojs from 'video.js'
+import type Player from 'video.js/dist/types/player'
 
 import type { VideoApiClient } from './api/client'
 import type { CreateVideoResponse, PlaybackResponse, VideoResponse, VideoStatus } from './api/contracts'
@@ -28,7 +30,9 @@ const errorMessage = ref('')
 const playback = ref<PlaybackResponse | null>(null)
 const jobStatus = ref<VideoStatus | null>(null)
 const input = ref<HTMLInputElement | null>(null)
+const videoElement = ref<HTMLVideoElement | null>(null)
 let pollTimer: ReturnType<typeof setTimeout> | undefined
+let player: Player | undefined
 let disposed = false
 let workflowGeneration = 0
 
@@ -58,9 +62,32 @@ function setError(message: string) {
   state.value = 'error'
 }
 
+function disposePlayer() {
+  if (player) {
+    player.dispose()
+    player = undefined
+  }
+}
+
+async function initializePlayer(response: PlaybackResponse, generation: number) {
+  await nextTick()
+  if (disposed || generation !== workflowGeneration || !videoElement.value) return
+  disposePlayer()
+  player = videojs(videoElement.value, {
+    controls: true,
+    sources: [{ src: response.manifestUrl, type: response.contentType }],
+  })
+  player.on('error', () => {
+    if (!disposed && generation === workflowGeneration) {
+      setError(player?.error()?.message ?? 'Unable to play this video.')
+    }
+  })
+}
+
 function selectFile(event: Event) {
   workflowGeneration += 1
   clearTimer()
+  disposePlayer()
   const files = (event.target as HTMLInputElement).files
   selectedFile.value = files?.length === 1 ? (files[0] ?? null) : null
   createdVideo.value = null
@@ -113,6 +140,11 @@ async function checkStatus(videoId: string, generation: number) {
   }
   if (result.job.status === 'COMPLETED') {
     clearTimer()
+    const response = await actions.value.getPlayback(videoId)
+    if (disposed || generation !== workflowGeneration) return
+    playback.value = response
+    state.value = 'ready'
+    await initializePlayer(response, generation)
     return
   }
   if (!disposed && generation === workflowGeneration) scheduleStatusCheck(videoId, generation)
@@ -132,6 +164,7 @@ async function submit() {
   workflowGeneration += 1
   const generation = workflowGeneration
   clearTimer()
+  disposePlayer()
   errorMessage.value = ''
   playback.value = null
   createdVideo.value = null
@@ -160,6 +193,7 @@ function dispose() {
   disposed = true
   workflowGeneration += 1
   clearTimer()
+  disposePlayer()
 }
 
 onBeforeUnmount(dispose)
@@ -185,7 +219,7 @@ defineExpose({ createdVideo, dispose, state })
         <p>Job ID: {{ createdVideo.job.jobId }}</p>
         <p>Upload ready: {{ createdVideo.upload.method }} {{ createdVideo.upload.url }}</p>
       </section>
-      <video v-if="playback" class="player" controls :src="playback.manifestUrl" aria-label="Uploaded video"></video>
+      <video v-if="playback" ref="videoElement" class="video-js player" controls aria-label="Uploaded video"></video>
     </form>
   </main>
 </template>

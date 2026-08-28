@@ -5,6 +5,7 @@ import { createVideoApiClient } from './api/client'
 import App from './App.vue'
 import router from './router'
 import './assets/main.css'
+import 'video.js/dist/video-js.css'
 
 const apiClient = createVideoApiClient()
 const app = createApp(App, {
