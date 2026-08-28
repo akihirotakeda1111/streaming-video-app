@@ -26,20 +26,16 @@ impl JobStatus {
 }
 
 trait Database {
-    fn execute(
-        &mut self,
-        statement: &str,
-        parameters: &[&(dyn ToSql + Sync)],
-    ) -> Result<u64, postgres::Error>;
+    fn execute(&mut self, statement: &str, parameters: &[&str]) -> Result<u64, postgres::Error>;
 }
 
 impl Database for Client {
-    fn execute(
-        &mut self,
-        statement: &str,
-        parameters: &[&(dyn ToSql + Sync)],
-    ) -> Result<u64, postgres::Error> {
-        Client::execute(self, statement, parameters)
+    fn execute(&mut self, statement: &str, parameters: &[&str]) -> Result<u64, postgres::Error> {
+        let values: Vec<&(dyn ToSql + Sync)> = parameters
+            .iter()
+            .map(|value| value as &(dyn ToSql + Sync))
+            .collect();
+        Client::execute(self, statement, &values)
     }
 }
 
@@ -62,11 +58,19 @@ impl<D> PostgresJobState<D> {
 }
 
 impl<D: Database> PostgresJobState<D> {
-    fn set_status(&mut self, job_id: &str, status: JobStatus) -> Result<(), PersistenceError> {
-        let changed = self.database.execute(
-            "UPDATE jobs SET status = $1, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $2::text::uuid",
-            &[&status.as_contract_value(), &job_id],
-        ).map_err(map_error)?;
+    fn set_status(
+        &mut self,
+        job_id: &str,
+        status: JobStatus,
+        required_status: &'static str,
+    ) -> Result<(), PersistenceError> {
+        let changed = self
+            .database
+            .execute(
+                "UPDATE jobs SET status = $1, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $2::text::uuid AND status = $3",
+                &[status.as_contract_value(), job_id, required_status],
+            )
+            .map_err(map_error)?;
         require_one(changed)
     }
 }
@@ -77,7 +81,7 @@ impl<D: Database> JobState for PostgresJobState<D> {
             .database
             .execute(
                 "UPDATE jobs SET status = 'QUEUED', updated_at = CURRENT_TIMESTAMP WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND status = 'UPLOADING'",
-                &[&job_id, &video_id],
+                &[job_id, video_id],
             )
             .map_err(map_error)?;
         match changed {
@@ -90,17 +94,25 @@ impl<D: Database> JobState for PostgresJobState<D> {
     }
 
     fn mark_processing(&mut self, job_id: &str) -> Result<(), PersistenceError> {
-        self.set_status(job_id, JobStatus::Processing)
+        self.set_status(
+            job_id,
+            JobStatus::Processing,
+            JobStatus::Queued.as_contract_value(),
+        )
     }
 
     fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError> {
-        self.set_status(job_id, JobStatus::Completed)
+        self.set_status(
+            job_id,
+            JobStatus::Completed,
+            JobStatus::Processing.as_contract_value(),
+        )
     }
 
     fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError> {
         let changed = self.database.execute(
-            "UPDATE jobs SET status = $1, failure_code = $2, failure_message = $3, updated_at = NOW() WHERE id = $4::text::uuid",
-            &[&JobStatus::Failed.as_contract_value(), &"ENCODING_FAILED", &reason, &job_id],
+            "UPDATE jobs SET status = $1, failure_code = $2, failure_message = $3, updated_at = NOW() WHERE id = $4::text::uuid AND status IN ('QUEUED', 'PROCESSING')",
+            &[JobStatus::Failed.as_contract_value(), "ENCODING_FAILED", reason, job_id],
         ).map_err(map_error)?;
         require_one(changed)
     }
