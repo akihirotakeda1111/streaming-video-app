@@ -176,11 +176,23 @@ function parsePlaybackResponse(value: unknown): PlaybackResponse {
   }
 }
 
-async function readJson(response: Response): Promise<unknown> {
-  const text = await response.text()
+function asNetworkError(error: unknown): NetworkError {
+  return new NetworkError(error instanceof Error ? error.message : 'Network request failed')
+}
+
+async function readBody(response: Response): Promise<unknown> {
+  let text: string
+  try {
+    text = await response.text()
+  } catch (error) {
+    throw asNetworkError(error)
+  }
   try {
     return JSON.parse(text) as unknown
   } catch {
+    if (!response.ok) {
+      throw new ApiError(`Request failed with status ${response.status}`, response.status)
+    }
     throw new ContractError('Response body is not valid JSON')
   }
 }
@@ -206,9 +218,9 @@ export function createVideoApiClient(
     try {
       response = await fetcher(endpoint(path), init)
     } catch (error) {
-      throw new NetworkError(error instanceof Error ? error.message : 'Network request failed')
+      throw asNetworkError(error)
     }
-    const body = await readJson(response)
+    const body = await readBody(response)
     if (!response.ok) {
       const error = parseError(body)
       throw new ApiError(error?.message ?? `Request failed with status ${response.status}`, response.status, error?.code)

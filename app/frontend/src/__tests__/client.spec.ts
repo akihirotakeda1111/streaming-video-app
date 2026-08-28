@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { ContractError, createVideoApiClient } from '../api/client'
+import { ContractError, NetworkError, createVideoApiClient } from '../api/client'
 
 const videoId = '018f47a2-45c2-7a84-b84f-5f6dd7b5910a'
 const jobId = '018f47a2-4699-7892-9fc0-fbe46d3bbd67'
@@ -52,5 +52,53 @@ describe('video API client', () => {
     ))
 
     await expect(client.createVideo({ fileName: 'movie.mp4', contentType: 'video/mp4', sizeBytes: 10 })).rejects.toBeInstanceOf(ContractError)
+  })
+
+  it('preserves ApiError status for non-JSON HTTP failures', async () => {
+    const client = createVideoApiClient(
+      { apiBaseUrl: 'https://api.example' },
+      vi.fn().mockResolvedValue(new Response('<html>Bad Gateway</html>', { status: 502 })),
+    )
+
+    await expect(client.getVideo(videoId)).rejects.toEqual(
+      expect.objectContaining({ name: 'ApiError', status: 502 }),
+    )
+  })
+
+  it('turns body-read failures into NetworkError', async () => {
+    const client = createVideoApiClient(
+      { apiBaseUrl: 'https://api.example' },
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: () => Promise.reject(new TypeError('Failed to fetch')),
+      } as Response),
+    )
+
+    await expect(client.getVideo(videoId)).rejects.toBeInstanceOf(NetworkError)
+  })
+
+  it('rejects date-only timestamps', async () => {
+    const client = createVideoApiClient(
+      { apiBaseUrl: 'https://api.example' },
+      vi.fn().mockResolvedValue(response({ ...createResponse, createdAt: '2026-08-25' }, 201)),
+    )
+
+    await expect(
+      client.createVideo({ fileName: 'movie.mp4', contentType: 'video/mp4', sizeBytes: 10 }),
+    ).rejects.toBeInstanceOf(ContractError)
+  })
+
+  it('rejects timezone-less timestamps', async () => {
+    const client = createVideoApiClient(
+      { apiBaseUrl: 'https://api.example' },
+      vi.fn().mockResolvedValue(
+        response({ ...createResponse, upload: { ...createResponse.upload, expiresAt: '2026-08-25T03:15:00' } }, 201),
+      ),
+    )
+
+    await expect(
+      client.createVideo({ fileName: 'movie.mp4', contentType: 'video/mp4', sizeBytes: 10 }),
+    ).rejects.toBeInstanceOf(ContractError)
   })
 })
