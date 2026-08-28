@@ -35,11 +35,16 @@ function stripQueryAndFragment(value: string): string {
   return index === -1 ? value : value.slice(0, index)
 }
 
+function sanitizeInvalidUrl(value: string): string {
+  const stripped = stripQueryAndFragment(value)
+  return /^(?:[a-z][a-z\d+.-]*:)?\/\/[^/?#]*@/i.test(stripped) ? REDACTED : stripped
+}
+
 function sanitizeOrigin(value: string): string {
   try {
     return new URL(value).origin
   } catch {
-    return stripQueryAndFragment(value)
+    return sanitizeInvalidUrl(value)
   }
 }
 
@@ -48,7 +53,7 @@ function sanitizePath(value: string): string {
     const url = new URL(value)
     return `${url.origin}${url.pathname}`
   } catch {
-    return stripQueryAndFragment(value)
+    return sanitizeInvalidUrl(value)
   }
 }
 

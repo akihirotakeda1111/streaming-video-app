@@ -95,4 +95,11 @@ describe('E2E fixtures and diagnostics', () => {
       path: 'https://example.com/videos/123',
     })
   })
+
+  it('redacts userinfo from malformed origin and path', () => {
+    expect(safeDiagnostic({ origin: 'https://user:pass@?token=secret', path: 'https://user:pass@?token=secret' })).toEqual({
+      origin: '[REDACTED]',
+      path: '[REDACTED]',
+    })
+  })
 })
