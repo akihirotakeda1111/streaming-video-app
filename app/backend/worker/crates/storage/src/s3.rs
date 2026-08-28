@@ -36,7 +36,13 @@ impl BlockingRuntime {
 
 trait S3Api {
     fn get(&mut self, bucket: &str, key: &str) -> Result<Vec<u8>, String>;
-    fn put(&mut self, bucket: &str, key: &str, contents: &[u8]) -> Result<(), String>;
+    fn put(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        contents: &[u8],
+    ) -> Result<(), String>;
 }
 
 pub struct AwsS3Api {
@@ -63,13 +69,20 @@ impl S3Api for AwsS3Api {
                 .map_err(|error| error.to_string())
         })
     }
-    fn put(&mut self, bucket: &str, key: &str, contents: &[u8]) -> Result<(), String> {
+    fn put(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        contents: &[u8],
+    ) -> Result<(), String> {
         let body = ByteStream::from(contents.to_vec());
         self.runtime.block_on(async {
             self.client
                 .put_object()
                 .bucket(bucket)
                 .key(key)
+                .content_type(content_type)
                 .body(body)
                 .send()
                 .await
@@ -120,13 +133,21 @@ impl<A: S3Api> Read for S3Storage<A> {
     }
 }
 impl<A: S3Api> Write for S3Storage<A> {
-    fn write(&mut self, bucket: &str, key: &str, contents: &[u8]) -> Result<(), ObjectError> {
+    fn write(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        contents: &[u8],
+    ) -> Result<(), ObjectError> {
         if bucket != self.output_bucket {
             return Err(ObjectError(
                 "write bucket is not the configured output bucket".into(),
             ));
         }
-        self.api.put(bucket, key, contents).map_err(ObjectError)
+        self.api
+            .put(bucket, key, content_type, contents)
+            .map_err(ObjectError)
     }
 }
 
@@ -143,9 +164,19 @@ mod tests {
                 .push(("get".into(), bucket.into(), key.into(), vec![]));
             Ok(b"input".to_vec())
         }
-        fn put(&mut self, bucket: &str, key: &str, contents: &[u8]) -> Result<(), String> {
-            self.calls
-                .push(("put".into(), bucket.into(), key.into(), contents.into()));
+        fn put(
+            &mut self,
+            bucket: &str,
+            key: &str,
+            content_type: &str,
+            contents: &[u8],
+        ) -> Result<(), String> {
+            self.calls.push((
+                content_type.into(),
+                bucket.into(),
+                key.into(),
+                contents.into(),
+            ));
             Ok(())
         }
     }
@@ -157,10 +188,22 @@ mod tests {
             api: FakeApi::default(),
         };
         assert_eq!(storage.read("input", "source").unwrap(), b"input");
-        storage.write("output", "manifest", b"hls").unwrap();
+        storage
+            .write(
+                "output",
+                "manifest",
+                "application/vnd.apple.mpegurl",
+                b"hls",
+            )
+            .unwrap();
         assert!(storage.read("other", "source").is_err());
-        assert!(storage.write("input", "manifest", b"hls").is_err());
+        assert!(
+            storage
+                .write("input", "manifest", "application/vnd.apple.mpegurl", b"hls")
+                .is_err()
+        );
         assert_eq!(storage.api.calls.len(), 2);
+        assert_eq!(storage.api.calls[1].0, "application/vnd.apple.mpegurl");
     }
 
     #[test]

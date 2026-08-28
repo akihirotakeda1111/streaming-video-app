@@ -3,6 +3,7 @@
 pub mod claim;
 pub mod event;
 pub mod fakes;
+pub mod publish;
 pub mod runtime;
 
 /// A deterministic representation of wall-clock time used by worker ports.

@@ -9,7 +9,13 @@ pub trait Read {
 }
 
 pub trait Write {
-    fn write(&mut self, bucket: &str, key: &str, contents: &[u8]) -> Result<(), ObjectError>;
+    fn write(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        contents: &[u8],
+    ) -> Result<(), ObjectError>;
 }
 
 pub mod s3;
