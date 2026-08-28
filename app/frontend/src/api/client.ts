@@ -251,7 +251,7 @@ export function createVideoApiClient(
 
   return {
     createVideo: (requestBody) => request('/videos', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody) }, parseCreateVideoResponse),
-    uploadFile: (file, response) => uploadFileToPresignedRequest(file, response),
+    uploadFile: (file, response) => uploadFileToPresignedRequest(file, response, fetcher),
     getVideo: (videoId) => request(`/videos/${encodeURIComponent(videoId)}`, { method: 'GET' }, parseVideoResponse),
     getVideoStatus: (videoId) => request(`/videos/${encodeURIComponent(videoId)}`, { method: 'GET' }, parseVideoResponse),
     getPlayback: (videoId) => request(`/videos/${encodeURIComponent(videoId)}/playback`, { method: 'GET' }, parsePlaybackResponse),
