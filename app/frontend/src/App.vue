@@ -81,13 +81,21 @@ function clearTimer() {
 async function checkStatus(videoId: string) {
   if (disposed) return
   const result: VideoResponse = await actions.value.getVideoStatus(videoId)
+  if (disposed) return
   if (result.job.status === 'FAILED') throw new Error(result.job.failure?.message ?? 'Video processing failed.')
   if (result.job.status === 'COMPLETED') {
-    playback.value = await actions.value.getPlayback(videoId)
+    const nextPlayback = await actions.value.getPlayback(videoId)
+    if (disposed) return
+    playback.value = nextPlayback
     state.value = 'ready'
     return
   }
-  pollTimer = setTimeout(() => void checkStatus(videoId).catch((error: unknown) => setError(errorMessageFor(error))), props.pollIntervalMs)
+  if (disposed) return
+  pollTimer = setTimeout(() => {
+    void checkStatus(videoId).catch((error: unknown) => {
+      if (!disposed) setError(errorMessageFor(error))
+    })
+  }, props.pollIntervalMs)
 }
 
 async function submit() {
