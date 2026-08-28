@@ -4,7 +4,7 @@ import { computed, onBeforeUnmount, ref } from 'vue'
 import type { VideoApiClient } from './api/client'
 import type { CreateVideoResponse, PlaybackResponse, VideoResponse } from './api/contracts'
 
-export type WorkflowState = 'idle' | 'creating' | 'uploading' | 'processing' | 'ready' | 'error'
+export type WorkflowState = 'idle' | 'creating' | 'created' | 'uploading' | 'processing' | 'ready' | 'error'
 
 export interface WorkflowActions {
   createVideo: VideoApiClient['createVideo']
@@ -23,6 +23,7 @@ const props = withDefaults(
 
 const state = ref<WorkflowState>('idle')
 const selectedFile = ref<File | null>(null)
+const createdVideo = ref<CreateVideoResponse | null>(null)
 const errorMessage = ref('')
 const playback = ref<PlaybackResponse | null>(null)
 const input = ref<HTMLInputElement | null>(null)
@@ -43,9 +44,12 @@ const defaultActions: WorkflowActions = {
 }
 
 const actions = computed(() => ({ ...defaultActions, ...props.workflowActions }))
-const active = computed(() => ['creating', 'uploading', 'processing'].includes(state.value))
+const continuesWorkflow = computed(() =>
+  Boolean(props.workflowActions?.uploadFile && props.workflowActions?.getVideoStatus && props.workflowActions?.getPlayback),
+)
+const active = computed(() => state.value === 'creating')
 const stateLabel = computed(() =>
-  ({ idle: 'Ready to upload', creating: 'Creating video', uploading: 'Uploading', processing: 'Processing', ready: 'Ready to play', error: 'Upload error' })[
+  ({ idle: 'Ready to upload', creating: 'Creating video', created: 'Video created', uploading: 'Uploading', processing: 'Processing', ready: 'Ready to play', error: 'Upload error' })[
     state.value
   ],
 )
@@ -58,6 +62,7 @@ function setError(message: string) {
 function selectFile(event: Event) {
   const files = (event.target as HTMLInputElement).files
   selectedFile.value = files?.length === 1 ? (files[0] ?? null) : null
+  createdVideo.value = null
   playback.value = null
   errorMessage.value = ''
   if (!selectedFile.value) {
@@ -112,15 +117,21 @@ async function submit() {
   clearTimer()
   errorMessage.value = ''
   playback.value = null
+  createdVideo.value = null
   try {
     state.value = 'creating'
     const created = await actions.value.createVideo({ fileName: file.name, contentType: 'video/mp4', sizeBytes: file.size })
     if (disposed) return
-    state.value = 'uploading'
-    await actions.value.uploadFile(file, created)
-    if (disposed) return
-    state.value = 'processing'
-    await checkStatus(created.videoId)
+    createdVideo.value = created
+    if (continuesWorkflow.value) {
+      state.value = 'uploading'
+      await actions.value.uploadFile(file, created)
+      if (disposed) return
+      state.value = 'processing'
+      await checkStatus(created.videoId)
+      return
+    }
+    state.value = 'created'
   } catch (error: unknown) {
     if (!disposed) setError(errorMessageFor(error))
   }
@@ -136,7 +147,7 @@ function dispose() {
 }
 
 onBeforeUnmount(dispose)
-defineExpose({ dispose, state })
+defineExpose({ createdVideo, dispose, state })
 </script>
 
 <template>
@@ -152,6 +163,11 @@ defineExpose({ dispose, state })
       <button type="submit" :disabled="active">{{ active ? 'Working…' : 'Upload video' }}</button>
       <p class="status" role="status" aria-live="polite">{{ stateLabel }}</p>
       <p v-if="errorMessage" class="error" role="alert">{{ errorMessage }}</p>
+      <section v-if="createdVideo" class="create-result" aria-label="Video creation result">
+        <p>Video ID: {{ createdVideo.videoId }}</p>
+        <p>Job ID: {{ createdVideo.job.jobId }}</p>
+        <p>Upload ready: {{ createdVideo.upload.method }} {{ createdVideo.upload.url }}</p>
+      </section>
       <video v-if="playback" class="player" controls :src="playback.manifestUrl" aria-label="Uploaded video"></video>
     </form>
   </main>
