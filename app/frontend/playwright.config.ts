@@ -14,7 +14,11 @@ import { e2eConfig } from './e2e/config'
 export default defineConfig({
   testDir: './e2e',
   /* Maximum time one test can run for. */
-  timeout: e2eConfig.timeouts.processing,
+  timeout:
+    e2eConfig.timeouts.navigation +
+    e2eConfig.timeouts.upload +
+    e2eConfig.timeouts.processing +
+    e2eConfig.timeouts.playback,
   expect: {
     /**
      * Maximum time expect() should wait for the condition to be met.
