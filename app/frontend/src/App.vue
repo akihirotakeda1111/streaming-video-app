@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue'
 
-import { createVideoApiClient, type VideoApiClient } from './api/client'
+import type { VideoApiClient } from './api/client'
 import type { CreateVideoResponse, PlaybackResponse, VideoResponse } from './api/contracts'
 
 export type WorkflowState = 'idle' | 'creating' | 'uploading' | 'processing' | 'ready' | 'error'
@@ -29,19 +29,17 @@ const input = ref<HTMLInputElement | null>(null)
 let pollTimer: ReturnType<typeof setTimeout> | undefined
 let disposed = false
 
-const client = createVideoApiClient
+function unwired(name: keyof WorkflowActions): () => Promise<never> {
+  return async () => {
+    throw new Error(`${name} is not wired`)
+  }
+}
+
 const defaultActions: WorkflowActions = {
-  createVideo: (request) => client().createVideo(request),
-  uploadFile: async (file, response) => {
-    const result = await fetch(response.upload.url, {
-      method: response.upload.method,
-      headers: response.upload.headers,
-      body: file,
-    })
-    if (!result.ok) throw new Error(`Upload failed (${result.status})`)
-  },
-  getVideoStatus: (videoId) => client().getVideoStatus(videoId),
-  getPlayback: (videoId) => client().getPlayback(videoId),
+  createVideo: unwired('createVideo'),
+  uploadFile: unwired('uploadFile'),
+  getVideoStatus: unwired('getVideoStatus'),
+  getPlayback: unwired('getPlayback'),
 }
 
 const actions = computed(() => ({ ...defaultActions, ...props.workflowActions }))
