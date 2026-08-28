@@ -68,7 +68,7 @@ export async function uploadFileToPresignedRequest(
     throw asNetworkError(error)
   }
   if (!result.ok) {
-    throw new ApiClientError(`Upload failed with status ${result.status}`, 'api', result.status)
+    throw new ApiError(`Upload failed with status ${result.status}`, result.status)
   }
 }
 
