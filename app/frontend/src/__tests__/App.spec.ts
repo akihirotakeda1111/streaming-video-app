@@ -4,6 +4,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 
 import App from '../App.vue'
 import type { WorkflowActions } from '../App.vue'
+import { ApiError } from '../api/client'
 import type { CreateVideoResponse, PlaybackResponse, VideoResponse } from '../api/contracts'
 
 const videoId = '018f47a2-45c2-7a84-b84f-5f6dd7b5910a'
@@ -104,26 +105,45 @@ describe('App workflow shell', () => {
     expect(wrapper.get('[data-workflow-state="error"]').text()).toContain('createVideo is not wired')
   })
 
-  it('drives visible states through injected workflow actions', async () => {
-    const workflowActions = actions({
-      getVideoStatus: vi.fn().mockResolvedValueOnce(videoResponse('PROCESSING')).mockResolvedValueOnce(videoResponse('COMPLETED')),
+  it('sends create metadata and retains the upload instructions without starting upload', async () => {
+    const file = mp4('clip.mp4', 'abcdef')
+    const workflowActions = actions()
+    const wrapper = mount(App, { props: { workflowActions } })
+
+    await chooseFiles(wrapper, [file])
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    expect(workflowActions.createVideo).toHaveBeenCalledOnce()
+    expect(workflowActions.createVideo).toHaveBeenCalledWith({
+      fileName: 'clip.mp4',
+      contentType: 'video/mp4',
+      sizeBytes: file.size,
     })
-    vi.useFakeTimers()
-    const wrapper = mount(App, { props: { workflowActions, pollIntervalMs: 1000 } })
+    expect(workflowActions.uploadFile).not.toHaveBeenCalled()
+    expect(workflowActions.getVideoStatus).not.toHaveBeenCalled()
+    expect(workflowActions.getPlayback).not.toHaveBeenCalled()
+    expect(wrapper.get('[data-workflow-state="created"]').text()).toContain('Video created')
+    expect(wrapper.get('[aria-label="Video creation result"]').text()).toContain(videoId)
+    expect(wrapper.get('[aria-label="Video creation result"]').text()).toContain(jobId)
+    expect(wrapper.get('[aria-label="Video creation result"]').text()).toContain('PUT https://upload.example/source.mp4')
+    expect((wrapper.vm as { createdVideo: CreateVideoResponse | null }).createdVideo).toEqual(createdResponse())
+  })
+
+  it('shows an actionable error and does not upload when create fails', async () => {
+    const workflowActions = actions({
+      createVideo: vi.fn().mockRejectedValue(new ApiError('Video too large.', 413, 'PAYLOAD_TOO_LARGE')),
+    })
+    const wrapper = mount(App, { props: { workflowActions } })
 
     await chooseFiles(wrapper, [mp4()])
     await wrapper.get('form').trigger('submit')
     await flushPromises()
 
-    expect(workflowActions.createVideo).toHaveBeenCalledOnce()
-    expect(workflowActions.uploadFile).toHaveBeenCalledOnce()
-    expect(wrapper.get('[data-workflow-state]').attributes('data-workflow-state')).toBe('processing')
-
-    await vi.advanceTimersByTimeAsync(1000)
-    await flushPromises()
-
-    expect(wrapper.get('[data-workflow-state="ready"]').text()).toContain('Ready to play')
-    expect(workflowActions.getPlayback).toHaveBeenCalledWith(videoId)
+    expect(wrapper.get('[data-workflow-state="error"]').text()).toContain('Video too large.')
+    expect(workflowActions.uploadFile).not.toHaveBeenCalled()
+    expect(workflowActions.getVideoStatus).not.toHaveBeenCalled()
+    expect(wrapper.find('[aria-label="Video creation result"]').exists()).toBe(false)
   })
 
   it('prevents duplicate submissions while active', async () => {
@@ -148,15 +168,18 @@ describe('App workflow shell', () => {
 
     finishCreate(createdResponse())
     await flushPromises()
+
+    expect(workflowActions.uploadFile).not.toHaveBeenCalled()
+    expect(wrapper.find('[data-workflow-state="created"]').exists()).toBe(true)
   })
 
-  it('does not continue polling after disposal', async () => {
-    let finishStatus!: (value: VideoResponse) => void
+  it('does not retain create results after disposal', async () => {
+    let finishCreate!: (value: CreateVideoResponse) => void
     const workflowActions = actions({
-      getVideoStatus: vi.fn(
+      createVideo: vi.fn(
         () =>
-          new Promise<VideoResponse>((resolve) => {
-            finishStatus = resolve
+          new Promise<CreateVideoResponse>((resolve) => {
+            finishCreate = resolve
           }),
       ),
     })
@@ -166,10 +189,11 @@ describe('App workflow shell', () => {
     await flushPromises()
 
     ;(wrapper.vm as { dispose: () => void }).dispose()
-    finishStatus(videoResponse('COMPLETED'))
+    finishCreate(createdResponse())
     await flushPromises()
 
-    expect(workflowActions.getPlayback).not.toHaveBeenCalled()
-    expect(wrapper.find('[data-workflow-state="processing"]').exists()).toBe(true)
+    expect(workflowActions.uploadFile).not.toHaveBeenCalled()
+    expect((wrapper.vm as { createdVideo: CreateVideoResponse | null }).createdVideo).toBeNull()
+    expect(wrapper.find('[data-workflow-state="creating"]').exists()).toBe(true)
   })
 })
