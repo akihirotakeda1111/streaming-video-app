@@ -24,6 +24,7 @@ pub enum Call {
     Write {
         bucket: String,
         key: String,
+        content_type: String,
         contents: Vec<u8>,
     },
     Claim {
@@ -151,10 +152,17 @@ impl Read for FakeStorage {
 }
 
 impl Write for FakeStorage {
-    fn write(&mut self, bucket: &str, key: &str, contents: &[u8]) -> Result<(), ObjectError> {
+    fn write(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        contents: &[u8],
+    ) -> Result<(), ObjectError> {
         self.log.push(Call::Write {
             bucket: bucket.into(),
             key: key.into(),
+            content_type: content_type.into(),
             contents: contents.into(),
         });
         if let Some(error) = self.write_failures.pop_front() {
