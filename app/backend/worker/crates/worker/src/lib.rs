@@ -5,6 +5,7 @@ pub mod event;
 pub mod fakes;
 pub mod publish;
 pub mod runtime;
+pub mod terminal;
 
 /// A deterministic representation of wall-clock time used by worker ports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

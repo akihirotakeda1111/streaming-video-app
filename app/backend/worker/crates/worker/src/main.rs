@@ -1,10 +1,11 @@
+use encoding::runtime::ProcessExecutor;
 use persistence::postgres::PostgresJobState;
 use queue::sqs::SqsQueue;
 use storage::s3::S3Storage;
 use tokio::sync::watch;
 use tracing::{error, info};
-use worker::claim::ProcessingDownloadProcessor;
 use worker::runtime::PHASE1_MAX_CONCURRENCY;
+use worker::terminal::TerminalProcessor;
 
 async fn shutdown_requested() -> std::io::Result<()> {
     #[cfg(unix)]
@@ -47,6 +48,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let acknowledgements = match SqsQueue::new(&config.aws_region, config.queue_url.clone()) {
+        Ok(queue) => queue,
+        Err(error) => {
+            error!(error = %error.0, "queue acknowledgement initialization failed");
+            std::process::exit(1);
+        }
+    };
     let jobs = match PostgresJobState::connect(&config.database_url) {
         Ok(jobs) => jobs,
         Err(error) => {
@@ -65,10 +73,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let processor = ProcessingDownloadProcessor::new(
+    let processor = TerminalProcessor::new(
         jobs,
         storage,
+        ProcessExecutor,
+        acknowledgements,
         config.input_bucket.clone(),
+        config.output_bucket.clone(),
+        config.ffmpeg_path.clone(),
         config.temporary_directory.clone(),
     );
     let (stop, shutdown) = watch::channel(false);
