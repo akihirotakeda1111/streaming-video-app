@@ -5,15 +5,22 @@ import { flushPromises, mount } from '@vue/test-utils'
 import App from '../App.vue'
 import type { WorkflowActions } from '../App.vue'
 import { ApiError } from '../api/client'
-import type { CreateVideoResponse, PlaybackResponse, VideoResponse } from '../api/contracts'
+import type { CreateVideoRequest, CreateVideoResponse, PlaybackResponse, VideoResponse } from '../api/contracts'
 
-const videojsMock = vi.hoisted(() =>
-  vi.fn(() => ({
-    dispose: vi.fn(),
-    error: vi.fn((): { message: string } | null => null),
-    on: vi.fn(),
-  })),
-)
+type PlayerMock = {
+  dispose: ReturnType<typeof vi.fn<() => void>>
+  error: ReturnType<typeof vi.fn<() => { message: string } | null>>
+  on: ReturnType<typeof vi.fn<(event: string, handler: () => void) => void>>
+}
+
+const videojsMock = vi.hoisted(() => {
+  const createPlayer = (): PlayerMock => ({
+    dispose: vi.fn<() => void>(),
+    error: vi.fn<() => { message: string } | null>(() => null),
+    on: vi.fn<(event: string, handler: () => void) => void>(),
+  })
+  return vi.fn<(element: HTMLVideoElement, options?: unknown) => PlayerMock>(createPlayer)
+})
 vi.mock('video.js', () => ({ default: videojsMock }))
 
 const videoId = '018f47a2-45c2-7a84-b84f-5f6dd7b5910a'
@@ -69,21 +76,37 @@ function playbackResponse(): PlaybackResponse {
   }
 }
 
+function mockCreateVideo(implementation?: (request: CreateVideoRequest) => Promise<CreateVideoResponse>) {
+  return vi.fn<(request: CreateVideoRequest) => Promise<CreateVideoResponse>>(implementation)
+}
+
+function mockUploadFile(implementation?: (file: File, response: CreateVideoResponse) => Promise<void>) {
+  return vi.fn<(file: File, response: CreateVideoResponse) => Promise<void>>(implementation)
+}
+
+function mockGetVideoStatus(implementation?: (videoId: string) => Promise<VideoResponse>) {
+  return vi.fn<(videoId: string) => Promise<VideoResponse>>(implementation)
+}
+
+function mockGetPlayback() {
+  return vi.fn<(videoId: string) => Promise<PlaybackResponse>>()
+}
+
 function actions(overrides: Partial<WorkflowActions> = {}): WorkflowActions {
   return {
-    createVideo: vi.fn().mockResolvedValue(createdResponse()),
-    uploadFile: vi.fn().mockResolvedValue(undefined),
-    getVideoStatus: vi.fn().mockResolvedValue(videoResponse('COMPLETED')),
-    getPlayback: vi.fn().mockResolvedValue(playbackResponse()),
+    createVideo: mockCreateVideo().mockResolvedValue(createdResponse()),
+    uploadFile: mockUploadFile().mockResolvedValue(undefined),
+    getVideoStatus: mockGetVideoStatus().mockResolvedValue(videoResponse('COMPLETED')),
+    getPlayback: mockGetPlayback().mockResolvedValue(playbackResponse()),
     ...overrides,
   }
 }
 
-function createPlayerMock() {
-  const player = {
-    dispose: vi.fn(),
-    error: vi.fn((): { message: string } | null => null),
-    on: vi.fn(),
+function createPlayerMock(): PlayerMock {
+  const player: PlayerMock = {
+    dispose: vi.fn<() => void>(),
+    error: vi.fn<() => { message: string } | null>(() => null),
+    on: vi.fn<(event: string, handler: () => void) => void>(),
   }
   videojsMock.mockReturnValue(player)
   return player
@@ -137,7 +160,7 @@ describe('App workflow shell', () => {
     const file = mp4('clip.mp4', 'abcdef')
     const created = createdResponse()
     const workflowActions = actions({
-      createVideo: vi.fn().mockResolvedValue(created),
+      createVideo: mockCreateVideo().mockResolvedValue(created),
     })
     const wrapper = mount(App, { props: { workflowActions } })
 
@@ -145,14 +168,12 @@ describe('App workflow shell', () => {
     await wrapper.get('form').trigger('submit')
     await flushPromises()
 
-    expect(workflowActions.createVideo).toHaveBeenCalledOnce()
-    expect(workflowActions.createVideo).toHaveBeenCalledWith({
+    expect(workflowActions.createVideo).toHaveBeenCalledExactlyOnceWith({
       fileName: 'clip.mp4',
       contentType: 'video/mp4',
       sizeBytes: file.size,
     })
-    expect(workflowActions.uploadFile).toHaveBeenCalledOnce()
-    expect(workflowActions.uploadFile).toHaveBeenCalledWith(file, created)
+    expect(workflowActions.uploadFile).toHaveBeenCalledExactlyOnceWith(file, created)
     expect(workflowActions.getVideoStatus).not.toHaveBeenCalled()
     expect(workflowActions.getPlayback).not.toHaveBeenCalled()
     expect(wrapper.get('[data-workflow-state="processing"]').text()).toContain('Processing')
@@ -164,7 +185,7 @@ describe('App workflow shell', () => {
 
   it('shows an actionable error and does not upload when create fails', async () => {
     const workflowActions = actions({
-      createVideo: vi.fn().mockRejectedValue(new ApiError('Video too large.', 413, 'PAYLOAD_TOO_LARGE')),
+      createVideo: mockCreateVideo().mockRejectedValue(new ApiError('Video too large.', 413, 'PAYLOAD_TOO_LARGE')),
     })
     const wrapper = mount(App, { props: { workflowActions } })
 
@@ -181,7 +202,7 @@ describe('App workflow shell', () => {
   it('prevents duplicate submissions while active', async () => {
     let finishCreate!: (value: CreateVideoResponse) => void
     const workflowActions = actions({
-      createVideo: vi.fn(
+      createVideo: mockCreateVideo(
         () =>
           new Promise<CreateVideoResponse>((resolve) => {
             finishCreate = resolve
@@ -208,7 +229,7 @@ describe('App workflow shell', () => {
   it('prevents duplicate submissions while uploading', async () => {
     let finishUpload!: () => void
     const workflowActions = actions({
-      uploadFile: vi.fn(
+      uploadFile: mockUploadFile(
         () =>
           new Promise<void>((resolve) => {
             finishUpload = resolve
@@ -232,7 +253,7 @@ describe('App workflow shell', () => {
 
   it('shows an actionable error and does not poll when upload fails', async () => {
     const workflowActions = actions({
-      uploadFile: vi.fn().mockRejectedValue(new ApiError('Upload failed with status 403', 403)),
+      uploadFile: mockUploadFile().mockRejectedValue(new ApiError('Upload failed with status 403', 403)),
     })
     const wrapper = mount(App, { props: { workflowActions } })
 
@@ -248,7 +269,7 @@ describe('App workflow shell', () => {
   it('does not start upload after disposal during create', async () => {
     let finishCreate!: (value: CreateVideoResponse) => void
     const workflowActions = actions({
-      createVideo: vi.fn(
+      createVideo: mockCreateVideo(
         () =>
           new Promise<CreateVideoResponse>((resolve) => {
             finishCreate = resolve
@@ -271,8 +292,7 @@ describe('App workflow shell', () => {
 
   it('polls contract statuses and requests playback only after COMPLETED', async () => {
     const workflowActions = actions({
-      getVideoStatus: vi
-        .fn()
+      getVideoStatus: mockGetVideoStatus()
         .mockResolvedValueOnce(videoResponse('PROCESSING'))
         .mockResolvedValueOnce(videoResponse('QUEUED'))
         .mockResolvedValueOnce(videoResponse('COMPLETED')),
@@ -299,8 +319,7 @@ describe('App workflow shell', () => {
     await flushPromises()
     expect(wrapper.get('[data-job-status]').text()).toContain('COMPLETED')
     expect(wrapper.find('[data-workflow-state="ready"]').exists()).toBe(true)
-    expect(workflowActions.getPlayback).toHaveBeenCalledOnce()
-    expect(workflowActions.getPlayback).toHaveBeenCalledWith(videoId)
+    expect(workflowActions.getPlayback).toHaveBeenCalledExactlyOnceWith(videoId)
     expect(videojsMock).toHaveBeenCalledWith(
       expect.any(HTMLVideoElement),
       expect.objectContaining({
@@ -318,7 +337,7 @@ describe('App workflow shell', () => {
 
   it('renders FAILED details and never requests playback', async () => {
     const workflowActions = actions({
-      getVideoStatus: vi.fn().mockResolvedValue(videoResponse('FAILED')),
+      getVideoStatus: mockGetVideoStatus().mockResolvedValue(videoResponse('FAILED')),
     })
     vi.useFakeTimers()
     const wrapper = mount(App, { props: { workflowActions, pollIntervalMs: 1000 } })
@@ -337,7 +356,7 @@ describe('App workflow shell', () => {
   it('ignores in-flight status after disposal', async () => {
     let finishStatus!: (value: VideoResponse) => void
     const workflowActions = actions({
-      getVideoStatus: vi.fn(
+      getVideoStatus: mockGetVideoStatus(
         () =>
           new Promise<VideoResponse>((resolve) => {
             finishStatus = resolve
