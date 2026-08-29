@@ -54,6 +54,63 @@ func TestRegisterContractRoutesIsolated(t *testing.T) {
 	}
 }
 
+func TestWithCORSAllowsOnlyConfiguredOrigin(t *testing.T) {
+	const allowedOrigin = "http://localhost:5173"
+	handler := WithCORS(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), allowedOrigin)
+
+	t.Run("preflight", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodOptions, "/api/v1/videos", nil)
+		req.Header.Set("Origin", allowedOrigin)
+		req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+		req.Header.Set("Access-Control-Request-Headers", "content-type")
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != allowedOrigin {
+			t.Fatalf("Access-Control-Allow-Origin = %q", got)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Methods"); got != corsAllowedMethods {
+			t.Fatalf("Access-Control-Allow-Methods = %q", got)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Headers"); got != corsAllowedHeaders {
+			t.Fatalf("Access-Control-Allow-Headers = %q", got)
+		}
+	})
+
+	t.Run("actual request", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/videos", nil)
+		req.Header.Set("Origin", allowedOrigin)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != allowedOrigin {
+			t.Fatalf("Access-Control-Allow-Origin = %q", got)
+		}
+	})
+
+	t.Run("different origin", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/videos", nil)
+		req.Header.Set("Origin", "https://example.invalid")
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Fatalf("Access-Control-Allow-Origin = %q, want empty", got)
+		}
+	})
+}
+
 func TestDecodeJSONAndBodyLimit(t *testing.T) {
 	handler := withRequestSizeLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload struct {

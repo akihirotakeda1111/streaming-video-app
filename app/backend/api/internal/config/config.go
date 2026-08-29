@@ -16,6 +16,7 @@ const (
 	envVideoInput  = "VIDEO_INPUT_BUCKET"
 	envVideoOutput = "VIDEO_OUTPUT_BUCKET"
 	envOutputS3    = "OUTPUT_S3_ENDPOINT"
+	envFrontend    = "FRONTEND_ORIGIN"
 )
 
 var s3BucketPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
@@ -29,6 +30,7 @@ type Config struct {
 	InputBucket      string
 	OutputBucket     string
 	OutputS3Endpoint string
+	FrontendOrigin   string
 }
 
 func Load(lookupEnv LookupEnvFunc) (Config, error) {
@@ -76,6 +78,14 @@ func Load(lookupEnv LookupEnvFunc) (Config, error) {
 	if err := validateS3EndpointURL(cfg.OutputS3Endpoint); err != nil {
 		return Config{}, wrapInvalid(envOutputS3, err)
 	}
+
+	if err := loadRequiredString(lookupEnv, envFrontend, &cfg.FrontendOrigin); err != nil {
+		return Config{}, err
+	}
+	if err := validateOrigin(cfg.FrontendOrigin); err != nil {
+		return Config{}, wrapInvalid(envFrontend, err)
+	}
+	cfg.FrontendOrigin = strings.TrimSuffix(cfg.FrontendOrigin, "/")
 
 	return cfg, nil
 }
@@ -139,6 +149,20 @@ func validateS3EndpointURL(raw string) error {
 	default:
 		return fmt.Errorf("must use an http or https scheme")
 	}
+}
+
+func validateOrigin(raw string) error {
+	parsed, err := validateURL(raw)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("must use an http or https scheme")
+	}
+	if parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("must contain only a scheme and host")
+	}
+	return nil
 }
 
 func validateS3Bucket(name string) error {

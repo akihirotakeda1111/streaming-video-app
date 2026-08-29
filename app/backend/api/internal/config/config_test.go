@@ -10,6 +10,7 @@ func TestLoadConfigValid(t *testing.T) {
 		envVideoInput:  "streaming-video-input-dev",
 		envVideoOutput: "streaming-video-output-dev",
 		envOutputS3:    "http://localhost:4566",
+		envFrontend:    "http://localhost:5173",
 	}))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -33,6 +34,9 @@ func TestLoadConfigValid(t *testing.T) {
 	if cfg.OutputS3Endpoint != "http://localhost:4566" {
 		t.Fatalf("OutputS3Endpoint = %q", cfg.OutputS3Endpoint)
 	}
+	if cfg.FrontendOrigin != "http://localhost:5173" {
+		t.Fatalf("FrontendOrigin = %q", cfg.FrontendOrigin)
+	}
 }
 
 func TestLoadConfigMissingRequiredValue(t *testing.T) {
@@ -43,6 +47,7 @@ func TestLoadConfigMissingRequiredValue(t *testing.T) {
 		envVideoInput,
 		envVideoOutput,
 		envOutputS3,
+		envFrontend,
 	}
 
 	for _, name := range required {
@@ -54,6 +59,7 @@ func TestLoadConfigMissingRequiredValue(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envFrontend:    "http://localhost:5173",
 			}
 			delete(env, name)
 
@@ -82,6 +88,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envFrontend:    "http://localhost:5173",
 			},
 		},
 		{
@@ -93,6 +100,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envFrontend:    "http://localhost:5173",
 			},
 		},
 		{
@@ -104,6 +112,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-dev",
 				envVideoOutput: "streaming-video-dev",
 				envOutputS3:    "http://localhost:4566",
+				envFrontend:    "http://localhost:5173",
 			},
 		},
 		{
@@ -115,6 +124,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "192.168.5.4",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envFrontend:    "http://localhost:5173",
 			},
 		},
 		{
@@ -126,6 +136,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envFrontend:    "http://localhost:5173",
 			},
 		},
 		{
@@ -137,6 +148,19 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "ftp://localhost:4566",
+				envFrontend:    "http://localhost:5173",
+			},
+		},
+		{
+			name: "frontend_origin_with_path",
+			env: map[string]string{
+				envHTTPAddr:    "0.0.0.0:8080",
+				envDatabaseURL: "postgres://user:pass@localhost:5432/app?sslmode=disable",
+				envAWSRegion:   "ap-northeast-1",
+				envVideoInput:  "streaming-video-input-dev",
+				envVideoOutput: "streaming-video-output-dev",
+				envOutputS3:    "http://localhost:4566",
+				envFrontend:    "http://localhost:5173/not-an-origin",
 			},
 		},
 	}

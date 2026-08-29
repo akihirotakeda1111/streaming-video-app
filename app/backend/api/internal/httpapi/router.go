@@ -8,6 +8,11 @@ import (
 
 const requestBodyLimit = 1 << 20
 
+const (
+	corsAllowedMethods = "GET, POST, OPTIONS"
+	corsAllowedHeaders = "Content-Type"
+)
+
 // NewRouter builds the contract HTTP handler tree without relying on global state.
 func NewRouter() http.Handler {
 	return NewRouterWithVideoCreation(nil)
@@ -61,6 +66,33 @@ func NewRouterWithVideoPlayback(repo persistence.Repository, outputBucket, outpu
 func withRequestSizeLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, requestBodyLimit)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// WithCORS permits the configured browser origin to call the JSON API without
+// allowing credentials or reflecting arbitrary origins.
+func WithCORS(next http.Handler, allowedOrigin string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" || origin != allowedOrigin {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		header := w.Header()
+		header.Set("Access-Control-Allow-Origin", allowedOrigin)
+		header.Set("Access-Control-Allow-Methods", corsAllowedMethods)
+		header.Set("Access-Control-Allow-Headers", corsAllowedHeaders)
+		header.Add("Vary", "Origin")
+
+		if r.Method == http.MethodOptions {
+			header.Add("Vary", "Access-Control-Request-Method")
+			header.Add("Vary", "Access-Control-Request-Headers")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 		next.ServeHTTP(w, r)
 	})
 }

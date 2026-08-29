@@ -71,6 +71,16 @@ func TestBuildRuntimeWiresContractRoutes(t *testing.T) {
 
 	assertRouteStatus(t, server.handler, http.MethodGet, "/api/v1/health", http.StatusOK)
 
+	preflight := httptest.NewRequest(http.MethodOptions, "/api/v1/videos", nil)
+	preflight.Header.Set("Origin", testConfig().FrontendOrigin)
+	preflight.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	preflight.Header.Set("Access-Control-Request-Headers", "content-type")
+	preflightRec := httptest.NewRecorder()
+	server.handler.ServeHTTP(preflightRec, preflight)
+	if preflightRec.Code != http.StatusNoContent {
+		t.Fatalf("OPTIONS /api/v1/videos = %d, want %d", preflightRec.Code, http.StatusNoContent)
+	}
+
 	post := httptest.NewRequest(http.MethodPost, "/api/v1/videos", strings.NewReader(`{"fileName":"movie.mp4","contentType":"video/mp4","sizeBytes":1}`))
 	postRec := httptest.NewRecorder()
 	server.handler.ServeHTTP(postRec, post)
@@ -440,6 +450,7 @@ func testConfig() config.Config {
 		InputBucket:      "video-input-test",
 		OutputBucket:     "video-output-test",
 		OutputS3Endpoint: "https://video-output-test.s3.ap-northeast-1.amazonaws.com",
+		FrontendOrigin:   "http://localhost:5173",
 	}
 }
 
@@ -452,6 +463,7 @@ func testLookupEnv() config.LookupEnvFunc {
 		"VIDEO_INPUT_BUCKET":  cfg.InputBucket,
 		"VIDEO_OUTPUT_BUCKET": cfg.OutputBucket,
 		"OUTPUT_S3_ENDPOINT":  cfg.OutputS3Endpoint,
+		"FRONTEND_ORIGIN":     cfg.FrontendOrigin,
 	}
 	return func(name string) (string, bool) {
 		value, ok := values[name]
