@@ -5,6 +5,8 @@ on:
     branches:
       - main
       - dev
+    paths:
+      - 'app/**'
 
 permissions:
   contents: read
