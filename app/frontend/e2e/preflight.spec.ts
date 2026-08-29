@@ -1,7 +1,7 @@
 import { test, expect, type Page, type APIRequestContext, type TestInfo } from '@playwright/test'
-import { e2eConfig } from './config'
-import { attachSafeDiagnostic, redactText } from './diagnostics'
-import { withMp4Fixture } from './fixtures'
+import { e2eConfig } from './config.js'
+import { attachSafeDiagnostic, redactText } from './diagnostics.js'
+import { withMp4Fixture, type VideoFixture } from './fixtures.js'
 
 async function verifyDependency(
   testInfo: TestInfo,
@@ -46,7 +46,7 @@ test.describe('@preflight', () => {
     await test.step('side-effect-free API health', () => verifyDependency(testInfo, 'API', () => verifyApi(request)))
     await test.step('local FFmpeg fixture capability', () =>
       verifyDependency(testInfo, 'FFmpeg', async () => {
-        await withMp4Fixture(async (fixture) => {
+        await withMp4Fixture(async (fixture: VideoFixture) => {
           expect(fixture.contentType).toBe('video/mp4')
           expect(fixture.sizeBytes).toBeGreaterThan(0)
         })
