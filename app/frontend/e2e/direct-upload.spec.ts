@@ -1,4 +1,4 @@
-import { test, expect, type Page, type TestInfo } from '@playwright/test'
+import { test, expect, type Page, type Request } from '@playwright/test'
 import { e2eConfig } from './config.js'
 import { attachSafeDiagnostic, safeDiagnostic, redactUrl } from './diagnostics.js'
 import { withMp4Fixture, type VideoFixture } from './fixtures.js'
@@ -9,6 +9,7 @@ interface NetworkEvidence {
   path: string
   status?: number
   contentType?: string
+  bodyBytes?: number
 }
 
 function evidenceUrl(value: string): Pick<NetworkEvidence, 'origin' | 'path'> {
@@ -16,8 +17,41 @@ function evidenceUrl(value: string): Pick<NetworkEvidence, 'origin' | 'path'> {
   return { origin: url.origin, path: url.pathname }
 }
 
+function createVideoTarget(): Pick<NetworkEvidence, 'origin' | 'path'> {
+  const api = new URL(e2eConfig.apiUrl)
+  const basePath = api.pathname.replace(/\/$/, '')
+  const path = basePath.endsWith('/api/v1') ? `${basePath}/videos` : '/api/v1/videos'
+  return { origin: api.origin, path }
+}
+
+function matchesTarget(
+  value: Pick<NetworkEvidence, 'origin' | 'path'>,
+  target: Pick<NetworkEvidence, 'origin' | 'path'>,
+): boolean {
+  return value.origin === target.origin && value.path === target.path
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 function responseEvidence(response: Awaited<ReturnType<Page['waitForResponse']>>): NetworkEvidence {
   return { method: response.request().method(), ...evidenceUrl(response.url()), status: response.status() }
+}
+
+function requestBodyBytes(request: Request): number | undefined {
+  const buffer = request.postDataBuffer()
+  if (buffer) return buffer.byteLength
+  const length = request.headers()['content-length']
+  if (length && /^\d+$/.test(length)) return Number(length)
+  return undefined
+}
+
+function uploadTargetFromCreateBody(body: unknown): Pick<NetworkEvidence, 'origin' | 'path'> {
+  if (!isRecord(body) || !isRecord(body.upload) || typeof body.upload.url !== 'string') {
+    throw new Error('create-video response did not include an upload URL')
+  }
+  return evidenceUrl(body.upload.url)
 }
 
 function idFromResult(text: string, label: 'Video' | 'Job'): string {
@@ -30,19 +64,34 @@ test.describe('@phase1-pipeline', () => {
   test.use({ trace: 'off' })
 
   test('creates one video and uploads its source directly to S3', async ({ page }, testInfo) => {
-    const responses: NetworkEvidence[] = []
+    const createTarget = createVideoTarget()
+    const apiOrigin = new URL(e2eConfig.apiUrl).origin
+    const frontendOrigin = new URL(e2eConfig.frontendUrl).origin
+    const createResponses: NetworkEvidence[] = []
+    const putResponses: NetworkEvidence[] = []
+    const putRequests: NetworkEvidence[] = []
+    let createResponse: Awaited<ReturnType<Page['waitForResponse']>> | undefined
     let uploadRequest: NetworkEvidence | undefined
+    let uploadTarget: Pick<NetworkEvidence, 'origin' | 'path'> | undefined
     let videoId: string | undefined
     let jobId: string | undefined
 
     page.on('response', (response) => {
-      const request = response.request()
-      if (request.method() === 'POST' || request.method() === 'PUT') responses.push(responseEvidence(response))
+      const method = response.request().method()
+      if (method === 'POST' && matchesTarget(evidenceUrl(response.url()), createTarget)) {
+        createResponse = response
+        createResponses.push(responseEvidence(response))
+      }
+      if (method === 'PUT') putResponses.push(responseEvidence(response))
     })
     page.on('request', (request) => {
-      if (request.method() === 'PUT') {
-        uploadRequest = { method: 'PUT', ...evidenceUrl(request.url()), contentType: request.headers()['content-type'] }
-      }
+      if (request.method() !== 'PUT') return
+      putRequests.push({
+        method: 'PUT',
+        ...evidenceUrl(request.url()),
+        contentType: request.headers()['content-type'],
+        bodyBytes: requestBodyBytes(request),
+      })
     })
 
     try {
@@ -60,16 +109,38 @@ test.describe('@phase1-pipeline', () => {
         const resultText = (await result.textContent()) ?? ''
         videoId = idFromResult(resultText, 'Video')
         jobId = idFromResult(resultText, 'Job')
-        expect(responses.filter((response) => response.method === 'POST')).toHaveLength(1)
+        expect(createResponses).toHaveLength(1)
 
-        await expect.poll(() => uploadRequest, { timeout: e2eConfig.timeouts.upload }).toBeTruthy()
-        expect(uploadRequest?.method).toBe('PUT')
-        expect(uploadRequest?.contentType).toBe('video/mp4')
-        expect(uploadRequest?.origin).not.toBe(new URL(e2eConfig.apiUrl).origin)
-        expect(uploadRequest?.origin).not.toBe(new URL(e2eConfig.frontendUrl).origin)
+        if (!createResponse) throw new Error('create-video response was not observed')
+        uploadTarget = uploadTargetFromCreateBody(await createResponse.json())
+        expect(uploadTarget.origin).not.toBe(apiOrigin)
+        expect(uploadTarget.origin).not.toBe(frontendOrigin)
+
+        const target = uploadTarget
         await expect
           .poll(
-            () => responses.some((response) => response.method === 'PUT' && response.status && response.status >= 200 && response.status < 300),
+            () => putRequests.find((request) => matchesTarget(request, target)),
+            { timeout: e2eConfig.timeouts.upload },
+          )
+          .toBeTruthy()
+
+        uploadRequest = putRequests.find((request) => matchesTarget(request, target))
+        expect(uploadRequest?.method).toBe('PUT')
+        expect(uploadRequest?.contentType).toBe('video/mp4')
+        expect(uploadRequest?.origin).not.toBe(apiOrigin)
+        expect(uploadRequest?.origin).not.toBe(frontendOrigin)
+        expect(uploadRequest?.bodyBytes).toBe(fixture.sizeBytes)
+
+        await expect
+          .poll(
+            () =>
+              putResponses.some(
+                (response) =>
+                  matchesTarget(response, target) &&
+                  response.status !== undefined &&
+                  response.status >= 200 &&
+                  response.status < 300,
+              ),
             { timeout: e2eConfig.timeouts.upload },
           )
           .toBe(true)
@@ -77,13 +148,24 @@ test.describe('@phase1-pipeline', () => {
         await expect(page.locator('[data-workflow-state]')).toHaveAttribute('data-workflow-state', /processing|ready/)
       })
     } finally {
+      const target = uploadTarget
+      const matchedPuts = target ? putResponses.filter((response) => matchesTarget(response, target)) : []
       await attachSafeDiagnostic(testInfo, 'direct-upload-network', {
         videoId,
         jobId,
-        apiOrigin: new URL(e2eConfig.apiUrl).origin,
-        frontendOrigin: new URL(e2eConfig.frontendUrl).origin,
+        apiOrigin,
+        frontendOrigin,
         upload: uploadRequest,
-        responses: responses.map((response) => safeDiagnostic(response)),
+        responses: [...createResponses, ...matchedPuts].map((response) =>
+          safeDiagnostic({
+            origin: response.origin,
+            path: response.path,
+            status: response.status,
+            method: response.method,
+            contentType: response.contentType,
+            bodyBytes: response.bodyBytes,
+          }),
+        ),
       })
     }
   })
