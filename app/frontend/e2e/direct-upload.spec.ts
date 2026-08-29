@@ -27,6 +27,8 @@ function idFromResult(text: string, label: 'Video' | 'Job'): string {
 }
 
 test.describe('@phase1-pipeline', () => {
+  test.use({ trace: 'off' })
+
   test('creates one video and uploads its source directly to S3', async ({ page }, testInfo) => {
     const responses: NetworkEvidence[] = []
     let uploadRequest: NetworkEvidence | undefined
