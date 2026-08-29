@@ -25,7 +25,7 @@ async function verifyFrontend(request: APIRequestContext): Promise<void> {
 }
 
 async function verifyBrowser(page: Page): Promise<void> {
-  await page.goto('/')
+  await page.goto(`${e2eConfig.frontendUrl}/`)
   await expect(page.locator('h1')).toHaveText('You did it!')
 }
 
