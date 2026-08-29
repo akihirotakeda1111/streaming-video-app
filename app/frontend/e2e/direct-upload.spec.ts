@@ -139,6 +139,8 @@ async function inspectHlsObjects(
   playback: PlaybackObservation,
   videoId: string,
   jobId: string,
+  apiOrigin: string,
+  frontendOrigin: string,
 ) {
   const manifest = new URL(playback.manifestUrl)
   const expectedPrefix = `/videos/${videoId}/jobs/${jobId}/hls/`
@@ -146,6 +148,10 @@ async function inspectHlsObjects(
   expect(playback.contentType).toBe('application/vnd.apple.mpegurl')
   expect(manifest.protocol).toBe('https:')
   expect(manifest.hostname).not.toContain('cloudfront.net')
+  expect(manifest.origin).not.toBe(apiOrigin)
+  expect(manifest.origin).not.toBe(frontendOrigin)
+  expect(manifest.search).toBe('')
+  expect(manifest.hash).toBe('')
   expect(manifest.pathname).toBe(`${expectedPrefix}index.m3u8`)
 
   const result = await page.evaluate(async (manifestUrl) => {
