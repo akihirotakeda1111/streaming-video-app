@@ -1,7 +1,7 @@
 import { access } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
-import { generateMp4Fixture } from './fixtures'
-import { redactText, redactUrl, safeDiagnostic } from './diagnostics'
+import { generateMp4Fixture } from './fixtures.js'
+import { redactText, redactUrl, safeDiagnostic } from './diagnostics.js'
 
 describe('E2E fixtures and diagnostics', () => {
   it('generates and cleans up a video/mp4 fixture', async () => {
