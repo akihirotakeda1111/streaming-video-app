@@ -57,6 +57,14 @@ function matchesTarget(
   return value.origin === target.origin && value.path === target.path
 }
 
+function responsesMatchingTarget(
+  responses: NetworkEvidence[],
+  target: Pick<NetworkEvidence, 'origin' | 'path'> | undefined,
+): NetworkEvidence[] {
+  if (!target) return []
+  return responses.filter((response) => matchesTarget(response, target))
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -406,10 +414,7 @@ test.describe('@phase1-pipeline', () => {
         await inspectHlsObjects(page, playback, videoId, jobId, apiOrigin, frontendOrigin)
       })
     } finally {
-      const target = uploadTarget
-      const matchedPuts = target
-        ? putResponses.filter((response) => matchesTarget(response, target))
-        : []
+      const matchedPuts = responsesMatchingTarget(putResponses, uploadTarget)
       await attachSafeDiagnostic(testInfo, 'direct-upload-network', {
         videoId,
         jobId,

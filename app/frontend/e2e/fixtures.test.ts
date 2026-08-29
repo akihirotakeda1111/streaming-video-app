@@ -13,7 +13,7 @@ describe('E2E fixtures and diagnostics', () => {
     } finally {
       await fixture.cleanup()
     }
-    await expect(access(fixture.path)).rejects.toThrow()
+    await expect(access(fixture.path)).rejects.toThrow(/ENOENT/)
   })
 
   it('redacts presigned URLs and credential-like values but keeps IDs', () => {

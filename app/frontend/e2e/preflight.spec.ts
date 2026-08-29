@@ -48,8 +48,11 @@ async function verifyApi(request: APIRequestContext): Promise<void> {
 test.describe('@preflight', () => {
   test('verifies frontend, API, browser, and FFmpeg readiness', async ({ page, request }, testInfo) => {
     await test.step('frontend reachability', () => verifyDependency(testInfo, 'frontend', () => verifyFrontend(request)))
+
     await test.step('browser operation', () => verifyDependency(testInfo, 'browser', () => verifyBrowser(page)))
+
     await test.step('side-effect-free API health', () => verifyDependency(testInfo, 'API', () => verifyApi(request)))
+
     await test.step('local FFmpeg fixture capability', () =>
       verifyDependency(testInfo, 'FFmpeg', async () => {
         await withMp4Fixture(async (fixture: VideoFixture) => {
