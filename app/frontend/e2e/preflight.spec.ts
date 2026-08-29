@@ -17,15 +17,21 @@ async function verifyDependency(
   }
 }
 
+function frontendCheckUrl(): string {
+  const url = new URL(e2eConfig.frontendUrl)
+  if (!url.pathname.endsWith('/')) url.pathname += '/'
+  return url.href
+}
+
 async function verifyFrontend(request: APIRequestContext): Promise<void> {
-  const response = await request.get(`${e2eConfig.frontendUrl}/`, {
+  const response = await request.get(frontendCheckUrl(), {
     timeout: e2eConfig.timeouts.navigation,
   })
   if (!response.ok()) throw new Error(`frontend returned HTTP ${response.status()}`)
 }
 
 async function verifyBrowser(page: Page): Promise<void> {
-  await page.goto(`${e2eConfig.frontendUrl}/`)
+  await page.goto(frontendCheckUrl())
   await expect(page.locator('h1')).toHaveText('You did it!')
 }
 
