@@ -61,12 +61,21 @@ function responseEvidence(response: Awaited<ReturnType<Page['waitForResponse']>>
   }
 }
 
-function requestBodyBytes(request: Request): number | undefined {
+async function requestEvidence(request: Request): Promise<NetworkEvidence> {
   const buffer = request.postDataBuffer()
-  if (buffer) return buffer.byteLength
-  const length = request.headers()['content-length']
-  if (length && /^\d+$/.test(length)) return Number(length)
-  return undefined
+  const headers = await request.allHeaders()
+  const length = headers['content-length']
+  const bodyBytes = buffer
+    ? buffer.byteLength
+    : length && /^\d+$/.test(length)
+      ? Number(length)
+      : undefined
+  return {
+    method: request.method(),
+    ...evidenceUrl(request.url()),
+    contentType: headers['content-type'],
+    bodyBytes,
+  }
 }
 
 function uploadTargetFromCreateBody(body: unknown): Pick<NetworkEvidence, 'origin' | 'path'> {
@@ -138,7 +147,7 @@ test.describe('@phase1-pipeline', () => {
     const frontendOrigin = new URL(e2eConfig.frontendUrl).origin
     const createResponses: NetworkEvidence[] = []
     const putResponses: NetworkEvidence[] = []
-    const putRequests: NetworkEvidence[] = []
+    const putRequests: Request[] = []
     let createResponse: Awaited<ReturnType<Page['waitForResponse']>> | undefined
     let uploadRequest: NetworkEvidence | undefined
     let uploadTarget: Pick<NetworkEvidence, 'origin' | 'path'> | undefined
@@ -177,12 +186,7 @@ test.describe('@phase1-pipeline', () => {
     })
     page.on('request', (request) => {
       if (request.method() !== 'PUT') return
-      putRequests.push({
-        method: 'PUT',
-        ...evidenceUrl(request.url()),
-        contentType: request.headers()['content-type'],
-        bodyBytes: requestBodyBytes(request),
-      })
+      putRequests.push(request)
     })
 
     try {
@@ -209,12 +213,17 @@ test.describe('@phase1-pipeline', () => {
 
         const target = uploadTarget
         await expect
-          .poll(() => putRequests.find((request) => matchesTarget(request, target)), {
-            timeout: e2eConfig.timeouts.upload,
-          })
+          .poll(
+            () => putRequests.find((request) => matchesTarget(evidenceUrl(request.url()), target)),
+            { timeout: e2eConfig.timeouts.upload },
+          )
           .toBeTruthy()
 
-        uploadRequest = putRequests.find((request) => matchesTarget(request, target))
+        const matchedRequest = putRequests.find((request) =>
+          matchesTarget(evidenceUrl(request.url()), target),
+        )
+        if (!matchedRequest) throw new Error('upload request was not observed')
+        uploadRequest = await requestEvidence(matchedRequest)
         expect(uploadRequest?.method).toBe('PUT')
         expect(uploadRequest?.contentType).toBe('video/mp4')
         expect(uploadRequest?.origin).not.toBe(apiOrigin)
