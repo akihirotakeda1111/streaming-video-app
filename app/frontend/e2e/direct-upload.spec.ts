@@ -12,6 +12,24 @@ interface NetworkEvidence {
   bodyBytes?: number
 }
 
+type JobStatus = 'UPLOADING' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED'
+
+interface StatusObservation {
+  status: JobStatus
+  failure: unknown
+  body: Record<string, unknown>
+}
+
+const JOB_STATUSES = new Set<JobStatus>([
+  'UPLOADING',
+  'QUEUED',
+  'PROCESSING',
+  'COMPLETED',
+  'FAILED',
+])
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
+
 function evidenceUrl(value: string): Pick<NetworkEvidence, 'origin' | 'path'> {
   const url = new URL(redactUrl(value))
   return { origin: url.origin, path: url.pathname }
@@ -36,7 +54,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function responseEvidence(response: Awaited<ReturnType<Page['waitForResponse']>>): NetworkEvidence {
-  return { method: response.request().method(), ...evidenceUrl(response.url()), status: response.status() }
+  return {
+    method: response.request().method(),
+    ...evidenceUrl(response.url()),
+    status: response.status(),
+  }
 }
 
 function requestBodyBytes(request: Request): number | undefined {
@@ -60,10 +82,57 @@ function idFromResult(text: string, label: 'Video' | 'Job'): string {
   return id
 }
 
-test.describe('@phase1-pipeline', () => {
-  test.use({ trace: 'off' })
+function statusTarget(videoId: string): Pick<NetworkEvidence, 'origin' | 'path'> {
+  const api = new URL(e2eConfig.apiUrl)
+  const basePath = api.pathname.replace(/\/$/, '')
+  const path = basePath.endsWith('/api/v1')
+    ? `${basePath}/videos/${videoId}`
+    : `/api/v1/videos/${videoId}`
+  return { origin: api.origin, path }
+}
 
-  test('creates one video and uploads its source directly to S3', async ({ page }, testInfo) => {
+function parseStatusResponse(value: unknown): StatusObservation {
+  if (!isRecord(value) || !isRecord(value.job) || typeof value.job.status !== 'string') {
+    throw new Error('get-video response did not match the response contract')
+  }
+  const status = value.job.status as JobStatus
+  if (!JOB_STATUSES.has(status)) throw new Error(`get-video response had unknown status: ${status}`)
+  return { status, failure: value.job.failure, body: value }
+}
+
+function expectRfc3339(value: unknown, field: string) {
+  expect(typeof value, `${field} must be a string`).toBe('string')
+  expect(RFC3339.test(String(value)), `${field} must be RFC 3339`).toBe(true)
+  expect(Number.isNaN(Date.parse(String(value))), `${field} must be a valid instant`).toBe(false)
+}
+
+function validateCompletedResponse(
+  observation: StatusObservation,
+  videoId: string,
+  jobId: string,
+  fixture: VideoFixture,
+) {
+  const body = observation.body
+  const job = body.job as Record<string, unknown>
+  expect(body.videoId).toBe(videoId)
+  expect(job.jobId).toBe(jobId)
+  expect(UUID.test(String(body.videoId))).toBe(true)
+  expect(UUID.test(String(job.jobId))).toBe(true)
+  expect(body.fileName).toBe('fixture.mp4')
+  expect(body.contentType).toBe(fixture.contentType)
+  expect(body.sizeBytes).toBe(fixture.sizeBytes)
+  expect(observation.status).toBe('COMPLETED')
+  expect(observation.failure).toBeNull()
+  expectRfc3339(body.createdAt, 'createdAt')
+  expectRfc3339(body.updatedAt, 'updatedAt')
+}
+
+test.use({ trace: 'off' })
+
+test.describe('@phase1-pipeline', () => {
+  test('uploads one video and reaches COMPLETED through the asynchronous pipeline', async ({
+    page,
+  }, testInfo) => {
     const createTarget = createVideoTarget()
     const apiOrigin = new URL(e2eConfig.apiUrl).origin
     const frontendOrigin = new URL(e2eConfig.frontendUrl).origin
@@ -75,6 +144,10 @@ test.describe('@phase1-pipeline', () => {
     let uploadTarget: Pick<NetworkEvidence, 'origin' | 'path'> | undefined
     let videoId: string | undefined
     let jobId: string | undefined
+    let latestStatus: JobStatus | undefined
+    let latestStatusIndex = -1
+    const observedStatuses: JobStatus[] = []
+    const statusResponses: Promise<StatusObservation>[] = []
 
     page.on('response', (response) => {
       const method = response.request().method()
@@ -83,6 +156,24 @@ test.describe('@phase1-pipeline', () => {
         createResponses.push(responseEvidence(response))
       }
       if (method === 'PUT') putResponses.push(responseEvidence(response))
+      if (
+        method === 'GET' &&
+        videoId &&
+        matchesTarget(evidenceUrl(response.url()), statusTarget(videoId)) &&
+        response.status() === 200
+      ) {
+        const receivedIndex = statusResponses.length
+        const statusResponse = response.json().then(parseStatusResponse)
+        statusResponses.push(statusResponse)
+        void statusResponse.then((observation) => {
+          if (receivedIndex >= latestStatusIndex) {
+            latestStatusIndex = receivedIndex
+            latestStatus = observation.status
+          }
+          if (!observedStatuses.includes(observation.status))
+            observedStatuses.push(observation.status)
+        })
+      }
     })
     page.on('request', (request) => {
       if (request.method() !== 'PUT') return
@@ -118,10 +209,9 @@ test.describe('@phase1-pipeline', () => {
 
         const target = uploadTarget
         await expect
-          .poll(
-            () => putRequests.find((request) => matchesTarget(request, target)),
-            { timeout: e2eConfig.timeouts.upload },
-          )
+          .poll(() => putRequests.find((request) => matchesTarget(request, target)), {
+            timeout: e2eConfig.timeouts.upload,
+          })
           .toBeTruthy()
 
         uploadRequest = putRequests.find((request) => matchesTarget(request, target))
@@ -145,11 +235,45 @@ test.describe('@phase1-pipeline', () => {
           )
           .toBe(true)
 
-        await expect(page.locator('[data-workflow-state]')).toHaveAttribute('data-workflow-state', /processing|ready/)
+        await expect(page.locator('[data-workflow-state]')).toHaveAttribute(
+          'data-workflow-state',
+          /processing|ready/,
+        )
+
+        await expect
+          .poll(
+            async () => {
+              const rendered = (
+                (await page.locator('[data-job-status]').textContent()) ?? ''
+              ).match(/Job status:\s*(\w+)/)?.[1]
+              if (rendered === 'FAILED' || latestStatus === 'FAILED') {
+                const observations = await Promise.all(statusResponses)
+                const failed = observations.findLast((item) => item.status === 'FAILED')
+                throw new Error(
+                  `pipeline reached FAILED: ${JSON.stringify(
+                    safeDiagnostic({ videoId, jobId, status: 'FAILED', failure: failed?.failure }),
+                  )}`,
+                )
+              }
+              return { api: latestStatus, ui: rendered }
+            },
+            {
+              timeout: e2eConfig.timeouts.processing,
+              message: `pipeline did not reach COMPLETED (videoId=${videoId}, jobId=${jobId}); last status is reported below`,
+            },
+          )
+          .toEqual({ api: 'COMPLETED', ui: 'COMPLETED' })
+
+        const observations = await Promise.all(statusResponses)
+        const completed = observations.findLast((item) => item.status === 'COMPLETED')
+        expect(completed, 'a successful COMPLETED API response was not observed').toBeDefined()
+        validateCompletedResponse(completed!, videoId, jobId, fixture)
       })
     } finally {
       const target = uploadTarget
-      const matchedPuts = target ? putResponses.filter((response) => matchesTarget(response, target)) : []
+      const matchedPuts = target
+        ? putResponses.filter((response) => matchesTarget(response, target))
+        : []
       await attachSafeDiagnostic(testInfo, 'direct-upload-network', {
         videoId,
         jobId,
@@ -166,6 +290,12 @@ test.describe('@phase1-pipeline', () => {
             bodyBytes: response.bodyBytes,
           }),
         ),
+      })
+      await attachSafeDiagnostic(testInfo, 'pipeline-status', {
+        videoId,
+        jobId,
+        status: latestStatus,
+        observedStatuses,
       })
     }
   })
