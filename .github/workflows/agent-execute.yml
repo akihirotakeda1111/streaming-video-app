@@ -46,6 +46,12 @@
 #   A non-empty placeholder is required so the action still runs the
 #   Linux sandbox bootstrap (and the unused Responses API proxy).
 #
+# Live AWS E2E configuration:
+# - Repository variables: AWS_REGION, VIDEO_INPUT_BUCKET, VIDEO_OUTPUT_BUCKET.
+# - Repository secrets: AWS_E2E_API_ACCESS_KEY_ID, AWS_E2E_API_SECRET_ACCESS_KEY.
+# - The input bucket CORS origin must match http://localhost:5173.
+# - AWS credentials are scoped to API startup and are removed before Vite starts.
+#
 # Official references used while writing this file:
 # - https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows
 # - https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
@@ -215,7 +221,23 @@ jobs:
 
       - name: Start E2E runtime
         if: ${{ needs.parse-spec.outputs.e2e == 'true' }}
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          VIDEO_INPUT_BUCKET: ${{ vars.VIDEO_INPUT_BUCKET }}
+          VIDEO_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
+          FRONTEND_ORIGIN: http://localhost:5173
+          E2E_API_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_API_ACCESS_KEY_ID }}
+          E2E_API_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_API_SECRET_ACCESS_KEY }}
         run: |
+          if [ -z "$AWS_REGION" ] || [ -z "$VIDEO_INPUT_BUCKET" ] || [ -z "$VIDEO_OUTPUT_BUCKET" ]; then
+            echo "AWS_REGION, VIDEO_INPUT_BUCKET, and VIDEO_OUTPUT_BUCKET repository variables are required"
+            exit 1
+          fi
+          if [ -z "$E2E_API_ACCESS_KEY_ID" ] || [ -z "$E2E_API_SECRET_ACCESS_KEY" ]; then
+            echo "AWS_E2E_API_ACCESS_KEY_ID and AWS_E2E_API_SECRET_ACCESS_KEY repository secrets are required"
+            exit 1
+          fi
+
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y ffmpeg
@@ -241,21 +263,20 @@ jobs:
             cd app/backend/api
             HTTP_ADDR=127.0.0.1:8000 \
             DATABASE_URL='postgres://streaming_video:streaming_video_dev_password@127.0.0.1:5432/streaming_video?sslmode=disable' \
-            AWS_REGION=ap-northeast-1 \
-            AWS_ACCESS_KEY_ID=e2e-local \
-            AWS_SECRET_ACCESS_KEY=e2e-local \
+            AWS_ACCESS_KEY_ID="$E2E_API_ACCESS_KEY_ID" \
+            AWS_SECRET_ACCESS_KEY="$E2E_API_SECRET_ACCESS_KEY" \
             AWS_EC2_METADATA_DISABLED=true \
-            VIDEO_INPUT_BUCKET=streaming-video-input-e2e \
-            VIDEO_OUTPUT_BUCKET=streaming-video-output-e2e \
-            OUTPUT_S3_ENDPOINT=http://127.0.0.1:9000 \
+            OUTPUT_S3_ENDPOINT="https://${VIDEO_OUTPUT_BUCKET}.s3.${AWS_REGION}.amazonaws.com" \
             go run ./cmd/api
           ) > "$RUNNER_TEMP/e2e-api.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/e2e-api.pid"
 
+          unset E2E_API_ACCESS_KEY_ID E2E_API_SECRET_ACCESS_KEY
+
           (
             cd app/frontend
-            VITE_API_BASE_URL=http://127.0.0.1:8000 \
-              npm run dev -- --host 127.0.0.1 --port 5173
+            VITE_API_BASE_URL=http://127.0.0.1:8000/api/v1 \
+              npm run dev -- --host 0.0.0.0 --port 5173
           ) > "$RUNNER_TEMP/e2e-frontend.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/e2e-frontend.pid"
 
@@ -275,7 +296,7 @@ jobs:
           }
 
           wait_for api http://127.0.0.1:8000/api/v1/health "$RUNNER_TEMP/e2e-api.log"
-          wait_for frontend http://127.0.0.1:5173/ "$RUNNER_TEMP/e2e-frontend.log"
+          wait_for frontend http://localhost:5173/ "$RUNNER_TEMP/e2e-frontend.log"
 
       - name: Install pinned Codex CLI
         id: codex-cli
@@ -298,7 +319,7 @@ jobs:
           CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
           GITHUB_TOKEN: ""
           E2E_ENVIRONMENT: ${{ needs.parse-spec.outputs.e2e == 'true' && 'disposable' || '' }}
-          E2E_FRONTEND_URL: ${{ needs.parse-spec.outputs.e2e == 'true' && 'http://127.0.0.1:5173' || '' }}
+          E2E_FRONTEND_URL: ${{ needs.parse-spec.outputs.e2e == 'true' && 'http://localhost:5173' || '' }}
           E2E_API_URL: ${{ needs.parse-spec.outputs.e2e == 'true' && 'http://127.0.0.1:8000' || '' }}
           E2E_PROJECT: ${{ needs.parse-spec.outputs.e2e == 'true' && 'chromium' || '' }}
           FFMPEG_PATH: ${{ needs.parse-spec.outputs.e2e == 'true' && '/usr/bin/ffmpeg' || '' }}
@@ -390,7 +411,23 @@ jobs:
 
       - name: Start E2E runtime
         if: ${{ needs.parse-spec.outputs.e2e == 'true' }}
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          VIDEO_INPUT_BUCKET: ${{ vars.VIDEO_INPUT_BUCKET }}
+          VIDEO_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
+          FRONTEND_ORIGIN: http://localhost:5173
+          E2E_API_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_API_ACCESS_KEY_ID }}
+          E2E_API_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_API_SECRET_ACCESS_KEY }}
         run: |
+          if [ -z "$AWS_REGION" ] || [ -z "$VIDEO_INPUT_BUCKET" ] || [ -z "$VIDEO_OUTPUT_BUCKET" ]; then
+            echo "AWS_REGION, VIDEO_INPUT_BUCKET, and VIDEO_OUTPUT_BUCKET repository variables are required"
+            exit 1
+          fi
+          if [ -z "$E2E_API_ACCESS_KEY_ID" ] || [ -z "$E2E_API_SECRET_ACCESS_KEY" ]; then
+            echo "AWS_E2E_API_ACCESS_KEY_ID and AWS_E2E_API_SECRET_ACCESS_KEY repository secrets are required"
+            exit 1
+          fi
+
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y ffmpeg
@@ -416,20 +453,19 @@ jobs:
             cd app/backend/api
             HTTP_ADDR=127.0.0.1:8000 \
             DATABASE_URL='postgres://streaming_video:streaming_video_dev_password@127.0.0.1:5432/streaming_video?sslmode=disable' \
-            AWS_REGION=ap-northeast-1 \
-            AWS_ACCESS_KEY_ID=e2e-local \
-            AWS_SECRET_ACCESS_KEY=e2e-local \
+            AWS_ACCESS_KEY_ID="$E2E_API_ACCESS_KEY_ID" \
+            AWS_SECRET_ACCESS_KEY="$E2E_API_SECRET_ACCESS_KEY" \
             AWS_EC2_METADATA_DISABLED=true \
-            VIDEO_INPUT_BUCKET=streaming-video-input-e2e \
-            VIDEO_OUTPUT_BUCKET=streaming-video-output-e2e \
-            OUTPUT_S3_ENDPOINT=http://127.0.0.1:9000 \
+            OUTPUT_S3_ENDPOINT="https://${VIDEO_OUTPUT_BUCKET}.s3.${AWS_REGION}.amazonaws.com" \
             go run ./cmd/api
           ) > "$RUNNER_TEMP/e2e-api.log" 2>&1 &
 
+          unset E2E_API_ACCESS_KEY_ID E2E_API_SECRET_ACCESS_KEY
+
           (
             cd app/frontend
-            VITE_API_BASE_URL=http://127.0.0.1:8000 \
-              npm run dev -- --host 127.0.0.1 --port 5173
+            VITE_API_BASE_URL=http://127.0.0.1:8000/api/v1 \
+              npm run dev -- --host 0.0.0.0 --port 5173
           ) > "$RUNNER_TEMP/e2e-frontend.log" 2>&1 &
 
           wait_for() {
@@ -448,7 +484,7 @@ jobs:
           }
 
           wait_for api http://127.0.0.1:8000/api/v1/health "$RUNNER_TEMP/e2e-api.log"
-          wait_for frontend http://127.0.0.1:5173/ "$RUNNER_TEMP/e2e-frontend.log"
+          wait_for frontend http://localhost:5173/ "$RUNNER_TEMP/e2e-frontend.log"
 
       - name: Download work report
         uses: actions/download-artifact@v7
@@ -463,7 +499,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_API_URL: ${{ github.api_url }}
           E2E_ENVIRONMENT: ${{ needs.parse-spec.outputs.e2e == 'true' && 'disposable' || '' }}
-          E2E_FRONTEND_URL: ${{ needs.parse-spec.outputs.e2e == 'true' && 'http://127.0.0.1:5173' || '' }}
+          E2E_FRONTEND_URL: ${{ needs.parse-spec.outputs.e2e == 'true' && 'http://localhost:5173' || '' }}
           E2E_API_URL: ${{ needs.parse-spec.outputs.e2e == 'true' && 'http://127.0.0.1:8000' || '' }}
           E2E_PROJECT: ${{ needs.parse-spec.outputs.e2e == 'true' && 'chromium' || '' }}
           FFMPEG_PATH: ${{ needs.parse-spec.outputs.e2e == 'true' && '/usr/bin/ffmpeg' || '' }}
