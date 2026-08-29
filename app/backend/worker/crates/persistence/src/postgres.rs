@@ -1,6 +1,8 @@
 //! PostgreSQL implementation of the job-state port.
 
-use postgres::{Client, NoTls, types::ToSql};
+use std::future::Future;
+
+use tokio_postgres::{Client, NoTls, types::ToSql};
 
 use crate::{JobState, PersistenceError};
 
@@ -26,16 +28,24 @@ impl JobStatus {
 }
 
 trait Database {
-    fn execute(&mut self, statement: &str, parameters: &[&str]) -> Result<u64, postgres::Error>;
+    fn execute(
+        &mut self,
+        statement: &str,
+        parameters: &[&str],
+    ) -> impl Future<Output = Result<u64, tokio_postgres::Error>> + Send;
 }
 
 impl Database for Client {
-    fn execute(&mut self, statement: &str, parameters: &[&str]) -> Result<u64, postgres::Error> {
+    async fn execute(
+        &mut self,
+        statement: &str,
+        parameters: &[&str],
+    ) -> Result<u64, tokio_postgres::Error> {
         let values: Vec<&(dyn ToSql + Sync)> = parameters
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))
             .collect();
-        Client::execute(self, statement, &values)
+        Client::execute(self, statement, &values).await
     }
 }
 
@@ -44,21 +54,29 @@ pub struct PostgresJobState<D = Client> {
 }
 
 impl PostgresJobState<Client> {
-    pub fn connect(database_url: &str) -> Result<Self, PersistenceError> {
-        Client::connect(database_url, NoTls)
-            .map(|database| Self { database })
-            .map_err(map_error)
+    pub async fn connect(database_url: &str) -> Result<Self, PersistenceError> {
+        let (database, connection) = tokio_postgres::connect(database_url, NoTls)
+            .await
+            .map_err(map_error)?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::error!(%error, "postgres connection stopped");
+            }
+        });
+        Ok(Self { database })
     }
 }
 
+#[cfg(test)]
 impl<D> PostgresJobState<D> {
     fn new(database: D) -> Self {
         Self { database }
     }
 }
 
+#[allow(private_bounds)]
 impl<D: Database> PostgresJobState<D> {
-    fn set_status(
+    async fn set_status(
         &mut self,
         job_id: &str,
         status: JobStatus,
@@ -70,19 +88,21 @@ impl<D: Database> PostgresJobState<D> {
                 "UPDATE jobs SET status = $1, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $2::text::uuid AND status = $3",
                 &[status.as_contract_value(), job_id, required_status],
             )
+            .await
             .map_err(map_error)?;
         require_one(changed)
     }
 }
 
-impl<D: Database> JobState for PostgresJobState<D> {
-    fn claim(&mut self, job_id: &str, video_id: &str) -> Result<bool, PersistenceError> {
+impl<D: Database + Send> JobState for PostgresJobState<D> {
+    async fn claim(&mut self, job_id: &str, video_id: &str) -> Result<bool, PersistenceError> {
         let changed = self
             .database
             .execute(
                 "UPDATE jobs SET status = 'QUEUED', updated_at = CURRENT_TIMESTAMP WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND status = 'UPLOADING'",
                 &[job_id, video_id],
             )
+            .await
             .map_err(map_error)?;
         match changed {
             1 => Ok(true),
@@ -93,27 +113,29 @@ impl<D: Database> JobState for PostgresJobState<D> {
         }
     }
 
-    fn mark_processing(&mut self, job_id: &str) -> Result<(), PersistenceError> {
+    async fn mark_processing(&mut self, job_id: &str) -> Result<(), PersistenceError> {
         self.set_status(
             job_id,
             JobStatus::Processing,
             JobStatus::Queued.as_contract_value(),
         )
+        .await
     }
 
-    fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError> {
+    async fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError> {
         self.set_status(
             job_id,
             JobStatus::Completed,
             JobStatus::Processing.as_contract_value(),
         )
+        .await
     }
 
-    fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError> {
+    async fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError> {
         let changed = self.database.execute(
             "UPDATE jobs SET status = $1, failure_code = $2, failure_message = $3, updated_at = NOW() WHERE id = $4::text::uuid AND status IN ('QUEUED', 'PROCESSING')",
             &[JobStatus::Failed.as_contract_value(), "ENCODING_FAILED", reason, job_id],
-        ).map_err(map_error)?;
+        ).await.map_err(map_error)?;
         require_one(changed)
     }
 }
@@ -128,7 +150,7 @@ fn require_one(changed: u64) -> Result<(), PersistenceError> {
     }
 }
 
-fn map_error(error: postgres::Error) -> PersistenceError {
+fn map_error(error: tokio_postgres::Error) -> PersistenceError {
     PersistenceError(format!("postgres operation failed: {error}"))
 }
 
@@ -159,10 +181,13 @@ mod tests {
             &mut self,
             _statement: &str,
             parameters: &[&str],
-        ) -> Result<u64, postgres::Error> {
-            self.parameters
-                .push(parameters.iter().map(|value| (*value).to_owned()).collect());
-            Ok(self.changed)
+        ) -> impl Future<Output = Result<u64, tokio_postgres::Error>> + Send {
+            let result = {
+                self.parameters
+                    .push(parameters.iter().map(|value| (*value).to_owned()).collect());
+                Ok(self.changed)
+            };
+            std::future::ready(result)
         }
     }
 
@@ -185,51 +210,51 @@ mod tests {
         );
     }
 
-    #[test]
-    fn driver_bindings_use_contract_values_in_call_order() {
+    #[tokio::test]
+    async fn driver_bindings_use_contract_values_in_call_order() {
         let mut claim = jobs();
-        assert!(claim.claim("job-id", "video-id").unwrap());
+        assert!(claim.claim("job-id", "video-id").await.unwrap());
         assert_eq!(claim.database.parameters, [["job-id", "video-id"]]);
 
         let mut processing = jobs();
-        processing.mark_processing("job-id").unwrap();
+        processing.mark_processing("job-id").await.unwrap();
         assert_eq!(
             processing.database.parameters,
             [["PROCESSING", "job-id", "QUEUED"]]
         );
 
         let mut completed = jobs();
-        completed.mark_completed("job-id").unwrap();
+        completed.mark_completed("job-id").await.unwrap();
         assert_eq!(
             completed.database.parameters,
             [["COMPLETED", "job-id", "PROCESSING"]]
         );
 
         let mut failed = jobs();
-        failed.mark_failed("job-id", "ffmpeg exited").unwrap();
+        failed.mark_failed("job-id", "ffmpeg exited").await.unwrap();
         assert_eq!(
             failed.database.parameters,
             [["FAILED", "ENCODING_FAILED", "ffmpeg exited", "job-id"]]
         );
     }
 
-    #[test]
-    fn zero_row_claim_is_a_safe_no_op() {
+    #[tokio::test]
+    async fn zero_row_claim_is_a_safe_no_op() {
         let mut jobs = PostgresJobState::new(FakeDatabase {
             changed: 0,
             ..FakeDatabase::default()
         });
-        assert!(!jobs.claim("job-id", "video-id").unwrap());
+        assert!(!jobs.claim("job-id", "video-id").await.unwrap());
     }
 
-    #[test]
-    fn zero_row_status_change_is_an_error() {
+    #[tokio::test]
+    async fn zero_row_status_change_is_an_error() {
         let mut jobs = PostgresJobState::new(FakeDatabase {
             changed: 0,
             ..FakeDatabase::default()
         });
-        assert!(jobs.mark_processing("job-id").is_err());
-        assert!(jobs.mark_completed("job-id").is_err());
-        assert!(jobs.mark_failed("job-id", "ffmpeg exited").is_err());
+        assert!(jobs.mark_processing("job-id").await.is_err());
+        assert!(jobs.mark_completed("job-id").await.is_err());
+        assert!(jobs.mark_failed("job-id", "ffmpeg exited").await.is_err());
     }
 }

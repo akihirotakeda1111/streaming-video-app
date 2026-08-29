@@ -206,18 +206,16 @@ fn validate_bucket(variable: &'static str, value: &str) -> Result<(), ConfigErro
             .as_bytes()
             .last()
             .is_some_and(|byte| byte.is_ascii_alphanumeric())
-    {
-        if value
+        && value
             .as_bytes()
             .last()
             .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-            && !value.contains("..")
-            && !value.contains(".-")
-            && !value.contains("-.")
-            && value.parse::<std::net::IpAddr>().is_err()
-        {
-            return Ok(());
-        }
+        && !value.contains("..")
+        && !value.contains(".-")
+        && !value.contains("-.")
+        && value.parse::<std::net::IpAddr>().is_err()
+    {
+        return Ok(());
     }
     Err(ConfigError::invalid(
         variable,

@@ -3,13 +3,14 @@
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use persistence::{JobState, PersistenceError};
 use queue::Message;
 use storage::{ObjectError, Read};
 use tempfile::Builder;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::event::parse_notification;
@@ -83,11 +84,8 @@ impl<J: JobState + Send + 'static> MessageProcessor for AtomicClaimProcessor<J> 
     type Error = PersistenceError;
 
     async fn process(&self, message: Message) -> Result<(), Self::Error> {
-        let mut jobs = self
-            .jobs
-            .lock()
-            .map_err(|_| PersistenceError("job state lock poisoned".into()))?;
-        let owned = claim_notification(&mut *jobs, &message.body, &self.input_bucket)?;
+        let mut jobs = self.jobs.lock().await;
+        let owned = claim_notification(&mut *jobs, &message.body, &self.input_bucket).await?;
         for item in owned {
             info!(job_id = %item.job_id, video_id = %item.video_id, "claimed job");
         }
@@ -140,28 +138,22 @@ where
 
     async fn process(&self, message: Message) -> Result<(), Self::Error> {
         let owned = {
-            let mut jobs = self.jobs.lock().map_err(|_| {
-                ProcessingError::Persistence(PersistenceError("job state lock poisoned".into()))
-            })?;
-            claim_notification(&mut *jobs, &message.body, &self.input_bucket)?
+            let mut jobs = self.jobs.lock().await;
+            claim_notification(&mut *jobs, &message.body, &self.input_bucket).await?
         };
 
         for item in owned {
             {
-                let mut jobs = self.jobs.lock().map_err(|_| {
-                    ProcessingError::Persistence(PersistenceError("job state lock poisoned".into()))
-                })?;
-                jobs.mark_processing(&item.job_id)?;
+                let mut jobs = self.jobs.lock().await;
+                jobs.mark_processing(&item.job_id).await?;
             }
 
             let work_directory = JobDirectory::create(&self.temporary_directory, &item.job_id)?;
             let contents = {
-                let mut storage = self.storage.lock().map_err(|_| {
-                    ProcessingError::Storage(ObjectError("storage lock poisoned".into()))
-                })?;
-                storage.read(&item.bucket, &item.key)?
+                let mut storage = self.storage.lock().await;
+                storage.read(&item.bucket, &item.key).await?
             };
-            work_directory.write_source(&contents)?;
+            work_directory.write_source(&contents).await?;
             info!(job_id = %item.job_id, bucket = %item.bucket, key = %item.key, "downloaded source");
         }
         Ok(())
@@ -192,14 +184,14 @@ impl JobDirectory {
         })
     }
 
-    fn write_source(&self, contents: &[u8]) -> io::Result<()> {
-        fs::write(self.directory.path().join(LOCAL_SOURCE_FILENAME), contents)
+    async fn write_source(&self, contents: &[u8]) -> io::Result<()> {
+        tokio::fs::write(self.directory.path().join(LOCAL_SOURCE_FILENAME), contents).await
     }
 }
 
 /// Claim every eligible record. Invalid notifications and zero-row claims are
 /// skipped so later work never starts without ownership.
-pub fn claim_notification<J: JobState>(
+pub async fn claim_notification<J: JobState>(
     jobs: &mut J,
     body: &str,
     configured_input_bucket: &str,
@@ -214,7 +206,7 @@ pub fn claim_notification<J: JobState>(
 
     let mut owned = Vec::new();
     for item in items {
-        if jobs.claim(&item.job_id, &item.video_id)? {
+        if jobs.claim(&item.job_id, &item.video_id).await? {
             owned.push(item);
         }
     }
@@ -260,17 +252,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn canonical_fixture_claims_an_uploading_job_once() {
+    #[tokio::test]
+    async fn canonical_fixture_claims_an_uploading_job_once() {
         let log = CallLog::default();
         let mut jobs = uploading_jobs(log.clone());
 
         assert_eq!(
-            claim_notification(&mut jobs, FIXTURE, INPUT_BUCKET).unwrap(),
+            claim_notification(&mut jobs, FIXTURE, INPUT_BUCKET)
+                .await
+                .unwrap(),
             [expected_work_item()]
         );
         assert_eq!(
-            claim_notification(&mut jobs, FIXTURE, INPUT_BUCKET).unwrap(),
+            claim_notification(&mut jobs, FIXTURE, INPUT_BUCKET)
+                .await
+                .unwrap(),
             []
         );
         assert_eq!(
@@ -288,19 +284,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_mismatched_and_non_uploading_jobs_are_zero_row_no_ops() {
+    #[tokio::test]
+    async fn missing_mismatched_and_non_uploading_jobs_are_zero_row_no_ops() {
         let log = CallLog::default();
         let mut jobs = FakeJobState::new(log.clone());
         jobs.add_claim(JOB_ID, VIDEO_ID, false);
 
         assert!(
             claim_notification(&mut jobs, FIXTURE, INPUT_BUCKET)
+                .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             claim_notification(&mut jobs, FIXTURE, "other-bucket")
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -310,6 +308,7 @@ mod tests {
                 FIXTURE,
                 INPUT_BUCKET
             )
+            .await
             .unwrap()
             .is_empty()
         );
@@ -322,8 +321,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn zero_row_claims_do_not_download_process_upload_or_delete() {
+    #[tokio::test]
+    async fn zero_row_claims_do_not_download_process_upload_or_delete() {
         let log = CallLog::default();
         let mut jobs = FakeJobState::new(log.clone());
         jobs.add_claim(JOB_ID, VIDEO_ID, false);
@@ -331,6 +330,7 @@ mod tests {
 
         assert!(
             claim_notification(&mut jobs, FIXTURE, INPUT_BUCKET)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -345,19 +345,21 @@ mod tests {
         assert!(storage.writes.is_empty());
     }
 
-    #[test]
-    fn ignored_notifications_never_touch_job_state() {
+    #[tokio::test]
+    async fn ignored_notifications_never_touch_job_state() {
         let log = CallLog::default();
         let mut jobs = uploading_jobs(log.clone());
         let test_event = r#"{"Service":"Amazon S3","Event":"s3:TestEvent"}"#;
 
         assert!(
             claim_notification(&mut jobs, test_event, INPUT_BUCKET)
+                .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             claim_notification(&mut jobs, "not-json", INPUT_BUCKET)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -411,7 +413,7 @@ mod tests {
         assert_eq!(claims.len(), 2);
 
         let remaining = {
-            let jobs = processor.jobs.lock().expect("job state lock");
+            let jobs = processor.jobs.lock().await;
             jobs.claims.clone()
         };
         assert_eq!(remaining, [(JOB_ID.to_owned(), VIDEO_ID.to_owned(), false)]);
@@ -434,8 +436,8 @@ mod tests {
         ])
     }
 
-    #[test]
-    fn claims_every_uploading_job_in_a_multi_record_notification() {
+    #[tokio::test]
+    async fn claims_every_uploading_job_in_a_multi_record_notification() {
         let log = CallLog::default();
         let mut jobs = FakeJobState::new(log.clone());
         jobs.add_claim(JOB_ID, VIDEO_ID, true);
@@ -443,11 +445,15 @@ mod tests {
         let body = two_record_body();
 
         assert_eq!(
-            claim_notification(&mut jobs, &body, INPUT_BUCKET).unwrap(),
+            claim_notification(&mut jobs, &body, INPUT_BUCKET)
+                .await
+                .unwrap(),
             [work_item(VIDEO_ID, JOB_ID), work_item(VIDEO_ID_2, JOB_ID_2)]
         );
         assert_eq!(
-            claim_notification(&mut jobs, &body, INPUT_BUCKET).unwrap(),
+            claim_notification(&mut jobs, &body, INPUT_BUCKET)
+                .await
+                .unwrap(),
             []
         );
         assert_eq!(
@@ -473,8 +479,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn skips_invalid_and_already_claimed_records_and_owns_the_rest() {
+    #[tokio::test]
+    async fn skips_invalid_and_already_claimed_records_and_owns_the_rest() {
         let log = CallLog::default();
         let mut jobs = FakeJobState::new(log.clone());
         jobs.add_claim(JOB_ID, VIDEO_ID, false);
@@ -488,7 +494,9 @@ mod tests {
         ]);
 
         assert_eq!(
-            claim_notification(&mut jobs, &body, INPUT_BUCKET).unwrap(),
+            claim_notification(&mut jobs, &body, INPUT_BUCKET)
+                .await
+                .unwrap(),
             [work_item(VIDEO_ID_2, JOB_ID_2)]
         );
         assert_eq!(
@@ -513,8 +521,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn database_error_on_a_later_claim_stops_without_claiming_remaining_jobs() {
+    #[tokio::test]
+    async fn database_error_on_a_later_claim_stops_without_claiming_remaining_jobs() {
         let log = CallLog::default();
         let mut jobs = FakeJobState::new(log.clone());
         jobs.add_claim(JOB_ID, VIDEO_ID, true);
@@ -531,6 +539,7 @@ mod tests {
 
         assert_eq!(
             claim_notification(&mut jobs, &body, INPUT_BUCKET)
+                .await
                 .unwrap_err()
                 .0,
             "connection reset"
@@ -558,11 +567,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn work_directory_source_is_exactly_source_mp4_with_downloaded_bytes() {
+    #[tokio::test]
+    async fn work_directory_source_is_exactly_source_mp4_with_downloaded_bytes() {
         let root = tempfile::tempdir().unwrap();
         let work = JobDirectory::create(root.path(), JOB_ID).unwrap();
-        work.write_source(b"exact-source-bytes").unwrap();
+        work.write_source(b"exact-source-bytes").await.unwrap();
         let path = work.directory.path().join(LOCAL_SOURCE_FILENAME);
         assert_eq!(path.file_name().unwrap(), "source.mp4");
         assert_eq!(fs::read(&path).unwrap(), b"exact-source-bytes");

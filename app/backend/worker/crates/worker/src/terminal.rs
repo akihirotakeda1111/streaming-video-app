@@ -1,15 +1,12 @@
 //! End-to-end processing and terminal-state ordering for an owned notification.
 
-use std::{
-    fmt, fs,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 use encoding::{Execute, HlsError, encode_hls, runtime::JobDirectory};
 use persistence::{JobState, PersistenceError};
 use queue::{Delete, Message, QueueError};
 use storage::{ObjectError, Read, Write};
+use tokio::sync::Mutex;
 
 use crate::{
     claim::claim_notification,
@@ -81,23 +78,20 @@ impl<J, S, E, Q> TerminalProcessor<J, S, E, Q> {
         }
     }
 
-    fn fail_owned(&self, job_id: &str, failure: String) -> Result<(), TerminalError>
+    async fn fail_owned(&self, job_id: &str, failure: String) -> Result<(), TerminalError>
     where
         J: JobState,
     {
         debug_assert!(!failure.trim().is_empty());
-        let mut jobs = self
-            .jobs
-            .lock()
-            .map_err(|_| TerminalError("job state lock poisoned".into()))?;
-        jobs.mark_failed(job_id, &failure).map_err(|error| {
+        let mut jobs = self.jobs.lock().await;
+        jobs.mark_failed(job_id, &failure).await.map_err(|error| {
             TerminalError(format!(
                 "{failure}; additionally failed to persist FAILED: {error}"
             ))
         })
     }
 
-    fn process_owned(&self, item: &crate::event::WorkItem) -> Result<(), String>
+    async fn process_owned(&self, item: &crate::event::WorkItem) -> Result<(), String>
     where
         J: JobState,
         S: Read + Write,
@@ -105,8 +99,9 @@ impl<J, S, E, Q> TerminalProcessor<J, S, E, Q> {
     {
         self.jobs
             .lock()
-            .map_err(|_| "job state lock poisoned".to_string())?
+            .await
             .mark_processing(&item.job_id)
+            .await
             .map_err(|e| format!("mark PROCESSING: {e}"))?;
 
         let directory = JobDirectory::create(&self.temporary_directory, &item.job_id)
@@ -114,30 +109,28 @@ impl<J, S, E, Q> TerminalProcessor<J, S, E, Q> {
         let source = self
             .storage
             .lock()
-            .map_err(|_| "storage lock poisoned".to_string())?
+            .await
             .read(&item.bucket, &item.key)
+            .await
             .map_err(|e: ObjectError| format!("download source: {}", e.0))?;
-        fs::write(directory.path().join("source.mp4"), source)
+        tokio::fs::write(directory.path().join("source.mp4"), source)
+            .await
             .map_err(|e| format!("write source: {e}"))?;
         let output = encode_hls(
-            &mut *self
-                .executor
-                .lock()
-                .map_err(|_| "executor lock poisoned".to_string())?,
+            &mut *self.executor.lock().await,
             self.ffmpeg_path.clone(),
             directory.path(),
         )
+        .await
         .map_err(|e: HlsError| format!("encode HLS: {e}"))?;
         publish_hls(
-            &mut *self
-                .storage
-                .lock()
-                .map_err(|_| "storage lock poisoned".to_string())?,
+            &mut *self.storage.lock().await,
             &self.output_bucket,
             &item.video_id,
             &item.job_id,
             &output,
         )
+        .await
         .map_err(|e: PublishError| format!("publish HLS: {e}"))?;
 
         // Cleanup is completed before the terminal transition so a cleanup
@@ -151,8 +144,9 @@ impl<J, S, E, Q> TerminalProcessor<J, S, E, Q> {
         // is the manifest.
         self.jobs
             .lock()
-            .map_err(|_| "job state lock poisoned".to_string())?
+            .await
             .mark_completed(&item.job_id)
+            .await
             .map_err(|e| format!("mark COMPLETED: {e}"))?;
         Ok(())
     }
@@ -169,11 +163,9 @@ where
 
     async fn process(&self, message: Message) -> Result<(), Self::Error> {
         let owned = {
-            let mut jobs = self
-                .jobs
-                .lock()
-                .map_err(|_| TerminalError("job state lock poisoned".into()))?;
+            let mut jobs = self.jobs.lock().await;
             claim_notification(&mut *jobs, &message.body, &self.input_bucket)
+                .await
                 .map_err(|e: PersistenceError| TerminalError(format!("claim notification: {e}")))?
         };
         if owned.is_empty() {
@@ -182,8 +174,8 @@ where
 
         let mut failed = false;
         for item in &owned {
-            if let Err(failure) = self.process_owned(item) {
-                self.fail_owned(&item.job_id, failure)?;
+            if let Err(failure) = self.process_owned(item).await {
+                self.fail_owned(&item.job_id, failure).await?;
                 failed = true;
             }
         }
@@ -197,8 +189,9 @@ where
         // turn an already-COMPLETED job into FAILED.
         self.queue
             .lock()
-            .map_err(|_| TerminalError("queue lock poisoned".into()))?
+            .await
             .delete(&message.receipt_handle)
+            .await
             .map_err(|e: QueueError| TerminalError(format!("delete completed message: {}", e.0)))
     }
 }
@@ -208,6 +201,7 @@ mod tests {
     use super::*;
     use crate::event::records_notification;
     use crate::fakes::{Call, CallLog, FakeJobState, FakeProcessExecutor, FakeQueue, FakeStorage};
+    use std::fs;
 
     const EVENT: &str = include_str!("../../../../../contracts/examples/s3/object-created.json");
     const INPUT: &str = "streaming-video-input";
@@ -330,11 +324,11 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let p = processor(log.clone(), root.path());
             match boundary {
-                "processing" => p.jobs.lock().unwrap().fail_mark_processing("no processing"),
-                "download" => p.storage.lock().unwrap().fail_read("no source"),
-                "encode" => p.executor.lock().unwrap().fail_next("no ffmpeg"),
-                "publish" => p.storage.lock().unwrap().fail_write("no upload"),
-                "complete" => p.jobs.lock().unwrap().fail_mark_completed("no completion"),
+                "processing" => p.jobs.lock().await.fail_mark_processing("no processing"),
+                "download" => p.storage.lock().await.fail_read("no source"),
+                "encode" => p.executor.lock().await.fail_next("no ffmpeg"),
+                "publish" => p.storage.lock().await.fail_write("no upload"),
+                "complete" => p.jobs.lock().await.fail_mark_completed("no completion"),
                 _ => unreachable!(),
             }
             assert!(p.process(message()).await.is_ok(), "{boundary}");
@@ -364,20 +358,20 @@ mod tests {
         let log = CallLog::default();
         let root = tempfile::tempdir().unwrap();
         let p = processor(log.clone(), root.path());
-        p.queue.lock().unwrap().fail_delete("SQS unavailable");
+        p.queue.lock().await.fail_delete("SQS unavailable");
         assert!(p.process(message()).await.is_err());
         let calls = log.calls();
         assert!(calls.iter().any(|c| matches!(c, Call::MarkCompleted(_))));
         assert!(!calls.iter().any(|c| matches!(c, Call::MarkFailed { .. })));
     }
 
-    fn successful_write_keys(
+    async fn successful_write_keys(
         processor: &TerminalProcessor<FakeJobState, FakeStorage, FakeProcessExecutor, FakeQueue>,
     ) -> Vec<String> {
         processor
             .storage
             .lock()
-            .unwrap()
+            .await
             .writes
             .iter()
             .map(|(_, key, _)| key.clone())
@@ -408,13 +402,13 @@ mod tests {
         let p = processor(log.clone(), root.path());
         p.storage
             .lock()
-            .unwrap()
+            .await
             .fail_write_after(1, "second segment failed");
 
         p.process(message()).await.unwrap();
         let calls = log.calls();
         failed_without_completion_or_delete(&calls);
-        let keys = successful_write_keys(&p);
+        let keys = successful_write_keys(&p).await;
         assert_eq!(
             keys.iter()
                 .filter(|key| key.ends_with(".ts") || key.ends_with("index.m3u8"))
@@ -440,13 +434,13 @@ mod tests {
         let p = processor(log.clone(), root.path());
         p.storage
             .lock()
-            .unwrap()
+            .await
             .fail_write_after(2, "manifest upload failed");
 
         p.process(message()).await.unwrap();
         let calls = log.calls();
         failed_without_completion_or_delete(&calls);
-        let keys = successful_write_keys(&p);
+        let keys = successful_write_keys(&p).await;
         assert!(
             keys.iter().any(|key| key.ends_with("segment-00000.ts")),
             "{keys:?}"
@@ -489,8 +483,8 @@ mod tests {
         let log = CallLog::default();
         let root = tempfile::tempdir().unwrap();
         let p = processor(log.clone(), root.path());
-        p.storage.lock().unwrap().fail_read("no source");
-        p.jobs.lock().unwrap().fail_mark_failed("catalog down");
+        p.storage.lock().await.fail_read("no source");
+        p.jobs.lock().await.fail_mark_failed("catalog down");
 
         let error = p.process(message()).await.unwrap_err();
         assert!(
@@ -535,7 +529,7 @@ mod tests {
         struct FreezingExecutor;
 
         impl Execute for FreezingExecutor {
-            fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
+            async fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
                 let playlist = PathBuf::from(command.argv.last().expect("playlist"));
                 let directory = playlist.parent().expect("playlist parent");
                 let source = command
@@ -673,7 +667,7 @@ mod tests {
         let log = CallLog::default();
         let root = tempfile::tempdir().unwrap();
         let p = two_job_processor(log.clone(), root.path());
-        p.storage.lock().unwrap().fail_read("no source");
+        p.storage.lock().await.fail_read("no source");
 
         p.process(two_job_message()).await.unwrap();
         let calls = log.calls();
@@ -700,7 +694,7 @@ mod tests {
             "{calls:?}"
         );
         assert_eq!(
-            p.jobs.lock().unwrap().claims,
+            p.jobs.lock().await.claims,
             [
                 (JOB.to_owned(), VIDEO.to_owned(), false),
                 (JOB_2.to_owned(), VIDEO_2.to_owned(), false),
@@ -740,7 +734,7 @@ mod tests {
         let log = CallLog::default();
         let root = tempfile::tempdir().unwrap();
         let p = two_job_processor(log.clone(), root.path());
-        p.storage.lock().unwrap().fail_read_after(1, "no source");
+        p.storage.lock().await.fail_read_after(1, "no source");
 
         p.process(two_job_message()).await.unwrap();
         let calls = log.calls();
@@ -826,10 +820,7 @@ mod tests {
         let log = CallLog::default();
         let root = tempfile::tempdir().unwrap();
         let p = two_job_processor(log.clone(), root.path());
-        p.jobs
-            .lock()
-            .unwrap()
-            .fail_claim_after(1, "connection reset");
+        p.jobs.lock().await.fail_claim_after(1, "connection reset");
 
         let error = p.process(two_job_message()).await.unwrap_err();
         assert!(error.0.contains("claim notification"), "{error}");
@@ -848,7 +839,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            p.jobs.lock().unwrap().claims,
+            p.jobs.lock().await.claims,
             [
                 (JOB.to_owned(), VIDEO.to_owned(), false),
                 (JOB_2.to_owned(), VIDEO_2.to_owned(), true),

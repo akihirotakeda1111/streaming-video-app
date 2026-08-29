@@ -32,7 +32,10 @@ pub struct Output {
 pub struct ProcessError(pub String);
 
 pub trait Execute {
-    fn execute(&mut self, command: Command) -> Result<Output, ProcessError>;
+    fn execute(
+        &mut self,
+        command: Command,
+    ) -> impl std::future::Future<Output = Result<Output, ProcessError>> + Send;
 }
 
 /// The files produced by one HLS encode.
@@ -76,7 +79,7 @@ impl From<io::Error> for HlsError {
 }
 
 /// Run ffmpeg with the worker's fixed HLS output layout and verify the result.
-pub fn encode_hls<E: Execute>(
+pub async fn encode_hls<E: Execute>(
     executor: &mut E,
     ffmpeg_path: impl Into<PathBuf>,
     work_directory: impl AsRef<Path>,
@@ -109,11 +112,16 @@ pub fn encode_hls<E: Execute>(
         ],
     );
 
-    let output = executor.execute(command)?;
+    let output = executor.execute(command).await?;
     if output.status != 0 {
         return Err(HlsError::Failed(output.status));
     }
-    validate_hls_output(work_directory)
+    let validation_directory = work_directory.to_owned();
+    tokio::task::spawn_blocking(move || validate_hls_output(validation_directory))
+        .await
+        .map_err(|error| {
+            HlsError::Process(ProcessError(format!("validate HLS task failed: {error}")))
+        })?
 }
 
 /// Validate an ffmpeg HLS result without trusting paths supplied by the playlist.
@@ -245,7 +253,7 @@ mod tests {
     }
 
     impl Execute for FakeProcess {
-        fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
+        async fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
             if self.write_hls {
                 let playlist = Path::new(command.argv.last().expect("playlist path"));
                 fs::write(playlist, "#EXTM3U\nsegment-00000.ts\n").unwrap();
@@ -376,13 +384,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn encode_hls_passes_fixed_argv_paths_and_segment_pattern() {
+    #[tokio::test]
+    async fn encode_hls_passes_fixed_argv_paths_and_segment_pattern() {
         let work = tempfile::tempdir().unwrap();
         fs::write(work.path().join("source.mp4"), b"video").unwrap();
         let mut executor = FakeProcess::succeeding();
 
-        let output = encode_hls(&mut executor, "ffmpeg", work.path()).unwrap();
+        let output = encode_hls(&mut executor, "ffmpeg", work.path())
+            .await
+            .unwrap();
         assert_eq!(executor.commands.len(), 1);
         assert_eq!(executor.commands[0].executable, PathBuf::from("ffmpeg"));
         assert_eq!(executor.commands[0].argv, expected_hls_argv(work.path()));
@@ -390,12 +400,12 @@ mod tests {
         assert_eq!(output.segments.len(), 1);
     }
 
-    #[test]
-    fn encode_hls_rejects_nonzero_ffmpeg_status() {
+    #[tokio::test]
+    async fn encode_hls_rejects_nonzero_ffmpeg_status() {
         let work = tempfile::tempdir().unwrap();
         let mut executor = FakeProcess::exiting(1);
 
-        match encode_hls(&mut executor, "ffmpeg", work.path()) {
+        match encode_hls(&mut executor, "ffmpeg", work.path()).await {
             Err(HlsError::Failed(1)) => {}
             other => panic!("expected Failed(1), got {other:?}"),
         }

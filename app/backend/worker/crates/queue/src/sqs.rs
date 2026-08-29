@@ -3,36 +3,8 @@
 use std::future::Future;
 
 use aws_sdk_sqs::Client;
-use tokio::runtime::{Handle, Runtime};
 
 use crate::{Delete, Message, QueueError, Receive};
-
-enum BlockingRuntime {
-    Current,
-    Owned(Runtime),
-}
-
-impl BlockingRuntime {
-    fn connect() -> Result<Self, String> {
-        if Handle::try_current().is_ok() {
-            Ok(Self::Current)
-        } else {
-            Runtime::new()
-                .map(Self::Owned)
-                .map_err(|error| error.to_string())
-        }
-    }
-
-    fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
-        match self {
-            Self::Current => {
-                let handle = Handle::current();
-                tokio::task::block_in_place(|| handle.block_on(future))
-            }
-            Self::Owned(runtime) => runtime.block_on(future),
-        }
-    }
-}
 
 trait SqsApi {
     fn receive(
@@ -40,12 +12,15 @@ trait SqsApi {
         queue_url: &str,
         wait_time_seconds: i32,
     ) -> impl Future<Output = Result<Option<Message>, String>> + Send;
-    fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String>;
+    fn delete(
+        &mut self,
+        queue_url: &str,
+        receipt_handle: &str,
+    ) -> impl Future<Output = Result<(), String>> + Send;
 }
 
 pub struct AwsSqsApi {
     client: Client,
-    runtime: BlockingRuntime,
 }
 
 impl SqsApi for AwsSqsApi {
@@ -72,17 +47,15 @@ impl SqsApi for AwsSqsApi {
             }))
     }
 
-    fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String> {
-        self.runtime.block_on(async {
-            self.client
-                .delete_message()
-                .queue_url(queue_url)
-                .receipt_handle(receipt_handle)
-                .send()
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
+    async fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String> {
+        self.client
+            .delete_message()
+            .queue_url(queue_url)
+            .receipt_handle(receipt_handle)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -93,18 +66,15 @@ pub struct SqsQueue<A = AwsSqsApi> {
 
 impl SqsQueue<AwsSqsApi> {
     /// Loads the standard AWS credential chain and pins the requested region.
-    pub fn new(region: &str, queue_url: impl Into<String>) -> Result<Self, QueueError> {
-        let runtime = BlockingRuntime::connect().map_err(QueueError)?;
-        let config = runtime.block_on(
-            aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(aws_config::Region::new(region.to_owned()))
-                .load(),
-        );
+    pub async fn new(region: &str, queue_url: impl Into<String>) -> Result<Self, QueueError> {
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.to_owned()))
+            .load()
+            .await;
         Ok(Self {
             queue_url: queue_url.into(),
             api: AwsSqsApi {
                 client: Client::new(&config),
-                runtime,
             },
         })
     }
@@ -119,10 +89,11 @@ impl<A: SqsApi + Send> Receive for SqsQueue<A> {
     }
 }
 
-impl<A: SqsApi> Delete for SqsQueue<A> {
-    fn delete(&mut self, receipt_handle: &str) -> Result<(), QueueError> {
+impl<A: SqsApi + Send> Delete for SqsQueue<A> {
+    async fn delete(&mut self, receipt_handle: &str) -> Result<(), QueueError> {
         self.api
             .delete(&self.queue_url, receipt_handle)
+            .await
             .map_err(QueueError)
     }
 }
@@ -151,7 +122,7 @@ mod tests {
                 body: "body".into(),
             }))
         }
-        fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String> {
+        async fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String> {
             self.calls.push(vec![
                 "delete".into(),
                 queue_url.into(),
@@ -168,7 +139,7 @@ mod tests {
             api: FakeApi::default(),
         };
         assert_eq!(queue.receive().await.unwrap().unwrap().body, "body");
-        queue.delete("receipt").unwrap();
+        queue.delete("receipt").await.unwrap();
         assert_eq!(
             queue.api.calls,
             vec![

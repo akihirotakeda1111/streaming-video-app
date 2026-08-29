@@ -4,15 +4,11 @@
 
 use std::{
     env,
-    sync::{
-        Arc, Barrier,
-        atomic::{AtomicU64, Ordering},
-    },
-    thread,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use postgres::{Client, NoTls, Row};
+use tokio_postgres::{Client, NoTls, Row, types::ToSql};
 
 use super::{JobState, PostgresJobState};
 use crate::PersistenceError;
@@ -33,19 +29,20 @@ struct Live {
     admin: Client,
 }
 
-impl Drop for Live {
-    fn drop(&mut self) {
-        let _ = self.admin.execute("SET search_path TO public", &[]);
-        let _ = self.admin.execute(
-            &format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema),
-            &[],
-        );
-    }
-}
-
 impl Live {
-    fn job_state(&self) -> PostgresJobState<Client> {
-        PostgresJobState::new(connect_on_schema(&self.url, &self.schema))
+    async fn job_state(&self) -> PostgresJobState<Client> {
+        PostgresJobState::new(connect_on_schema(&self.url, &self.schema).await)
+    }
+
+    async fn cleanup(self) {
+        let _ = self.admin.execute("SET search_path TO public", &[]).await;
+        let _ = self
+            .admin
+            .execute(
+                &format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema),
+                &[],
+            )
+            .await;
     }
 }
 
@@ -60,17 +57,28 @@ fn live_postgres_url() -> (String, bool) {
     }
 }
 
-fn connect_on_schema(url: &str, schema: &str) -> Client {
-    let mut client = Client::connect(url, NoTls).expect("postgres reconnect");
+async fn connect(url: &str) -> Result<Client, tokio_postgres::Error> {
+    let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("test postgres connection stopped: {error}");
+        }
+    });
+    Ok(client)
+}
+
+async fn connect_on_schema(url: &str, schema: &str) -> Client {
+    let client = connect(url).await.expect("postgres reconnect");
     client
         .execute(&format!("SET search_path TO {schema}"), &[])
+        .await
         .expect("set search_path");
     client
 }
 
-fn setup() -> Option<Live> {
+async fn setup() -> Option<Live> {
     let (url, required) = live_postgres_url();
-    let mut admin = match Client::connect(&url, NoTls) {
+    let admin = match connect(&url).await {
         Ok(client) => client,
         Err(error) if required => panic!("postgres is not available: {error}"),
         Err(error) => {
@@ -97,14 +105,16 @@ fn setup() -> Option<Live> {
 
     admin
         .execute(&format!("CREATE SCHEMA {schema}"), &[])
+        .await
         .expect("create schema");
     admin
         .execute(&format!("SET search_path TO {schema}"), &[])
+        .await
         .expect("set search_path");
     for statement in SCHEMA_SQL.split(';') {
         let statement = statement.trim();
         if !statement.is_empty() {
-            admin.execute(statement, &[]).unwrap_or_else(|error| {
+            admin.execute(statement, &[]).await.unwrap_or_else(|error| {
                 panic!("apply schema statement {statement:?}: {error}");
             });
         }
@@ -113,157 +123,171 @@ fn setup() -> Option<Live> {
     Some(Live { url, schema, admin })
 }
 
-fn insert_job(admin: &mut Client, video_id: &str, job_id: &str, status: &str) {
+async fn insert_job(admin: &Client, video_id: &str, job_id: &str, status: &str) {
     let key = format!("videos/{video_id}/jobs/{job_id}/source.mp4");
+    let video_parameters: &[&(dyn ToSql + Sync)] = &[&video_id, &key];
     admin
         .execute(
             "INSERT INTO videos (video_id, file_name, content_type, size_bytes, upload_bucket, upload_key, upload_expires_at)
              VALUES ($1::text::uuid, 'source.mp4', 'video/mp4', 1, 'input', $2, NOW())",
-            &[&video_id, &key],
+            video_parameters,
         )
+        .await
         .expect("insert video");
+    let job_parameters: &[&(dyn ToSql + Sync)] = &[&job_id, &video_id, &status];
     admin
         .execute(
             "INSERT INTO jobs (id, video_id, status) VALUES ($1::text::uuid, $2::text::uuid, $3)",
-            &[&job_id, &video_id, &status],
+            job_parameters,
         )
+        .await
         .expect("insert job");
 }
 
-fn job_row(admin: &mut Client, job_id: &str) -> Row {
+async fn job_row(admin: &Client, job_id: &str) -> Row {
     admin
         .query_one(
             "SELECT status, failure_code, failure_message FROM jobs WHERE id = $1::text::uuid",
             &[&job_id],
         )
+        .await
         .expect("load job")
 }
 
-fn job_status(admin: &mut Client, job_id: &str) -> String {
-    job_row(admin, job_id).get(0)
+async fn job_status(admin: &Client, job_id: &str) -> String {
+    job_row(admin, job_id).await.get(0)
 }
 
-#[test]
-fn claim_transitions_uploading_to_queued_once() {
-    let Some(mut live) = setup() else {
-        return;
-    };
-    insert_job(&mut live.admin, VIDEO_ID, JOB_ID, "UPLOADING");
-    let mut jobs = live.job_state();
-
-    assert!(jobs.claim(JOB_ID, VIDEO_ID).unwrap());
-    assert!(!jobs.claim(JOB_ID, VIDEO_ID).unwrap());
-    assert!(!jobs.claim(JOB_ID, VIDEO_ID_2).unwrap());
-    assert_eq!(job_status(&mut live.admin, JOB_ID), "QUEUED");
+#[tokio::test]
+async fn production_connector_is_safe_inside_the_worker_runtime() {
+    let (url, required) = live_postgres_url();
+    match PostgresJobState::connect(&url).await {
+        Ok(_) => {}
+        Err(error) if required => panic!("postgres is not available: {error}"),
+        Err(error) => eprintln!("skipping live postgres test: {error}"),
+    }
 }
 
-#[test]
-fn two_connections_only_one_claim_succeeds() {
-    let Some(mut live) = setup() else {
+#[tokio::test]
+async fn claim_transitions_uploading_to_queued_once() {
+    let Some(live) = setup().await else {
         return;
     };
-    insert_job(&mut live.admin, VIDEO_ID, JOB_ID, "UPLOADING");
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
 
-    let mut first = live.job_state();
-    let mut second = live.job_state();
-    let barrier = Arc::new(Barrier::new(2));
-    let job_id = JOB_ID.to_owned();
-    let video_id = VIDEO_ID.to_owned();
-    let spawned_barrier = barrier.clone();
-    let first_claim = thread::spawn(move || {
-        spawned_barrier.wait();
-        first.claim(&job_id, &video_id)
-    });
+    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    assert!(!jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    assert!(!jobs.claim(JOB_ID, VIDEO_ID_2).await.unwrap());
+    assert_eq!(job_status(&live.admin, JOB_ID).await, "QUEUED");
+    live.cleanup().await;
+}
 
-    barrier.wait();
-    let second_result = second.claim(JOB_ID, VIDEO_ID);
-    let first_result = first_claim.join().expect("claim thread");
+#[tokio::test]
+async fn two_connections_only_one_claim_succeeds() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+
+    let mut first = live.job_state().await;
+    let mut second = live.job_state().await;
+    let (first_result, second_result) = tokio::join!(
+        first.claim(JOB_ID, VIDEO_ID),
+        second.claim(JOB_ID, VIDEO_ID)
+    );
 
     let owned = [first_result.unwrap(), second_result.unwrap()]
         .into_iter()
         .filter(|claimed| *claimed)
         .count();
     assert_eq!(owned, 1);
-    assert_eq!(job_status(&mut live.admin, JOB_ID), "QUEUED");
+    assert_eq!(job_status(&live.admin, JOB_ID).await, "QUEUED");
+    live.cleanup().await;
 }
 
-#[test]
-fn queued_to_processing_to_completed() {
-    let Some(mut live) = setup() else {
+#[tokio::test]
+async fn queued_to_processing_to_completed() {
+    let Some(live) = setup().await else {
         return;
     };
-    insert_job(&mut live.admin, VIDEO_ID, JOB_ID, "UPLOADING");
-    let mut jobs = live.job_state();
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
 
-    assert!(jobs.mark_processing(JOB_ID).is_err());
-    assert_eq!(job_status(&mut live.admin, JOB_ID), "UPLOADING");
+    assert!(jobs.mark_processing(JOB_ID).await.is_err());
+    assert_eq!(job_status(&live.admin, JOB_ID).await, "UPLOADING");
 
-    assert!(jobs.claim(JOB_ID, VIDEO_ID).unwrap());
-    jobs.mark_processing(JOB_ID).unwrap();
-    assert_eq!(job_status(&mut live.admin, JOB_ID), "PROCESSING");
+    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    jobs.mark_processing(JOB_ID).await.unwrap();
+    assert_eq!(job_status(&live.admin, JOB_ID).await, "PROCESSING");
 
-    jobs.mark_completed(JOB_ID).unwrap();
-    let completed = job_row(&mut live.admin, JOB_ID);
+    jobs.mark_completed(JOB_ID).await.unwrap();
+    let completed = job_row(&live.admin, JOB_ID).await;
     assert_eq!(completed.get::<_, String>(0), "COMPLETED");
     assert!(completed.get::<_, Option<String>>(1).is_none());
     assert!(completed.get::<_, Option<String>>(2).is_none());
+    live.cleanup().await;
 }
 
-#[test]
-fn queued_or_processing_can_fail() {
-    let Some(mut live) = setup() else {
+#[tokio::test]
+async fn queued_or_processing_can_fail() {
+    let Some(live) = setup().await else {
         return;
     };
-    insert_job(&mut live.admin, VIDEO_ID, JOB_ID, "UPLOADING");
-    insert_job(&mut live.admin, VIDEO_ID_2, JOB_ID_2, "UPLOADING");
-    let mut jobs = live.job_state();
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    insert_job(&live.admin, VIDEO_ID_2, JOB_ID_2, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
 
-    assert!(jobs.mark_failed(JOB_ID, "too early").is_err());
-    assert_eq!(job_status(&mut live.admin, JOB_ID), "UPLOADING");
+    assert!(jobs.mark_failed(JOB_ID, "too early").await.is_err());
+    assert_eq!(job_status(&live.admin, JOB_ID).await, "UPLOADING");
 
-    assert!(jobs.claim(JOB_ID, VIDEO_ID).unwrap());
-    jobs.mark_failed(JOB_ID, "queued failed").unwrap();
-    let queued_failed = job_row(&mut live.admin, JOB_ID);
+    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    jobs.mark_failed(JOB_ID, "queued failed").await.unwrap();
+    let queued_failed = job_row(&live.admin, JOB_ID).await;
     assert_eq!(queued_failed.get::<_, String>(0), "FAILED");
     assert_eq!(queued_failed.get::<_, String>(1), "ENCODING_FAILED");
     assert_eq!(queued_failed.get::<_, String>(2), "queued failed");
 
-    assert!(jobs.claim(JOB_ID_2, VIDEO_ID_2).unwrap());
-    jobs.mark_processing(JOB_ID_2).unwrap();
-    jobs.mark_failed(JOB_ID_2, "processing failed").unwrap();
-    let processing_failed = job_row(&mut live.admin, JOB_ID_2);
+    assert!(jobs.claim(JOB_ID_2, VIDEO_ID_2).await.unwrap());
+    jobs.mark_processing(JOB_ID_2).await.unwrap();
+    jobs.mark_failed(JOB_ID_2, "processing failed")
+        .await
+        .unwrap();
+    let processing_failed = job_row(&live.admin, JOB_ID_2).await;
     assert_eq!(processing_failed.get::<_, String>(0), "FAILED");
     assert_eq!(processing_failed.get::<_, String>(1), "ENCODING_FAILED");
     assert_eq!(processing_failed.get::<_, String>(2), "processing failed");
+    live.cleanup().await;
 }
 
-#[test]
-fn completed_job_is_not_overwritten() {
-    let Some(mut live) = setup() else {
+#[tokio::test]
+async fn completed_job_is_not_overwritten() {
+    let Some(live) = setup().await else {
         return;
     };
-    insert_job(&mut live.admin, VIDEO_ID, JOB_ID, "UPLOADING");
-    let mut jobs = live.job_state();
-    assert!(jobs.claim(JOB_ID, VIDEO_ID).unwrap());
-    jobs.mark_processing(JOB_ID).unwrap();
-    jobs.mark_completed(JOB_ID).unwrap();
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    jobs.mark_processing(JOB_ID).await.unwrap();
+    jobs.mark_completed(JOB_ID).await.unwrap();
 
     assert!(matches!(
-        jobs.mark_processing(JOB_ID),
+        jobs.mark_processing(JOB_ID).await,
         Err(PersistenceError(message)) if message.contains("job not found")
     ));
     assert!(matches!(
-        jobs.mark_completed(JOB_ID),
+        jobs.mark_completed(JOB_ID).await,
         Err(PersistenceError(message)) if message.contains("job not found")
     ));
     assert!(matches!(
-        jobs.mark_failed(JOB_ID, "late failure"),
+        jobs.mark_failed(JOB_ID, "late failure").await,
         Err(PersistenceError(message)) if message.contains("job not found")
     ));
-    assert!(!jobs.claim(JOB_ID, VIDEO_ID).unwrap());
+    assert!(!jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
 
-    let completed = job_row(&mut live.admin, JOB_ID);
+    let completed = job_row(&live.admin, JOB_ID).await;
     assert_eq!(completed.get::<_, String>(0), "COMPLETED");
     assert!(completed.get::<_, Option<String>>(1).is_none());
     assert!(completed.get::<_, Option<String>>(2).is_none());
+    live.cleanup().await;
 }

@@ -41,21 +41,21 @@ async fn main() {
         }
     };
 
-    let queue = match SqsQueue::new(&config.aws_region, config.queue_url.clone()) {
+    let queue = match SqsQueue::new(&config.aws_region, config.queue_url.clone()).await {
         Ok(queue) => queue,
         Err(error) => {
             error!(error = %error.0, "queue initialization failed");
             std::process::exit(1);
         }
     };
-    let acknowledgements = match SqsQueue::new(&config.aws_region, config.queue_url.clone()) {
+    let acknowledgements = match SqsQueue::new(&config.aws_region, config.queue_url.clone()).await {
         Ok(queue) => queue,
         Err(error) => {
             error!(error = %error.0, "queue acknowledgement initialization failed");
             std::process::exit(1);
         }
     };
-    let jobs = match PostgresJobState::connect(&config.database_url) {
+    let jobs = match PostgresJobState::connect(&config.database_url).await {
         Ok(jobs) => jobs,
         Err(error) => {
             error!(%error, "database initialization failed");
@@ -66,7 +66,9 @@ async fn main() {
         &config.aws_region,
         config.input_bucket.clone(),
         config.output_bucket.clone(),
-    ) {
+    )
+    .await
+    {
         Ok(storage) => storage,
         Err(error) => {
             error!(error = %error.0, "storage initialization failed");
@@ -142,6 +144,8 @@ mod tests {
         assert!(production.contains("PHASE1_MAX_CONCURRENCY"));
         assert!(production.contains("TerminalProcessor::new"));
         assert!(production.contains("ProcessExecutor"));
+        assert!(production.contains("PostgresJobState::connect(&config.database_url).await"));
+        assert!(!production.contains("block_on"));
         assert!(!production.contains("password"));
     }
 }

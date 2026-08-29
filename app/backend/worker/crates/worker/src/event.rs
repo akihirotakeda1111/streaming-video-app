@@ -268,11 +268,9 @@ mod tests {
 
     #[test]
     fn form_decodes_plus_and_percent_encoding_before_validation() {
-        let encoded = format!(
-            "videos/018f47a2%2d45c2%2d7a84%2db84f%2d5f6dd7b5910a/jobs/018f47a2%2d4699%2d7892%2d9fc0%2dfbe46d3bbd67/source%2emp4"
-        );
+        let encoded = "videos/018f47a2%2d45c2%2d7a84%2db84f%2d5f6dd7b5910a/jobs/018f47a2%2d4699%2d7892%2d9fc0%2dfbe46d3bbd67/source%2emp4";
         assert_eq!(
-            parse_notification(&notification_with_key(&encoded), INPUT_BUCKET).unwrap(),
+            parse_notification(&notification_with_key(encoded), INPUT_BUCKET).unwrap(),
             [expected_work_item()]
         );
 

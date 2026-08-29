@@ -16,7 +16,10 @@ pub trait Receive {
 }
 
 pub trait Delete {
-    fn delete(&mut self, receipt_handle: &str) -> Result<(), QueueError>;
+    fn delete(
+        &mut self,
+        receipt_handle: &str,
+    ) -> impl std::future::Future<Output = Result<(), QueueError>> + Send;
 }
 
 pub mod sqs;

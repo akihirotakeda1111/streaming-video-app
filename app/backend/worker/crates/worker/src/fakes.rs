@@ -99,7 +99,7 @@ impl Receive for FakeQueue {
 }
 
 impl Delete for FakeQueue {
-    fn delete(&mut self, receipt_handle: &str) -> Result<(), QueueError> {
+    async fn delete(&mut self, receipt_handle: &str) -> Result<(), QueueError> {
         self.log.push(Call::Delete(receipt_handle.into()));
         if let Some(error) = self.delete_failures.pop_front() {
             return Err(QueueError(error));
@@ -153,7 +153,7 @@ impl FakeStorage {
 }
 
 impl Read for FakeStorage {
-    fn read(&mut self, bucket: &str, key: &str) -> Result<Vec<u8>, ObjectError> {
+    async fn read(&mut self, bucket: &str, key: &str) -> Result<Vec<u8>, ObjectError> {
         self.log.push(Call::Read {
             bucket: bucket.into(),
             key: key.into(),
@@ -170,7 +170,7 @@ impl Read for FakeStorage {
 }
 
 impl Write for FakeStorage {
-    fn write(
+    async fn write(
         &mut self,
         bucket: &str,
         key: &str,
@@ -258,7 +258,7 @@ fn take_failure_after(
 }
 
 impl JobState for FakeJobState {
-    fn claim(&mut self, job_id: &str, video_id: &str) -> Result<bool, PersistenceError> {
+    async fn claim(&mut self, job_id: &str, video_id: &str) -> Result<bool, PersistenceError> {
         self.log.push(Call::Claim {
             job_id: job_id.into(),
             video_id: video_id.into(),
@@ -279,15 +279,15 @@ impl JobState for FakeJobState {
             Ok(false)
         }
     }
-    fn mark_processing(&mut self, job_id: &str) -> Result<(), PersistenceError> {
+    async fn mark_processing(&mut self, job_id: &str) -> Result<(), PersistenceError> {
         self.log.push(Call::MarkProcessing(job_id.into()));
         take_failure(&mut self.processing_failures)
     }
-    fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError> {
+    async fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError> {
         self.log.push(Call::MarkCompleted(job_id.into()));
         take_failure(&mut self.completed_failures)
     }
-    fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError> {
+    async fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError> {
         self.log.push(Call::MarkFailed {
             job_id: job_id.into(),
             reason: reason.into(),
@@ -349,7 +349,7 @@ impl FakeProcessExecutor {
     }
 }
 impl Execute for FakeProcessExecutor {
-    fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
+    async fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
         self.log.push(Call::Execute(command.clone()));
         if let Some(error) = self.failures.pop_front() {
             return Err(ProcessError(error));

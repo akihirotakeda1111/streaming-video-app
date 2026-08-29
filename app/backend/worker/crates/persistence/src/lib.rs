@@ -1,7 +1,7 @@
 //! Job state ports.  State transitions are deliberately separate so callers
 //! cannot accidentally treat a claim or failure as a successful completion.
 
-use std::fmt;
+use std::{fmt, future::Future};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistenceError(pub String);
@@ -15,10 +15,24 @@ impl fmt::Display for PersistenceError {
 impl std::error::Error for PersistenceError {}
 
 pub trait JobState {
-    fn claim(&mut self, job_id: &str, video_id: &str) -> Result<bool, PersistenceError>;
-    fn mark_processing(&mut self, job_id: &str) -> Result<(), PersistenceError>;
-    fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError>;
-    fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError>;
+    fn claim(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+    ) -> impl Future<Output = Result<bool, PersistenceError>> + Send;
+    fn mark_processing(
+        &mut self,
+        job_id: &str,
+    ) -> impl Future<Output = Result<(), PersistenceError>> + Send;
+    fn mark_completed(
+        &mut self,
+        job_id: &str,
+    ) -> impl Future<Output = Result<(), PersistenceError>> + Send;
+    fn mark_failed(
+        &mut self,
+        job_id: &str,
+        reason: &str,
+    ) -> impl Future<Output = Result<(), PersistenceError>> + Send;
 }
 
 pub mod postgres;

@@ -5,7 +5,11 @@
 pub struct ObjectError(pub String);
 
 pub trait Read {
-    fn read(&mut self, bucket: &str, key: &str) -> Result<Vec<u8>, ObjectError>;
+    fn read(
+        &mut self,
+        bucket: &str,
+        key: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, ObjectError>> + Send;
 }
 
 pub trait Write {
@@ -15,7 +19,7 @@ pub trait Write {
         key: &str,
         content_type: &str,
         contents: &[u8],
-    ) -> Result<(), ObjectError>;
+    ) -> impl std::future::Future<Output = Result<(), ObjectError>> + Send;
 }
 
 pub mod s3;

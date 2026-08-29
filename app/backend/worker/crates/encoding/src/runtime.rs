@@ -1,6 +1,6 @@
 //! Filesystem and child-process implementations of the encoding ports.
 
-use std::{fs, io, path::Path, process::Command as ProcessCommand};
+use std::{fs, io, path::Path};
 
 use tempfile::Builder;
 
@@ -11,10 +11,11 @@ use crate::{Command, Execute, Output, ProcessError};
 pub struct ProcessExecutor;
 
 impl Execute for ProcessExecutor {
-    fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
-        let output = ProcessCommand::new(&command.executable)
+    async fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
+        let output = tokio::process::Command::new(&command.executable)
             .args(&command.argv)
             .output()
+            .await
             .map_err(|error| ProcessError(format!("execute {:?}: {error}", command.executable)))?;
         Ok(Output {
             status: output.status.code().unwrap_or(-1),
@@ -91,14 +92,15 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn executor_passes_arguments_without_shell_interpolation() {
+    #[tokio::test]
+    async fn executor_passes_arguments_without_shell_interpolation() {
         let mut executor = ProcessExecutor;
         let output = executor
             .execute(Command::new(
                 "/bin/printf",
                 vec!["%s".into(), "hello; echo unsafe".into()],
             ))
+            .await
             .unwrap();
         assert_eq!(output.status, 0);
         assert_eq!(output.stdout, b"hello; echo unsafe");

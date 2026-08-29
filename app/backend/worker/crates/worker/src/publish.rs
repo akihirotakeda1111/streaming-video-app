@@ -1,6 +1,6 @@
 //! Publication of a validated HLS rendition to the canonical output prefix.
 
-use std::{fmt, fs, io};
+use std::{fmt, io};
 
 use encoding::HlsOutput;
 use storage::{ObjectError, Write};
@@ -43,7 +43,7 @@ impl From<ObjectError> for PublishError {
 
 /// Upload every playlist-referenced segment, in playlist order, before making
 /// the manifest visible. The supplied output must come from HLS validation.
-pub fn publish_hls<W: Write>(
+pub async fn publish_hls<W: Write>(
     storage: &mut W,
     output_bucket: &str,
     video_id: &str,
@@ -57,22 +57,26 @@ pub fn publish_hls<W: Write>(
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or(PublishError::InvalidSegmentPath)?;
-        let contents = fs::read(segment)?;
-        storage.write(
-            output_bucket,
-            &format!("{prefix}/{filename}"),
-            HLS_SEGMENT_CONTENT_TYPE,
-            &contents,
-        )?;
+        let contents = tokio::fs::read(segment).await?;
+        storage
+            .write(
+                output_bucket,
+                &format!("{prefix}/{filename}"),
+                HLS_SEGMENT_CONTENT_TYPE,
+                &contents,
+            )
+            .await?;
     }
 
-    let playlist = fs::read(&output.playlist)?;
-    storage.write(
-        output_bucket,
-        &format!("{prefix}/index.m3u8"),
-        HLS_PLAYLIST_CONTENT_TYPE,
-        &playlist,
-    )?;
+    let playlist = tokio::fs::read(&output.playlist).await?;
+    storage
+        .write(
+            output_bucket,
+            &format!("{prefix}/index.m3u8"),
+            HLS_PLAYLIST_CONTENT_TYPE,
+            &playlist,
+        )
+        .await?;
     Ok(())
 }
 
@@ -80,6 +84,7 @@ pub fn publish_hls<W: Write>(
 mod tests {
     use super::*;
     use crate::fakes::{Call, CallLog, FakeStorage};
+    use std::fs;
 
     const VIDEO_ID: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910a";
     const JOB_ID: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd67";
@@ -101,13 +106,15 @@ mod tests {
         )
     }
 
-    #[test]
-    fn publishes_referenced_segments_then_manifest_with_canonical_metadata() {
+    #[tokio::test]
+    async fn publishes_referenced_segments_then_manifest_with_canonical_metadata() {
         let (_directory, output) = output();
         let log = CallLog::default();
         let mut storage = FakeStorage::new(log.clone());
 
-        publish_hls(&mut storage, "video-output", VIDEO_ID, JOB_ID, &output).unwrap();
+        publish_hls(&mut storage, "video-output", VIDEO_ID, JOB_ID, &output)
+            .await
+            .unwrap();
 
         let writes: Vec<_> = log
             .calls()
@@ -145,14 +152,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn segment_failure_prevents_manifest_publication() {
+    #[tokio::test]
+    async fn segment_failure_prevents_manifest_publication() {
         let (_directory, output) = output();
         let log = CallLog::default();
         let mut storage = FakeStorage::new(log.clone());
         storage.fail_write("segment upload failed");
 
-        assert!(publish_hls(&mut storage, "video-output", VIDEO_ID, JOB_ID, &output).is_err());
+        assert!(
+            publish_hls(&mut storage, "video-output", VIDEO_ID, JOB_ID, &output)
+                .await
+                .is_err()
+        );
 
         let writes: Vec<_> = log
             .calls()
@@ -171,14 +182,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn later_segment_failure_prevents_manifest_publication() {
+    #[tokio::test]
+    async fn later_segment_failure_prevents_manifest_publication() {
         let (_directory, output) = output();
         let log = CallLog::default();
         let mut storage = FakeStorage::new(log.clone());
         storage.fail_write_after(1, "second segment upload failed");
 
-        assert!(publish_hls(&mut storage, "video-output", VIDEO_ID, JOB_ID, &output).is_err());
+        assert!(
+            publish_hls(&mut storage, "video-output", VIDEO_ID, JOB_ID, &output)
+                .await
+                .is_err()
+        );
         let keys: Vec<_> = storage
             .writes
             .iter()
@@ -197,13 +212,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn manifest_write_failure_does_not_publish_the_playlist() {
+    #[tokio::test]
+    async fn manifest_write_failure_does_not_publish_the_playlist() {
         let (_directory, output) = output();
         let mut storage = FakeStorage::new(CallLog::default());
         storage.fail_write_after(2, "manifest upload failed");
 
-        assert!(publish_hls(&mut storage, "video-output", VIDEO_ID, JOB_ID, &output).is_err());
+        assert!(
+            publish_hls(&mut storage, "video-output", VIDEO_ID, JOB_ID, &output)
+                .await
+                .is_err()
+        );
         let keys: Vec<_> = storage
             .writes
             .iter()
