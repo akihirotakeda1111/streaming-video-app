@@ -1,7 +1,8 @@
 import { test, expect, type Page, type Request } from '@playwright/test'
 import { e2eConfig } from './config.js'
-import { attachSafeDiagnostic, safeDiagnostic, redactUrl } from './diagnostics.js'
+import { attachSafeDiagnostic, safeDiagnostic } from './diagnostics.js'
 import { withMp4Fixture, type VideoFixture } from './fixtures.js'
+import { urlEvidence } from './url-evidence.js'
 
 interface NetworkEvidence {
   method: string
@@ -31,8 +32,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
 
 function evidenceUrl(value: string): Pick<NetworkEvidence, 'origin' | 'path'> {
-  const url = new URL(redactUrl(value))
-  return { origin: url.origin, path: url.pathname }
+  return urlEvidence(value)
 }
 
 function createVideoTarget(): Pick<NetworkEvidence, 'origin' | 'path'> {
