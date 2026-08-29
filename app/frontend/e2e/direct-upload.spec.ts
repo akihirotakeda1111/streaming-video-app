@@ -28,6 +28,7 @@ const JOB_STATUSES = new Set<JobStatus>([
   'FAILED',
 ])
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
 
 function evidenceUrl(value: string): Pick<NetworkEvidence, 'origin' | 'path'> {
   const url = new URL(redactUrl(value))
@@ -99,6 +100,12 @@ function parseStatusResponse(value: unknown): StatusObservation {
   return { status, failure: value.job.failure, body: value }
 }
 
+function expectRfc3339(value: unknown, field: string) {
+  expect(typeof value, `${field} must be a string`).toBe('string')
+  expect(RFC3339.test(String(value)), `${field} must be RFC 3339`).toBe(true)
+  expect(Number.isNaN(Date.parse(String(value))), `${field} must be a valid instant`).toBe(false)
+}
+
 function validateCompletedResponse(
   observation: StatusObservation,
   videoId: string,
@@ -116,8 +123,8 @@ function validateCompletedResponse(
   expect(body.sizeBytes).toBe(fixture.sizeBytes)
   expect(observation.status).toBe('COMPLETED')
   expect(observation.failure).toBeNull()
-  expect(Number.isNaN(Date.parse(String(body.createdAt)))).toBe(false)
-  expect(Number.isNaN(Date.parse(String(body.updatedAt)))).toBe(false)
+  expectRfc3339(body.createdAt, 'createdAt')
+  expectRfc3339(body.updatedAt, 'updatedAt')
 }
 
 test.use({ trace: 'off' })
