@@ -1,6 +1,7 @@
 name: Merge tests
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -16,10 +17,10 @@ jobs:
     name: Detect changed areas
     runs-on: ubuntu-latest
     outputs:
-      frontend: ${{ steps.filter.outputs.frontend }}
-      api: ${{ steps.filter.outputs.api }}
-      worker: ${{ steps.filter.outputs.worker }}
-      e2e: ${{ steps.filter.outputs.e2e }}
+      frontend: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.frontend == 'true' }}
+      api: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.api == 'true' }}
+      worker: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.worker == 'true' }}
+      e2e: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.e2e == 'true' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -28,6 +29,7 @@ jobs:
 
       - name: Detect changed areas
         id: filter
+        if: ${{ github.event_name == 'push' }}
         uses: dorny/paths-filter@v3
         with:
           filters: |
