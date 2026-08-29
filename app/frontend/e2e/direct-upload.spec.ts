@@ -380,11 +380,30 @@ test.describe('@phase1-pipeline', () => {
         expect(completed, 'a successful COMPLETED API response was not observed').toBeDefined()
         validateCompletedResponse(completed!, videoId, jobId, fixture)
 
+        await expect(page.locator('[data-workflow-state]')).toHaveAttribute(
+          'data-workflow-state',
+          'ready',
+          { timeout: e2eConfig.timeouts.playback },
+        )
+
+        await expect
+          .poll(
+            async () => {
+              const items = await Promise.all(playbackResponses)
+              return items.find((item) => item.videoId === videoId && item.jobId === jobId)
+            },
+            {
+              timeout: e2eConfig.timeouts.playback,
+              message: `playback response was not observed (videoId=${videoId}, jobId=${jobId})`,
+            },
+          )
+          .toBeTruthy()
+
         const playback = (await Promise.all(playbackResponses)).find(
           (item) => item.videoId === videoId && item.jobId === jobId,
         )
-        expect(playback, 'a successful playback response was not observed').toBeDefined()
-        await inspectHlsObjects(page, playback!, videoId, jobId)
+        if (!playback) throw new Error('a successful playback response was not observed')
+        await inspectHlsObjects(page, playback, videoId, jobId, apiOrigin, frontendOrigin)
       })
     } finally {
       const target = uploadTarget
