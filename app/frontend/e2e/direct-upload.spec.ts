@@ -145,6 +145,7 @@ test.describe('@phase1-pipeline', () => {
     let videoId: string | undefined
     let jobId: string | undefined
     let latestStatus: JobStatus | undefined
+    let latestStatusIndex = -1
     const observedStatuses: JobStatus[] = []
     const statusResponses: Promise<StatusObservation>[] = []
 
@@ -161,10 +162,14 @@ test.describe('@phase1-pipeline', () => {
         matchesTarget(evidenceUrl(response.url()), statusTarget(videoId)) &&
         response.status() === 200
       ) {
+        const receivedIndex = statusResponses.length
         const statusResponse = response.json().then(parseStatusResponse)
         statusResponses.push(statusResponse)
         void statusResponse.then((observation) => {
-          latestStatus = observation.status
+          if (receivedIndex >= latestStatusIndex) {
+            latestStatusIndex = receivedIndex
+            latestStatus = observation.status
+          }
           if (!observedStatuses.includes(observation.status))
             observedStatuses.push(observation.status)
         })
