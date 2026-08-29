@@ -91,6 +91,7 @@ jobs:
       frontend: ${{ steps.environments.outputs.frontend }}
       backend_api: ${{ steps.environments.outputs.backend_api }}
       backend_worker: ${{ steps.environments.outputs.backend_worker }}
+      e2e: ${{ steps.environments.outputs.e2e }}
     steps:
       - name: Checkout history
         uses: actions/checkout@v7
@@ -135,6 +136,7 @@ jobs:
               "frontend": "app/frontend",
               "backend_api": "app/backend/api",
               "backend_worker": "app/backend/worker",
+              "e2e": "app/frontend/e2e",
           }
 
           def overlaps(target: str) -> bool:
@@ -189,7 +191,7 @@ jobs:
           cache-dependency-path: app/frontend/package-lock.json
 
       - name: Set up Go
-        if: ${{ needs.parse-spec.outputs.backend_api == 'true' }}
+        if: ${{ needs.parse-spec.outputs.backend_api == 'true' || needs.parse-spec.outputs.e2e == 'true' }}
         uses: actions/setup-go@v7
         with:
           go-version-file: app/backend/api/go.mod
@@ -211,6 +213,70 @@ jobs:
         working-directory: app/frontend
         run: npx playwright install --with-deps
 
+      - name: Start E2E runtime
+        if: ${{ needs.parse-spec.outputs.e2e == 'true' }}
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+
+          docker compose -f app/compose.yaml up -d postgres
+          for attempt in {1..30}; do
+            if docker compose -f app/compose.yaml exec -T postgres \
+              pg_isready -U streaming_video -d streaming_video; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              exit 1
+            fi
+            sleep 2
+          done
+
+          docker compose -f app/compose.yaml exec -T postgres \
+            psql -U streaming_video -d streaming_video -v ON_ERROR_STOP=1 \
+            < app/backend/api/internal/persistence/migrations/0001_phase1_schema.up.sql
+
+          (
+            cd app/backend/api
+            HTTP_ADDR=127.0.0.1:8000 \
+            DATABASE_URL='postgres://streaming_video:streaming_video_dev_password@127.0.0.1:5432/streaming_video?sslmode=disable' \
+            AWS_REGION=ap-northeast-1 \
+            AWS_ACCESS_KEY_ID=e2e-local \
+            AWS_SECRET_ACCESS_KEY=e2e-local \
+            AWS_EC2_METADATA_DISABLED=true \
+            VIDEO_INPUT_BUCKET=streaming-video-input-e2e \
+            VIDEO_OUTPUT_BUCKET=streaming-video-output-e2e \
+            OUTPUT_S3_ENDPOINT=http://127.0.0.1:9000 \
+            go run ./cmd/api
+          ) > "$RUNNER_TEMP/e2e-api.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/e2e-api.pid"
+
+          (
+            cd app/frontend
+            VITE_API_BASE_URL=http://127.0.0.1:8000 \
+              npm run dev -- --host 127.0.0.1 --port 5173
+          ) > "$RUNNER_TEMP/e2e-frontend.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/e2e-frontend.pid"
+
+          wait_for() {
+            local name="$1"
+            local url="$2"
+            local log="$3"
+            for attempt in {1..60}; do
+              if curl --fail --silent --show-error "$url" >/dev/null; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo "$name did not become ready"
+            tail -n 100 "$log"
+            return 1
+          }
+
+          wait_for api http://127.0.0.1:8000/api/v1/health "$RUNNER_TEMP/e2e-api.log"
+          wait_for frontend http://127.0.0.1:5173/ "$RUNNER_TEMP/e2e-frontend.log"
+
       - name: Install pinned Codex CLI
         id: codex-cli
         run: |
@@ -231,7 +297,18 @@ jobs:
         env:
           CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
           GITHUB_TOKEN: ""
+          E2E_ENVIRONMENT: ${{ needs.parse-spec.outputs.e2e == 'true' && 'disposable' || '' }}
+          E2E_FRONTEND_URL: ${{ needs.parse-spec.outputs.e2e == 'true' && 'http://127.0.0.1:5173' || '' }}
+          E2E_API_URL: ${{ needs.parse-spec.outputs.e2e == 'true' && 'http://127.0.0.1:8000' || '' }}
+          E2E_PROJECT: ${{ needs.parse-spec.outputs.e2e == 'true' && 'chromium' || '' }}
+          FFMPEG_PATH: ${{ needs.parse-spec.outputs.e2e == 'true' && '/usr/bin/ffmpeg' || '' }}
         run: python agent/scripts/run-work-unit.py --spec "${{ needs.parse-spec.outputs.spec_path }}" --report-dir "${{ runner.temp }}/agent-report"
+
+      - name: Show E2E runtime logs
+        if: ${{ failure() && needs.parse-spec.outputs.e2e == 'true' }}
+        run: |
+          tail -n 100 "$RUNNER_TEMP/e2e-api.log" || true
+          tail -n 100 "$RUNNER_TEMP/e2e-frontend.log" || true
 
       - name: Upload work report
         id: upload-work-report
@@ -289,7 +366,7 @@ jobs:
           cache-dependency-path: app/frontend/package-lock.json
 
       - name: Set up Go
-        if: ${{ needs.parse-spec.outputs.backend_api == 'true' }}
+        if: ${{ needs.parse-spec.outputs.backend_api == 'true' || needs.parse-spec.outputs.e2e == 'true' }}
         uses: actions/setup-go@v7
         with:
           go-version-file: app/backend/api/go.mod
@@ -311,6 +388,68 @@ jobs:
         working-directory: app/frontend
         run: npx playwright install --with-deps
 
+      - name: Start E2E runtime
+        if: ${{ needs.parse-spec.outputs.e2e == 'true' }}
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+
+          docker compose -f app/compose.yaml up -d postgres
+          for attempt in {1..30}; do
+            if docker compose -f app/compose.yaml exec -T postgres \
+              pg_isready -U streaming_video -d streaming_video; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              exit 1
+            fi
+            sleep 2
+          done
+
+          docker compose -f app/compose.yaml exec -T postgres \
+            psql -U streaming_video -d streaming_video -v ON_ERROR_STOP=1 \
+            < app/backend/api/internal/persistence/migrations/0001_phase1_schema.up.sql
+
+          (
+            cd app/backend/api
+            HTTP_ADDR=127.0.0.1:8000 \
+            DATABASE_URL='postgres://streaming_video:streaming_video_dev_password@127.0.0.1:5432/streaming_video?sslmode=disable' \
+            AWS_REGION=ap-northeast-1 \
+            AWS_ACCESS_KEY_ID=e2e-local \
+            AWS_SECRET_ACCESS_KEY=e2e-local \
+            AWS_EC2_METADATA_DISABLED=true \
+            VIDEO_INPUT_BUCKET=streaming-video-input-e2e \
+            VIDEO_OUTPUT_BUCKET=streaming-video-output-e2e \
+            OUTPUT_S3_ENDPOINT=http://127.0.0.1:9000 \
+            go run ./cmd/api
+          ) > "$RUNNER_TEMP/e2e-api.log" 2>&1 &
+
+          (
+            cd app/frontend
+            VITE_API_BASE_URL=http://127.0.0.1:8000 \
+              npm run dev -- --host 127.0.0.1 --port 5173
+          ) > "$RUNNER_TEMP/e2e-frontend.log" 2>&1 &
+
+          wait_for() {
+            local name="$1"
+            local url="$2"
+            local log="$3"
+            for attempt in {1..60}; do
+              if curl --fail --silent "$url" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo "$name did not become ready"
+            tail -n 100 "$log"
+            return 1
+          }
+
+          wait_for api http://127.0.0.1:8000/api/v1/health "$RUNNER_TEMP/e2e-api.log"
+          wait_for frontend http://127.0.0.1:5173/ "$RUNNER_TEMP/e2e-frontend.log"
+
       - name: Download work report
         uses: actions/download-artifact@v7
         with:
@@ -323,4 +462,15 @@ jobs:
           AGENT_PR_PAT: ${{ secrets.AGENT_PR_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_API_URL: ${{ github.api_url }}
+          E2E_ENVIRONMENT: ${{ needs.parse-spec.outputs.e2e == 'true' && 'disposable' || '' }}
+          E2E_FRONTEND_URL: ${{ needs.parse-spec.outputs.e2e == 'true' && 'http://127.0.0.1:5173' || '' }}
+          E2E_API_URL: ${{ needs.parse-spec.outputs.e2e == 'true' && 'http://127.0.0.1:8000' || '' }}
+          E2E_PROJECT: ${{ needs.parse-spec.outputs.e2e == 'true' && 'chromium' || '' }}
+          FFMPEG_PATH: ${{ needs.parse-spec.outputs.e2e == 'true' && '/usr/bin/ffmpeg' || '' }}
         run: python agent/scripts/deliver.py --spec "${{ needs.parse-spec.outputs.spec_path }}" --report-dir "${{ runner.temp }}/agent-report"
+
+      - name: Show E2E runtime logs
+        if: ${{ failure() && needs.parse-spec.outputs.e2e == 'true' }}
+        run: |
+          tail -n 100 "$RUNNER_TEMP/e2e-api.log" || true
+          tail -n 100 "$RUNNER_TEMP/e2e-frontend.log" || true
