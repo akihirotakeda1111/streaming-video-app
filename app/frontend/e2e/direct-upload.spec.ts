@@ -21,6 +21,14 @@ interface StatusObservation {
   body: Record<string, unknown>
 }
 
+interface PlaybackObservation {
+  videoId: string
+  jobId: string
+  protocol: string
+  contentType: string
+  manifestUrl: string
+}
+
 const JOB_STATUSES = new Set<JobStatus>([
   'UPLOADING',
   'QUEUED',
@@ -100,6 +108,15 @@ function statusTarget(videoId: string): Pick<NetworkEvidence, 'origin' | 'path'>
   return { origin: api.origin, path }
 }
 
+function playbackTarget(videoId: string): Pick<NetworkEvidence, 'origin' | 'path'> {
+  const api = new URL(e2eConfig.apiUrl)
+  const basePath = api.pathname.replace(/\/$/, '')
+  const path = basePath.endsWith('/api/v1')
+    ? `${basePath}/videos/${videoId}/playback`
+    : `/api/v1/videos/${videoId}/playback`
+  return { origin: api.origin, path }
+}
+
 function parseStatusResponse(value: unknown): StatusObservation {
   if (!isRecord(value) || !isRecord(value.job) || typeof value.job.status !== 'string') {
     throw new Error('get-video response did not match the response contract')
@@ -107,6 +124,82 @@ function parseStatusResponse(value: unknown): StatusObservation {
   const status = value.job.status as JobStatus
   if (!JOB_STATUSES.has(status)) throw new Error(`get-video response had unknown status: ${status}`)
   return { status, failure: value.job.failure, body: value }
+}
+
+function parsePlaybackResponse(value: unknown): PlaybackObservation {
+  if (!isRecord(value)) throw new Error('playback response was not an object')
+  for (const field of ['videoId', 'jobId', 'protocol', 'contentType', 'manifestUrl']) {
+    if (typeof value[field] !== 'string') throw new Error(`playback response had invalid ${field}`)
+  }
+  return value as unknown as PlaybackObservation
+}
+
+async function inspectHlsObjects(
+  page: Page,
+  playback: PlaybackObservation,
+  videoId: string,
+  jobId: string,
+  apiOrigin: string,
+  frontendOrigin: string,
+) {
+  const manifest = new URL(playback.manifestUrl)
+  const expectedPrefix = `/videos/${videoId}/jobs/${jobId}/hls/`
+  expect(playback.protocol).toBe('HLS')
+  expect(playback.contentType).toBe('application/vnd.apple.mpegurl')
+  expect(manifest.protocol).toBe('https:')
+  expect(manifest.hostname).not.toContain('cloudfront.net')
+  expect(manifest.origin).not.toBe(apiOrigin)
+  expect(manifest.origin).not.toBe(frontendOrigin)
+  expect(manifest.search).toBe('')
+  expect(manifest.hash).toBe('')
+  expect(manifest.pathname).toBe(`${expectedPrefix}index.m3u8`)
+
+  const result = await page.evaluate(async (manifestUrl) => {
+    const response = await fetch(manifestUrl)
+    const contentType = response.headers.get('content-type')?.split(';', 1)[0] ?? null
+    const text = await response.text()
+    const references = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith('#'))
+    const manifestOrigin = new URL(manifestUrl).origin
+    type Segment = {
+      reference: string
+      valid: boolean
+      origin: string | null
+      path: string | null
+      status: number | null
+      contentType: string | null
+    }
+    const segments: Segment[] = references.map((reference): Segment => {
+      let url: URL
+      try {
+        url = new URL(reference, manifestUrl)
+      } catch {
+        return { reference, valid: false, origin: null, path: null, status: null, contentType: null }
+      }
+      return { reference, valid: true, origin: url.origin, path: url.pathname, status: null, contentType: null }
+    })
+    for (const segment of segments) {
+      if (!segment.valid || segment.origin !== manifestOrigin) continue
+      const segmentResponse = await fetch(new URL(segment.reference, manifestUrl))
+      segment.status = segmentResponse.status
+      segment.contentType = segmentResponse.headers.get('content-type')?.split(';', 1)[0] ?? null
+    }
+    return { status: response.status, contentType, segments }
+  }, playback.manifestUrl)
+
+  expect(result.status).toBe(200)
+  expect(result.contentType).toBe('application/vnd.apple.mpegurl')
+  expect(result.segments.length).toBeGreaterThan(0)
+  for (const segment of result.segments) {
+    expect(segment.reference).toMatch(/^segment-\d{5}\.ts$/)
+    expect(segment.valid).toBe(true)
+    expect(segment.origin).toBe(manifest.origin)
+    expect(segment.path).toBe(`${expectedPrefix}${segment.reference}`)
+    expect(segment.status).toBe(200)
+    expect(segment.contentType).toBe('video/mp2t')
+  }
 }
 
 function expectRfc3339(value: unknown, field: string) {
@@ -157,6 +250,7 @@ test.describe('@phase1-pipeline', () => {
     let latestStatusIndex = -1
     const observedStatuses: JobStatus[] = []
     const statusResponses: Promise<StatusObservation>[] = []
+    const playbackResponses: Promise<PlaybackObservation>[] = []
 
     page.on('response', (response) => {
       const method = response.request().method()
@@ -182,6 +276,14 @@ test.describe('@phase1-pipeline', () => {
           if (!observedStatuses.includes(observation.status))
             observedStatuses.push(observation.status)
         })
+      }
+      if (
+        method === 'GET' &&
+        videoId &&
+        matchesTarget(evidenceUrl(response.url()), playbackTarget(videoId)) &&
+        response.status() === 200
+      ) {
+        playbackResponses.push(response.json().then(parsePlaybackResponse))
       }
     })
     page.on('request', (request) => {
@@ -277,6 +379,31 @@ test.describe('@phase1-pipeline', () => {
         const completed = observations.findLast((item) => item.status === 'COMPLETED')
         expect(completed, 'a successful COMPLETED API response was not observed').toBeDefined()
         validateCompletedResponse(completed!, videoId, jobId, fixture)
+
+        await expect(page.locator('[data-workflow-state]')).toHaveAttribute(
+          'data-workflow-state',
+          'ready',
+          { timeout: e2eConfig.timeouts.playback },
+        )
+
+        await expect
+          .poll(
+            async () => {
+              const items = await Promise.all(playbackResponses)
+              return items.find((item) => item.videoId === videoId && item.jobId === jobId)
+            },
+            {
+              timeout: e2eConfig.timeouts.playback,
+              message: `playback response was not observed (videoId=${videoId}, jobId=${jobId})`,
+            },
+          )
+          .toBeTruthy()
+
+        const playback = (await Promise.all(playbackResponses)).find(
+          (item) => item.videoId === videoId && item.jobId === jobId,
+        )
+        if (!playback) throw new Error('a successful playback response was not observed')
+        await inspectHlsObjects(page, playback, videoId, jobId, apiOrigin, frontendOrigin)
       })
     } finally {
       const target = uploadTarget
