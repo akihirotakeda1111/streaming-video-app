@@ -54,10 +54,10 @@
 #   (GET /commits/{sha}/statuses). contents write does not cover either.
 #   checks: write and statuses: write are forbidden.
 # - Codex subprocess never receives GITHUB_TOKEN or AGENT_PR_PAT.
-# - Live AWS E2E uses the AWS_REGION, VIDEO_INPUT_BUCKET, and
-#   VIDEO_OUTPUT_BUCKET repository variables plus the
-#   AWS_E2E_API_ACCESS_KEY_ID and AWS_E2E_API_SECRET_ACCESS_KEY repository
-#   secrets. They are scoped to API startup and removed before Vite starts.
+# - Live AWS E2E uses the AWS_REGION, VIDEO_ENCODING_QUEUE_URL,
+#   VIDEO_INPUT_BUCKET, and VIDEO_OUTPUT_BUCKET repository variables plus the
+#   API and worker AWS E2E repository secrets. They are scoped to API / worker
+#   startup and removed before Vite starts.
 #
 # Official references:
 # - https://github.com/openai/codex-action
@@ -215,7 +215,7 @@ jobs:
           cache: false
 
       - name: Set up Rust
-        if: ${{ steps.environments.outputs.backend_worker == 'true' }}
+        if: ${{ steps.environments.outputs.backend_worker == 'true' || steps.environments.outputs.e2e == 'true' }}
         run: |
           rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.98.0
@@ -234,18 +234,25 @@ jobs:
         if: ${{ steps.environments.outputs.e2e == 'true' }}
         env:
           AWS_REGION: ${{ vars.AWS_REGION }}
+          VIDEO_ENCODING_QUEUE_URL: ${{ vars.VIDEO_ENCODING_QUEUE_URL }}
           VIDEO_INPUT_BUCKET: ${{ vars.VIDEO_INPUT_BUCKET }}
           VIDEO_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
           FRONTEND_ORIGIN: http://localhost:5173
           E2E_API_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_API_ACCESS_KEY_ID }}
           E2E_API_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_API_SECRET_ACCESS_KEY }}
+          E2E_WORKER_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_WORKER_ACCESS_KEY_ID }}
+          E2E_WORKER_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_WORKER_SECRET_ACCESS_KEY }}
         run: |
-          if [ -z "$AWS_REGION" ] || [ -z "$VIDEO_INPUT_BUCKET" ] || [ -z "$VIDEO_OUTPUT_BUCKET" ]; then
-            echo "AWS_REGION, VIDEO_INPUT_BUCKET, and VIDEO_OUTPUT_BUCKET repository variables are required"
+          if [ -z "$AWS_REGION" ] || [ -z "$VIDEO_ENCODING_QUEUE_URL" ] || [ -z "$VIDEO_INPUT_BUCKET" ] || [ -z "$VIDEO_OUTPUT_BUCKET" ]; then
+            echo "AWS_REGION, VIDEO_ENCODING_QUEUE_URL, VIDEO_INPUT_BUCKET, and VIDEO_OUTPUT_BUCKET repository variables are required"
             exit 1
           fi
           if [ -z "$E2E_API_ACCESS_KEY_ID" ] || [ -z "$E2E_API_SECRET_ACCESS_KEY" ]; then
             echo "AWS_E2E_API_ACCESS_KEY_ID and AWS_E2E_API_SECRET_ACCESS_KEY repository secrets are required"
+            exit 1
+          fi
+          if [ -z "$E2E_WORKER_ACCESS_KEY_ID" ] || [ -z "$E2E_WORKER_SECRET_ACCESS_KEY" ]; then
+            echo "AWS_E2E_WORKER_ACCESS_KEY_ID and AWS_E2E_WORKER_SECRET_ACCESS_KEY repository secrets are required"
             exit 1
           fi
 
@@ -282,7 +289,21 @@ jobs:
           ) > "$RUNNER_TEMP/e2e-api.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/e2e-api.pid"
 
+          (
+            cd app/backend/worker
+            DATABASE_URL='postgres://streaming_video:streaming_video_dev_password@127.0.0.1:5432/streaming_video?sslmode=disable' \
+            AWS_ACCESS_KEY_ID="$E2E_WORKER_ACCESS_KEY_ID" \
+            AWS_SECRET_ACCESS_KEY="$E2E_WORKER_SECRET_ACCESS_KEY" \
+            AWS_EC2_METADATA_DISABLED=true \
+            VIDEO_ENCODING_QUEUE_URL="$VIDEO_ENCODING_QUEUE_URL" \
+            FFMPEG_PATH=/usr/bin/ffmpeg \
+            TMPDIR="$RUNNER_TEMP/e2e-worker" \
+            cargo run --locked --package worker
+          ) > "$RUNNER_TEMP/e2e-worker.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/e2e-worker.pid"
+
           unset E2E_API_ACCESS_KEY_ID E2E_API_SECRET_ACCESS_KEY
+          unset E2E_WORKER_ACCESS_KEY_ID E2E_WORKER_SECRET_ACCESS_KEY
 
           (
             cd app/frontend
@@ -306,8 +327,26 @@ jobs:
             return 1
           }
 
+          wait_for_worker() {
+            for attempt in {1..120}; do
+              if grep -q '"message":"worker started"' "$RUNNER_TEMP/e2e-worker.log"; then
+                return 0
+              fi
+              if ! kill -0 "$(cat "$RUNNER_TEMP/e2e-worker.pid")" 2>/dev/null; then
+                echo "worker stopped before becoming ready"
+                tail -n 100 "$RUNNER_TEMP/e2e-worker.log"
+                return 1
+              fi
+              sleep 2
+            done
+            echo "worker did not become ready"
+            tail -n 100 "$RUNNER_TEMP/e2e-worker.log"
+            return 1
+          }
+
           wait_for api http://127.0.0.1:8000/api/v1/health "$RUNNER_TEMP/e2e-api.log"
           wait_for frontend http://localhost:5173/ "$RUNNER_TEMP/e2e-frontend.log"
+          wait_for_worker
 
       - name: Install pinned Codex CLI
         id: codex-cli
@@ -345,3 +384,4 @@ jobs:
         run: |
           tail -n 100 "$RUNNER_TEMP/e2e-api.log" || true
           tail -n 100 "$RUNNER_TEMP/e2e-frontend.log" || true
+          tail -n 100 "$RUNNER_TEMP/e2e-worker.log" || true
