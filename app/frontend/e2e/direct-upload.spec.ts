@@ -288,8 +288,8 @@ async function proveBrowserPlayback(
             (element as HTMLVideoElement & { player?: { currentSrc: () => string } }).player ??
             win.videojs?.getPlayer(element)
           return {
-            currentSrc: player?.currentSrc() || element.currentSrc,
-            readyState: element.readyState,
+            hasVideoJsPlayer: Boolean(player),
+            currentSrc: player?.currentSrc() ?? '',
             mediaError: element.error
               ? { code: element.error.code, message: element.error.message }
               : null,
@@ -300,7 +300,7 @@ async function proveBrowserPlayback(
         message: 'player did not initialize with the playback manifest URL',
       },
     )
-    .toMatchObject({ currentSrc: manifestUrl, mediaError: null })
+    .toMatchObject({ hasVideoJsPlayer: true, currentSrc: manifestUrl, mediaError: null })
 
   await expect
     .poll(() => video.evaluate((element: HTMLVideoElement) => element.readyState), {
