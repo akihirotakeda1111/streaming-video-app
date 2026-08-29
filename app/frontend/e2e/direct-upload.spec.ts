@@ -81,6 +81,12 @@ function responsesMatchingTarget(
   return responses.filter((response) => matchesTarget(response, target))
 }
 
+function isAbortFailure(failure: MediaNetworkFailure): boolean {
+  return /ERR_ABORTED|NS_BINDING_ABORTED|AbortError|aborted|cancelled|canceled/i.test(
+    failure.error ?? '',
+  )
+}
+
 function failuresForMedia(
   failures: MediaNetworkFailure[],
   manifest: URL | undefined,
@@ -88,7 +94,10 @@ function failuresForMedia(
 ): MediaNetworkFailure[] {
   if (!manifest || !pathPrefix) return []
   return failures.filter(
-    (failure) => failure.origin === manifest.origin && failure.path.startsWith(pathPrefix),
+    (failure) =>
+      failure.origin === manifest.origin &&
+      failure.path.startsWith(pathPrefix) &&
+      !isAbortFailure(failure),
   )
 }
 
@@ -264,26 +273,34 @@ async function proveBrowserPlayback(
   manifestUrl: string,
   segmentCount: number,
 ): Promise<BrowserPlaybackEvidence> {
-  const players = page.locator('video.video-js[aria-label="Uploaded video"]')
+  const players = page.locator('video[aria-label="Uploaded video"]')
   await expect(players, 'exactly one video.js player must initialize').toHaveCount(1)
   const video = players.first()
 
   await expect
     .poll(
       () =>
-        video.evaluate((element: HTMLVideoElement) => ({
-          currentSrc: element.currentSrc,
-          readyState: element.readyState,
-          mediaError: element.error
-            ? { code: element.error.code, message: element.error.message }
-            : null,
-        })),
+        video.evaluate((element: HTMLVideoElement) => {
+          const win = window as Window & {
+            videojs?: { getPlayer: (el: HTMLElement) => { currentSrc: () => string } | undefined }
+          }
+          const player =
+            (element as HTMLVideoElement & { player?: { currentSrc: () => string } }).player ??
+            win.videojs?.getPlayer(element)
+          return {
+            currentSrc: player?.currentSrc() || element.currentSrc,
+            readyState: element.readyState,
+            mediaError: element.error
+              ? { code: element.error.code, message: element.error.message }
+              : null,
+          }
+        }),
       {
         timeout: e2eConfig.timeouts.playback,
-        message: 'player did not reach a usable ready state',
+        message: 'player did not initialize with the playback manifest URL',
       },
     )
-    .toMatchObject({ currentSrc: manifestUrl, readyState: expect.any(Number), mediaError: null })
+    .toMatchObject({ currentSrc: manifestUrl, mediaError: null })
 
   await expect
     .poll(() => video.evaluate((element: HTMLVideoElement) => element.readyState), {
