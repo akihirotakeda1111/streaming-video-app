@@ -26,6 +26,14 @@ export VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://127.0.0.1:${API_PORT}/api/
 export OUTPUT_S3_ENDPOINT="${OUTPUT_S3_ENDPOINT:-https://${VIDEO_OUTPUT_BUCKET}.s3.${AWS_REGION}.amazonaws.com}"
 
 compose=(docker compose -f app/compose.yaml)
+cleanup_on_failure() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    "${compose[@]}" down --remove-orphans || true
+  fi
+}
+trap cleanup_on_failure EXIT
+
 "${compose[@]}" up --build -d
 
 wait_for_http() {
