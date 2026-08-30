@@ -50,7 +50,9 @@ const defaultActions: WorkflowActions = {
 }
 
 const actions = computed(() => ({ ...defaultActions, ...props.workflowActions }))
-const active = computed(() => state.value === 'creating' || state.value === 'uploading')
+const active = computed(
+  () => state.value === 'creating' || state.value === 'uploading' || state.value === 'processing',
+)
 const stateLabel = computed(() =>
   ({ idle: 'Ready to upload', creating: 'Creating video', created: 'Video created', uploading: 'Uploading', processing: 'Processing', ready: 'Ready to play', error: 'Upload error' })[
     state.value
