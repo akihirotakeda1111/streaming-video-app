@@ -52,6 +52,7 @@ jobs:
               - '.github/workflows/merge-tests.yml'
             e2e:
               - 'app/frontend/e2e/**'
+              - 'app/frontend/src/**'
               - 'app/frontend/playwright.config.ts'
               - 'app/frontend/package.json'
               - 'app/frontend/package-lock.json'
@@ -172,6 +173,17 @@ jobs:
         working-directory: app/frontend
         run: npm ci
 
+      - name: Install FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+
+      - name: Run E2E helper tests
+        working-directory: app/frontend
+        run: npm run test:e2e:helpers
+
       - name: Install Chromium and system dependencies
         working-directory: app/frontend
         run: npx playwright install --with-deps chromium
@@ -199,11 +211,6 @@ jobs:
           if [ -z "$E2E_WORKER_ACCESS_KEY_ID" ] || [ -z "$E2E_WORKER_SECRET_ACCESS_KEY" ]; then
             echo "AWS_E2E_WORKER_ACCESS_KEY_ID and AWS_E2E_WORKER_SECRET_ACCESS_KEY repository secrets are required"
             exit 1
-          fi
-
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y ffmpeg
           fi
 
           docker compose -f app/compose.yaml up -d postgres
