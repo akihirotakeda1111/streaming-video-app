@@ -29,6 +29,22 @@ interface PlaybackObservation {
   manifestUrl: string
 }
 
+interface BrowserPlaybackEvidence {
+  manifestOrigin: string
+  segmentCount: number
+  readyState: number
+  initialTime: number
+  currentTime: number
+  advancement: number
+}
+
+interface MediaNetworkFailure {
+  origin: string
+  path: string
+  status?: number
+  error?: string
+}
+
 const JOB_STATUSES = new Set<JobStatus>([
   'UPLOADING',
   'QUEUED',
@@ -63,6 +79,33 @@ function responsesMatchingTarget(
 ): NetworkEvidence[] {
   if (!target) return []
   return responses.filter((response) => matchesTarget(response, target))
+}
+
+function isAbortFailure(failure: MediaNetworkFailure): boolean {
+  return /ERR_ABORTED|NS_BINDING_ABORTED|AbortError|aborted|cancelled|canceled/i.test(
+    failure.error ?? '',
+  )
+}
+
+function failuresForMedia(
+  failures: MediaNetworkFailure[],
+  manifest: URL | undefined,
+  pathPrefix: string | undefined,
+): MediaNetworkFailure[] {
+  if (!manifest || !pathPrefix) return []
+  return failures.filter(
+    (failure) =>
+      failure.origin === manifest.origin &&
+      failure.path.startsWith(pathPrefix) &&
+      !isAbortFailure(failure),
+  )
+}
+
+function mediaPathPrefix(
+  videoId: string | undefined,
+  jobId: string | undefined,
+): string | undefined {
+  return videoId && jobId ? `/videos/${videoId}/jobs/${jobId}/hls/` : undefined
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -149,7 +192,7 @@ async function inspectHlsObjects(
   jobId: string,
   apiOrigin: string,
   frontendOrigin: string,
-) {
+): Promise<number> {
   const manifest = new URL(playback.manifestUrl)
   const expectedPrefix = `/videos/${videoId}/jobs/${jobId}/hls/`
   expect(playback.protocol).toBe('HLS')
@@ -184,9 +227,23 @@ async function inspectHlsObjects(
       try {
         url = new URL(reference, manifestUrl)
       } catch {
-        return { reference, valid: false, origin: null, path: null, status: null, contentType: null }
+        return {
+          reference,
+          valid: false,
+          origin: null,
+          path: null,
+          status: null,
+          contentType: null,
+        }
       }
-      return { reference, valid: true, origin: url.origin, path: url.pathname, status: null, contentType: null }
+      return {
+        reference,
+        valid: true,
+        origin: url.origin,
+        path: url.pathname,
+        status: null,
+        contentType: null,
+      }
     })
     for (const segment of segments) {
       if (!segment.valid || segment.origin !== manifestOrigin) continue
@@ -207,6 +264,91 @@ async function inspectHlsObjects(
     expect(segment.path).toBe(`${expectedPrefix}${segment.reference}`)
     expect(segment.status).toBe(200)
     expect(segment.contentType).toBe('video/mp2t')
+  }
+  return result.segments.length
+}
+
+async function proveBrowserPlayback(
+  page: Page,
+  manifestUrl: string,
+  segmentCount: number,
+): Promise<BrowserPlaybackEvidence> {
+  const players = page.locator('video[aria-label="Uploaded video"]')
+  await expect(players, 'exactly one video.js player must initialize').toHaveCount(1)
+  const video = players.first()
+
+  await expect
+    .poll(
+      () =>
+        video.evaluate((element: HTMLVideoElement) => {
+          const win = window as Window & {
+            videojs?: { getPlayer: (el: HTMLElement) => { currentSrc: () => string } | undefined }
+          }
+          const player =
+            (element as HTMLVideoElement & { player?: { currentSrc: () => string } }).player ??
+            win.videojs?.getPlayer(element)
+          return {
+            hasVideoJsPlayer: Boolean(player),
+            currentSrc: player?.currentSrc() ?? '',
+            mediaError: element.error
+              ? { code: element.error.code, message: element.error.message }
+              : null,
+          }
+        }),
+      {
+        timeout: e2eConfig.timeouts.playback,
+        message: 'player did not initialize with the playback manifest URL',
+      },
+    )
+    .toMatchObject({ hasVideoJsPlayer: true, currentSrc: manifestUrl, mediaError: null })
+
+  await expect
+    .poll(() => video.evaluate((element: HTMLVideoElement) => element.readyState), {
+      timeout: e2eConfig.timeouts.playback,
+      message: 'player did not load media metadata',
+    })
+    .toBeGreaterThanOrEqual(1)
+
+  const initialTime = await video.evaluate(async (element: HTMLVideoElement) => {
+    element.muted = true
+    await element.play()
+    return element.currentTime
+  })
+
+  await expect
+    .poll(
+      async () => {
+        const state = await video.evaluate((element: HTMLVideoElement) => ({
+          currentTime: element.currentTime,
+          readyState: element.readyState,
+          paused: element.paused,
+          ended: element.ended,
+          mediaError: element.error
+            ? { code: element.error.code, message: element.error.message }
+            : null,
+        }))
+        if (state.mediaError)
+          throw new Error(`fatal media error: ${JSON.stringify(state.mediaError)}`)
+        if (state.ended && state.currentTime <= initialTime) {
+          throw new Error('media ended without positive time advancement')
+        }
+        return state.currentTime
+      },
+      { timeout: e2eConfig.timeouts.playback, message: 'media currentTime did not advance' },
+    )
+    .toBeGreaterThan(initialTime + 0.05)
+
+  const finalState = await video.evaluate((element: HTMLVideoElement) => ({
+    currentTime: element.currentTime,
+    readyState: element.readyState,
+  }))
+  return {
+    manifestOrigin: new URL(manifestUrl).origin,
+    segmentCount,
+    readyState: finalState.readyState,
+    initialTime,
+    currentTime: finalState.currentTime,
+    advancement: finalState.currentTime - initialTime,
   }
 }
 
@@ -256,9 +398,12 @@ test.describe('@phase1-pipeline', () => {
     let jobId: string | undefined
     let latestStatus: JobStatus | undefined
     let latestStatusIndex = -1
+    let playbackEvidence: BrowserPlaybackEvidence | undefined
+    let playbackManifest: URL | undefined
     const observedStatuses: JobStatus[] = []
     const statusResponses: Promise<StatusObservation>[] = []
     const playbackResponses: Promise<PlaybackObservation>[] = []
+    const mediaNetworkFailures: MediaNetworkFailure[] = []
 
     page.on('response', (response) => {
       const method = response.request().method()
@@ -297,6 +442,14 @@ test.describe('@phase1-pipeline', () => {
     page.on('request', (request) => {
       if (request.method() !== 'PUT') return
       putRequests.push(request)
+    })
+    page.on('requestfailed', (request) => {
+      const target = evidenceUrl(request.url())
+      mediaNetworkFailures.push({ ...target, error: request.failure()?.errorText })
+    })
+    page.on('response', (response) => {
+      if (response.status() < 400) return
+      mediaNetworkFailures.push({ ...evidenceUrl(response.url()), status: response.status() })
     })
 
     try {
@@ -411,7 +564,28 @@ test.describe('@phase1-pipeline', () => {
           (item) => item.videoId === videoId && item.jobId === jobId,
         )
         if (!playback) throw new Error('a successful playback response was not observed')
-        await inspectHlsObjects(page, playback, videoId, jobId, apiOrigin, frontendOrigin)
+        playbackManifest = new URL(playback.manifestUrl)
+        const segmentCount = await inspectHlsObjects(
+          page,
+          playback,
+          videoId,
+          jobId,
+          apiOrigin,
+          frontendOrigin,
+        )
+        playbackEvidence = await proveBrowserPlayback(page, playback.manifestUrl, segmentCount)
+
+        const mediaPrefix = `/videos/${videoId}/jobs/${jobId}/hls/`
+        const fatalMediaFailures = failuresForMedia(
+          mediaNetworkFailures,
+          playbackManifest,
+          mediaPrefix,
+        )
+        expect(fatalMediaFailures, 'manifest or segment network requests must not fail').toEqual([])
+        await expect(
+          page.locator('[role="alert"]'),
+          'video.js must not report a fatal error',
+        ).toHaveCount(0)
       })
     } finally {
       const matchedPuts = responsesMatchingTarget(putResponses, uploadTarget)
@@ -437,6 +611,19 @@ test.describe('@phase1-pipeline', () => {
         jobId,
         status: latestStatus,
         observedStatuses,
+      })
+      const mediaPrefix = mediaPathPrefix(videoId, jobId)
+      await attachSafeDiagnostic(testInfo, 'browser-playback', {
+        videoId,
+        jobId,
+        status: latestStatus,
+        manifestOrigin: playbackManifest?.origin,
+        segmentCount: playbackEvidence?.segmentCount,
+        readyState: playbackEvidence?.readyState,
+        initialTime: playbackEvidence?.initialTime,
+        currentTime: playbackEvidence?.currentTime,
+        advancement: playbackEvidence?.advancement,
+        failures: failuresForMedia(mediaNetworkFailures, playbackManifest, mediaPrefix),
       })
     }
   })
