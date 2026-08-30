@@ -422,14 +422,16 @@ test.describe('@phase1-pipeline', () => {
         const receivedIndex = statusResponses.length
         const statusResponse = response.json().then(parseStatusResponse)
         statusResponses.push(statusResponse)
-        void statusResponse.then((observation) => {
-          if (receivedIndex >= latestStatusIndex) {
-            latestStatusIndex = receivedIndex
-            latestStatus = observation.status
-          }
-          if (!observedStatuses.includes(observation.status))
-            observedStatuses.push(observation.status)
-        })
+        void statusResponse
+          .then((observation) => {
+            if (receivedIndex >= latestStatusIndex) {
+              latestStatusIndex = receivedIndex
+              latestStatus = observation.status
+            }
+            if (!observedStatuses.includes(observation.status))
+              observedStatuses.push(observation.status)
+          })
+          .catch(() => {})
       }
       if (
         method === 'GET' &&
