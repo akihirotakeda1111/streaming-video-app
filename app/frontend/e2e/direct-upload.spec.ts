@@ -3,6 +3,7 @@ import { e2eConfig } from './config.js'
 import { attachSafeDiagnostic, safeDiagnostic } from './diagnostics.js'
 import { withMp4Fixture, type VideoFixture } from './fixtures.js'
 import { urlEvidence } from './url-evidence.js'
+import { isSolePutToTarget, matchesTarget, putDestinations } from './upload-evidence.js'
 
 interface NetworkEvidence {
   method: string
@@ -64,21 +65,6 @@ function createVideoTarget(): Pick<NetworkEvidence, 'origin' | 'path'> {
   const basePath = api.pathname.replace(/\/$/, '')
   const path = basePath.endsWith('/api/v1') ? `${basePath}/videos` : '/api/v1/videos'
   return { origin: api.origin, path }
-}
-
-function matchesTarget(
-  value: Pick<NetworkEvidence, 'origin' | 'path'>,
-  target: Pick<NetworkEvidence, 'origin' | 'path'>,
-): boolean {
-  return value.origin === target.origin && value.path === target.path
-}
-
-function responsesMatchingTarget(
-  responses: NetworkEvidence[],
-  target: Pick<NetworkEvidence, 'origin' | 'path'> | undefined,
-): NetworkEvidence[] {
-  if (!target) return []
-  return responses.filter((response) => matchesTarget(response, target))
 }
 
 function isAbortFailure(failure: MediaNetworkFailure): boolean {
@@ -356,6 +342,17 @@ async function proveBrowserPlayback(
   }
 }
 
+function expectSolePutToApiProvidedUrl(
+  destinations: Pick<NetworkEvidence, 'origin' | 'path'>[],
+  target: Pick<NetworkEvidence, 'origin' | 'path'>,
+) {
+  expect(
+    destinations,
+    'video bytes must leave the browser in exactly one PUT to the API-provided URL',
+  ).toEqual([target])
+  expect(isSolePutToTarget(destinations, target)).toBe(true)
+}
+
 function expectRfc3339(value: unknown, field: string) {
   expect(typeof value, `${field} must be a string`).toBe('string')
   expect(RFC3339.test(String(value)), `${field} must be RFC 3339`).toBe(true)
@@ -481,21 +478,27 @@ test.describe('@phase1-pipeline', () => {
         const target = uploadTarget
         await expect
           .poll(
-            () => putRequests.find((request) => matchesTarget(evidenceUrl(request.url()), target)),
-            { timeout: e2eConfig.timeouts.upload },
+            () =>
+              putRequests.some((request) => matchesTarget(evidenceUrl(request.url()), target)),
+            {
+              timeout: e2eConfig.timeouts.upload,
+              message: 'upload PUT to the API-provided URL was not observed',
+            },
           )
-          .toBeTruthy()
+          .toBe(true)
 
-        const matchedRequest = putRequests.find((request) =>
-          matchesTarget(evidenceUrl(request.url()), target),
+        expectSolePutToApiProvidedUrl(
+          putDestinations(putRequests.map((request) => request.url())),
+          target,
         )
+        const matchedRequest = putRequests[0]
         if (!matchedRequest) throw new Error('upload request was not observed')
         uploadRequest = await requestEvidence(matchedRequest)
-        expect(uploadRequest?.method).toBe('PUT')
-        expect(uploadRequest?.contentType).toBe('video/mp4')
-        expect(uploadRequest?.origin).not.toBe(apiOrigin)
-        expect(uploadRequest?.origin).not.toBe(frontendOrigin)
-        expect(uploadRequest?.bodyBytes).toBe(fixture.sizeBytes)
+        expect(uploadRequest.method).toBe('PUT')
+        expect(uploadRequest.contentType).toBe('video/mp4')
+        expect(uploadRequest.origin).not.toBe(apiOrigin)
+        expect(uploadRequest.origin).not.toBe(frontendOrigin)
+        expect(uploadRequest.bodyBytes).toBe(fixture.sizeBytes)
 
         await expect
           .poll(
@@ -510,6 +513,13 @@ test.describe('@phase1-pipeline', () => {
             { timeout: e2eConfig.timeouts.upload },
           )
           .toBe(true)
+
+        expectSolePutToApiProvidedUrl(
+          putResponses.map(({ origin, path }) => ({ origin, path })),
+          target,
+        )
+        expect(putResponses[0]?.status).toBeGreaterThanOrEqual(200)
+        expect(putResponses[0]?.status).toBeLessThan(300)
 
         await expect(page.locator('[data-workflow-state]')).toHaveAttribute(
           'data-workflow-state',
@@ -590,16 +600,26 @@ test.describe('@phase1-pipeline', () => {
           page.locator('[role="alert"]'),
           'video.js must not report a fatal error',
         ).toHaveCount(0)
+
+        if (!uploadTarget) throw new Error('create-video response did not include an upload URL')
+        expectSolePutToApiProvidedUrl(
+          putDestinations(putRequests.map((request) => request.url())),
+          uploadTarget,
+        )
+        expectSolePutToApiProvidedUrl(
+          putResponses.map(({ origin, path }) => ({ origin, path })),
+          uploadTarget,
+        )
       })
     } finally {
-      const matchedPuts = responsesMatchingTarget(putResponses, uploadTarget)
       await attachSafeDiagnostic(testInfo, 'direct-upload-network', {
         videoId,
         jobId,
         apiOrigin,
         frontendOrigin,
         upload: uploadRequest,
-        responses: [...createResponses, ...matchedPuts].map((response) =>
+        puts: putDestinations(putRequests.map((request) => request.url())),
+        responses: [...createResponses, ...putResponses].map((response) =>
           safeDiagnostic({
             origin: response.origin,
             path: response.path,

@@ -251,6 +251,23 @@ describe('App workflow shell', () => {
     await flushPromises()
   })
 
+  it('prevents duplicate submissions while processing', async () => {
+    const workflowActions = actions({
+      getVideoStatus: mockGetVideoStatus().mockResolvedValue(videoResponse('PROCESSING')),
+    })
+    const wrapper = mount(App, { props: { workflowActions } })
+    await chooseFiles(wrapper, [mp4()])
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    expect(workflowActions.createVideo).toHaveBeenCalledOnce()
+    expect(workflowActions.uploadFile).toHaveBeenCalledOnce()
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.find('[data-workflow-state="processing"]').exists()).toBe(true)
+  })
+
   it('shows an actionable error and does not poll when upload fails', async () => {
     const workflowActions = actions({
       uploadFile: mockUploadFile().mockRejectedValue(new ApiError('Upload failed with status 403', 403)),
