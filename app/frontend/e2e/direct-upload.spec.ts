@@ -281,11 +281,15 @@ async function proveBrowserPlayback(
     .poll(
       () =>
         video.evaluate((element: HTMLVideoElement) => {
+          type VideoJsPlayer = { currentSrc: () => string }
           const win = window as Window & {
-            videojs?: { getPlayer: (el: HTMLElement) => { currentSrc: () => string } | undefined }
+            videojs?: { getPlayer: (el: HTMLElement) => VideoJsPlayer | undefined }
           }
+          const playerElement = element.parentElement as
+            (HTMLElement & { player?: VideoJsPlayer }) | null
           const player =
-            (element as HTMLVideoElement & { player?: { currentSrc: () => string } }).player ??
+            playerElement?.player ??
+            (element as HTMLVideoElement & { player?: VideoJsPlayer }).player ??
             win.videojs?.getPlayer(element)
           return {
             hasVideoJsPlayer: Boolean(player),
