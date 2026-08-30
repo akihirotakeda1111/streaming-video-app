@@ -22,6 +22,10 @@
 # - Codex never receives REVIEW_CLASSIFIER_API_KEY, GITHUB_TOKEN, or AGENT_PR_PAT.
 # - Merge is never performed.
 # - Repair never runs against the default branch or a pull_request merge SHA.
+# - Pull Request changed paths only select application toolchains and dependencies.
+#   They do not gate review, repair, verification, or sandbox steps.
+# - Environment detection uses the trusted orchestrator parser. Node.js remains
+#   unconditional because it installs the Codex CLI.
 #
 # Concurrency:
 # - No workflow-level group. A parent workflow lock that matches the review
@@ -50,6 +54,10 @@
 #   (GET /commits/{sha}/statuses). contents write does not cover either.
 #   checks: write and statuses: write are forbidden.
 # - Codex subprocess never receives GITHUB_TOKEN or AGENT_PR_PAT.
+# - Live AWS E2E uses the AWS_REGION, VIDEO_ENCODING_QUEUE_URL,
+#   VIDEO_INPUT_BUCKET, and VIDEO_OUTPUT_BUCKET repository variables plus the
+#   API and worker AWS E2E repository secrets. They are injected only into the
+#   API and worker containers; the frontend container never receives them.
 #
 # Official references:
 # - https://github.com/openai/codex-action
@@ -157,31 +165,89 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Detect changed application environments
+        id: environments
+        working-directory: ${{ runner.temp }}/orchestrator
+        env:
+          SPEC_PATH: ${{ needs.prepare.outputs.spec_path }}
+          WORKSPACE_ROOT: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from agent.gitutil import change_path_list, collect_changes
+          from agent.review_loop import _merge_base_sha
+          from agent.spec import parse_spec
+
+          workspace = Path(os.environ["WORKSPACE_ROOT"])
+          spec = parse_spec(workspace / os.environ["SPEC_PATH"])
+          paths = change_path_list(
+              collect_changes(workspace, _merge_base_sha(workspace, spec))
+          )
+          targets = {
+              "frontend": "app/frontend",
+              "backend_api": "app/backend/api",
+              "backend_worker": "app/backend/worker",
+              "e2e": "app/frontend/e2e",
+          }
+
+          def overlaps(target: str) -> bool:
+              return any(path == target or path.startswith(f"{target}/") for path in paths)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for name, target in targets.items():
+                  print(f"{name}={'true' if overlaps(target) else 'false'}", file=output)
+          PY
+
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: "24.12.0"
-          cache: npm
+          cache: ${{ steps.environments.outputs.frontend == 'true' && 'npm' || '' }}
           cache-dependency-path: app/frontend/package-lock.json
 
       - name: Set up Go
+        if: ${{ steps.environments.outputs.backend_api == 'true' || steps.environments.outputs.e2e == 'true' }}
         uses: actions/setup-go@v7
         with:
           go-version-file: app/backend/api/go.mod
           cache: false
 
       - name: Set up Rust
+        if: ${{ steps.environments.outputs.backend_worker == 'true' || steps.environments.outputs.e2e == 'true' }}
         run: |
           rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.98.0
 
       - name: Install frontend dependencies
+        if: ${{ steps.environments.outputs.frontend == 'true' }}
         working-directory: app/frontend
         run: npm ci
 
       - name: Install Playwright browsers and system dependencies
+        if: ${{ steps.environments.outputs.frontend == 'true' }}
         working-directory: app/frontend
         run: npx playwright install --with-deps
+
+      - name: Start E2E runtime
+        if: ${{ steps.environments.outputs.e2e == 'true' }}
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          VIDEO_ENCODING_QUEUE_URL: ${{ vars.VIDEO_ENCODING_QUEUE_URL }}
+          VIDEO_INPUT_BUCKET: ${{ vars.VIDEO_INPUT_BUCKET }}
+          VIDEO_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
+          FRONTEND_ORIGIN: http://localhost:5173
+          API_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_API_ACCESS_KEY_ID }}
+          API_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_API_SECRET_ACCESS_KEY }}
+          WORKER_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_WORKER_ACCESS_KEY_ID }}
+          WORKER_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_WORKER_SECRET_ACCESS_KEY }}
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          bash app/scripts/start-e2e-compose.sh
 
       - name: Install pinned Codex CLI
         id: codex-cli
@@ -207,4 +273,17 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_API_URL: ${{ github.api_url }}
+          E2E_ENVIRONMENT: ${{ steps.environments.outputs.e2e == 'true' && 'disposable' || '' }}
+          E2E_FRONTEND_URL: ${{ steps.environments.outputs.e2e == 'true' && 'http://localhost:5173' || '' }}
+          E2E_API_URL: ${{ steps.environments.outputs.e2e == 'true' && 'http://127.0.0.1:8000' || '' }}
+          E2E_PROJECT: ${{ steps.environments.outputs.e2e == 'true' && 'chromium' || '' }}
+          FFMPEG_PATH: ${{ steps.environments.outputs.e2e == 'true' && '/usr/bin/ffmpeg' || '' }}
         run: python "${{ runner.temp }}/orchestrator/agent/scripts/run-review.py" --repo-root "${{ github.workspace }}" --pull-number "${{ needs.prepare.outputs.pull_number }}" --head-sha "${{ needs.prepare.outputs.head_sha }}" --spec "${{ needs.prepare.outputs.spec_path }}"
+
+      - name: Show E2E runtime logs
+        if: ${{ failure() && steps.environments.outputs.e2e == 'true' }}
+        run: docker compose -f app/compose.yaml logs --no-color --tail 100 || true
+
+      - name: Stop E2E runtime
+        if: ${{ always() && steps.environments.outputs.e2e == 'true' }}
+        run: docker compose -f app/compose.yaml down --volumes --remove-orphans || true

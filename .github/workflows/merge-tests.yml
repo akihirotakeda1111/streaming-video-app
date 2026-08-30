@@ -1,0 +1,220 @@
+name: Merge tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'app/**'
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.frontend == 'true' }}
+      api: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.api == 'true' }}
+      worker: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.worker == 'true' }}
+      e2e: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.e2e == 'true' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Detect changed areas
+        id: filter
+        if: ${{ github.event_name == 'push' }}
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            frontend:
+              - 'app/frontend/**'
+              - '!app/frontend/e2e/**'
+              - '!app/frontend/playwright.config.ts'
+              - 'app/contracts/**'
+              - 'app/compose.yaml'
+              - '.github/workflows/merge-tests.yml'
+            api:
+              - 'app/backend/api/**'
+              - 'app/contracts/**'
+              - 'app/compose.yaml'
+              - '.github/workflows/merge-tests.yml'
+            worker:
+              - 'app/backend/worker/**'
+              - 'app/contracts/**'
+              - 'app/compose.yaml'
+              - '.github/workflows/merge-tests.yml'
+            e2e:
+              - 'app/frontend/e2e/**'
+              - 'app/frontend/src/**'
+              - 'app/frontend/playwright.config.ts'
+              - 'app/frontend/package.json'
+              - 'app/frontend/package-lock.json'
+              - 'app/compose.yaml'
+              - '.github/workflows/merge-tests.yml'
+
+  frontend:
+    name: Frontend tests
+    needs: changes
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app/frontend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.12.0"
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm run test:unit -- --run
+
+      - name: Build frontend
+        run: npm run build
+
+  api:
+    name: API tests
+    needs: changes
+    if: ${{ needs.changes.outputs.api == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app/backend/api
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: app/backend/api/go.mod
+          cache: false
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests
+        run: go test ./...
+
+  worker:
+    name: Worker tests
+    needs: changes
+    if: ${{ needs.changes.outputs.worker == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app/backend/worker
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+
+      - name: Download dependencies
+        run: cargo fetch --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  e2e:
+    name: E2E tests
+    needs: changes
+    if: ${{ needs.changes.outputs.e2e == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.12.0"
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: app/backend/api/go.mod
+          cache: false
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+
+      - name: Install frontend dependencies
+        working-directory: app/frontend
+        run: npm ci
+
+      - name: Install FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+
+      - name: Run E2E helper tests
+        working-directory: app/frontend
+        run: npm run test:e2e:helpers
+
+      - name: Install Chromium and system dependencies
+        working-directory: app/frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Start E2E runtime
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          VIDEO_ENCODING_QUEUE_URL: ${{ vars.VIDEO_ENCODING_QUEUE_URL }}
+          VIDEO_INPUT_BUCKET: ${{ vars.VIDEO_INPUT_BUCKET }}
+          VIDEO_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
+          FRONTEND_ORIGIN: http://localhost:5173
+          API_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_API_ACCESS_KEY_ID }}
+          API_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_API_SECRET_ACCESS_KEY }}
+          WORKER_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_WORKER_ACCESS_KEY_ID }}
+          WORKER_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_WORKER_SECRET_ACCESS_KEY }}
+        run: bash app/scripts/start-e2e-compose.sh
+
+      - name: Run E2E tests
+        working-directory: app/frontend
+        env:
+          E2E_ENVIRONMENT: disposable
+          E2E_FRONTEND_URL: http://localhost:5173
+          E2E_API_URL: http://127.0.0.1:8000
+          E2E_PROJECT: chromium
+          FFMPEG_PATH: /usr/bin/ffmpeg
+        run: npm run test:e2e
+
+      - name: Show E2E runtime logs
+        if: ${{ failure() }}
+        run: docker compose -f app/compose.yaml logs --no-color --tail 100 || true
+
+      - name: Stop E2E runtime
+        if: ${{ always() }}
+        run: docker compose -f app/compose.yaml down --volumes --remove-orphans || true

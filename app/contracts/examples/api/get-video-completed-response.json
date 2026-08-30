@@ -1,0 +1,13 @@
+{
+  "videoId": "018f47a2-45c2-7a84-b84f-5f6dd7b5910a",
+  "fileName": "sample.mp4",
+  "contentType": "video/mp4",
+  "sizeBytes": 104857600,
+  "job": {
+    "jobId": "018f47a2-4699-7892-9fc0-fbe46d3bbd67",
+    "status": "COMPLETED",
+    "failure": null
+  },
+  "createdAt": "2026-08-25T03:00:00Z",
+  "updatedAt": "2026-08-25T03:04:52Z"
+}

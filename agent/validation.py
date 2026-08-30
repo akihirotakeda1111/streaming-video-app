@@ -67,7 +67,24 @@ FORBIDDEN_GIT_SUBCOMMANDS = frozenset(
     }
 )
 
-VALIDATION_ENV_EXTRA = frozenset({"PYTHONPATH", "VIRTUAL_ENV", "PYTHONHOME", "NODE_PATH"})
+VALIDATION_ENV_EXTRA = frozenset(
+    {
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "PYTHONHOME",
+        "NODE_PATH",
+        "CI",
+        "E2E_ENVIRONMENT",
+        "E2E_FRONTEND_URL",
+        "E2E_API_URL",
+        "E2E_PROJECT",
+        "E2E_NAVIGATION_TIMEOUT_MS",
+        "E2E_UPLOAD_TIMEOUT_MS",
+        "E2E_PROCESSING_TIMEOUT_MS",
+        "E2E_PLAYBACK_TIMEOUT_MS",
+        "FFMPEG_PATH",
+    }
+)
 
 
 @dataclass(frozen=True)

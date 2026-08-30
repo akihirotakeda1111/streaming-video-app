@@ -5,13 +5,20 @@ Does not commit, push, or open pull requests.
 
 from __future__ import annotations
 
+import random
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from agent.classify import FailureClass, classify_output, classify_validation
+from agent.classify import (
+    FailureClass,
+    classify_codex_failure,
+    classify_validation,
+    is_codex_transport_error,
+)
 from agent.codex_runner import (
     CodexRunResult,
     Executor,
@@ -19,6 +26,7 @@ from agent.codex_runner import (
     build_post_codex_diagnostic,
     detach_codex_api_key,
     emit_codex_diagnostic,
+    normalize_codex_thread_id,
     run_codex,
 )
 from agent.config import AgentConfig, load_config
@@ -64,6 +72,16 @@ from agent.state import (
 from agent.validation import ValidationRecord, run_validation_text
 
 REPAIR_ATTEMPT_LIMIT = "REPAIR_ATTEMPT_LIMIT"
+CODEX_TRANSPORT_RETRY_LIMIT = "CODEX_TRANSPORT_RETRY_LIMIT"
+CODEX_TRANSPORT_RETRY_MAX = 2
+CODEX_TRANSPORT_RETRY_BASE_SECONDS = 3.0
+CODEX_TRANSPORT_RETRY_CAP_SECONDS = 30.0
+_TRANSPORT_RESUME_PROMPT = (
+    "The previous Codex turn was interrupted by a temporary API stream disconnect. "
+    "Continue the same task from the current workspace. "
+    "Do not restart from scratch unless the previous work is incomplete or incorrect. "
+    "Do not run git commit/push or create pull requests."
+)
 _ESCALATED_FAILURE_CLASSES = frozenset(
     {
         FailureClass.AGENT_REPAIRABLE,
@@ -86,6 +104,25 @@ _SUCCESS_CYCLE_OUTCOMES = frozenset(
         CycleOutcome.FINAL_VERIFICATION_PASSED,
     }
 )
+
+
+def _bind_codex_credential(
+    env: Mapping[str, str] | None,
+    provided_key: str | None,
+    *,
+    api_key_env: str,
+) -> tuple[Mapping[str, str] | None, str | None]:
+    """Scrub process env, then bind a Work Unit-owned or Cycle-owned credential.
+
+    ``detach_codex_api_key`` copies ``env`` and does not mutate the caller mapping.
+    Process environment is always scrubbed. ``run_work_unit`` passes the same
+    explicit key to every cycle. Direct callers such as ``run-task.py`` omit
+    ``api_key`` and receive the detached process value.
+    """
+    rest_env, detached_key = detach_codex_api_key(env, api_key_env=api_key_env)
+    if provided_key is not None:
+        return rest_env, provided_key
+    return rest_env, detached_key
 
 
 def _as_cycle_outcome(value: object) -> CycleOutcome:
@@ -260,6 +297,7 @@ def run_task_cycle(
     repo_root: Path | str,
     config: AgentConfig | None = None,
     env: Mapping[str, str] | None = None,
+    api_key: str | None = None,
     executor: Executor | None = None,
     state: ExecutionState | None = None,
     persist_state: bool = True,
@@ -268,7 +306,7 @@ def run_task_cycle(
     root = Path(repo_root)
     parsed = spec if isinstance(spec, TaskSpec) else parse_spec(spec)
     validate_spec_scope_policy(parsed, cfg.runtime_edit_policy)
-    rest_env, api_key = detach_codex_api_key(env, api_key_env=cfg.codex.api_key_env)
+    rest_env, api_key = _bind_codex_credential(env, api_key, api_key_env=cfg.codex.api_key_env)
     snapshot = capture_snapshot(root)
     unsafe = _reject_unsafe_current_state(
         parsed, root, cfg, snapshot.base_sha, provided_state=state
@@ -307,44 +345,7 @@ def run_task_cycle(
         state=current.state.value,
         extra={"spec_task": selected.id},
     )
-    pre_fingerprint = _preflight_current_state(root, parsed, cfg)
-    if pre_fingerprint is None:
-        return _state_tampered_result(
-            parsed,
-            selected,
-            current,
-            snapshot.base_sha,
-            current_state_relpath(parsed.id, cfg),
-        )
-    implement = _invoke_codex_with_fingerprint(
-        parsed,
-        selected,
-        current,
-        root,
-        cfg,
-        snapshot.base_sha,
-        pre_fingerprint,
-        lambda: run_codex(
-            parsed,
-            selected,
-            repo_root=root,
-            config=cfg,
-            env=attach_codex_api_key(rest_env, api_key, api_key_env=cfg.codex.api_key_env),
-            executor=executor,
-            stage="implementation",
-            attempt=0,
-        ),
-    )
-    if isinstance(implement, CycleResult):
-        return implement
-    emit(
-        CODEX_COMPLETED,
-        "codex implementation completed",
-        task_id=parsed.id,
-        state=current.state.value,
-        extra={"spec_task": selected.id, "exit_code": implement.exit_code},
-    )
-    return _after_codex(
+    return _invoke_codex_turn(
         parsed,
         selected,
         current,
@@ -354,11 +355,13 @@ def run_task_cycle(
         api_key,
         executor,
         snapshot.base_sha,
-        implement,
         persist_state,
-        pre_fingerprint,
+        prompt=None,
+        original_prompt=None,
         stage="implementation",
         attempt=0,
+        thread_id=None,
+        transport_retries=0,
     )
 
 
@@ -463,6 +466,8 @@ def _after_codex(
     *,
     stage: str,
     attempt: int,
+    original_prompt: str | None,
+    transport_retries: int,
 ) -> CycleResult:
     emit(
         SCOPE_CHECK_STARTED,
@@ -506,13 +511,38 @@ def _after_codex(
             message=f"SCOPE_VIOLATION: {', '.join(scope.violation_paths)}",
         )
 
-    if implement.exit_code != 0 and not scope.changed_paths:
-        classification = classify_output(
-            stdout=implement.stdout,
-            stderr=implement.stderr,
-            binary="codex",
-            exit_code=implement.exit_code,
-        )
+    if implement.exit_code != 0:
+        if is_codex_transport_error(stdout=implement.stdout, stderr=implement.stderr):
+            if transport_retries < CODEX_TRANSPORT_RETRY_MAX:
+                return _retry_codex_after_transport(
+                    spec,
+                    task,
+                    state,
+                    root,
+                    cfg,
+                    env,
+                    api_key,
+                    executor,
+                    base_sha,
+                    persist_state,
+                    implement=implement,
+                    stage=stage,
+                    attempt=attempt,
+                    original_prompt=original_prompt,
+                    transport_retries=transport_retries,
+                )
+            classification = FailureClass.ENVIRONMENT_FAILURE
+            code: str | None = CODEX_TRANSPORT_RETRY_LIMIT
+            message = "codex transport retry limit reached"
+        else:
+            classification = classify_codex_failure(
+                stdout=implement.stdout,
+                stderr=implement.stderr,
+                exit_code=implement.exit_code,
+                api_key_present=bool((api_key or "").strip()),
+            )
+            code = None
+            message = "codex exited non-zero"
         target = (
             ExecutionStatus.FAILED
             if classification is FailureClass.ENVIRONMENT_FAILURE
@@ -530,7 +560,8 @@ def _after_codex(
             scope=scope,
             failure_class=classification,
             repair_attempts=state.repair_attempts,
-            message="codex exited non-zero without in-scope changes",
+            message=message,
+            code=code,
         )
 
     emit(
@@ -767,6 +798,105 @@ def _validate_and_maybe_repair(
         state=state.state.value,
         extra={"spec_task": task.id, "attempt": state.repair_attempts},
     )
+    return _invoke_codex_turn(
+        spec,
+        task,
+        state,
+        root,
+        cfg,
+        env,
+        api_key,
+        executor,
+        base_sha,
+        persist_state,
+        prompt=prompt,
+        original_prompt=prompt,
+        stage="repair",
+        attempt=state.repair_attempts,
+        thread_id=None,
+        transport_retries=0,
+    )
+
+
+def _codex_transport_backoff_seconds(retry_index: int) -> float:
+    low = CODEX_TRANSPORT_RETRY_BASE_SECONDS * (2**retry_index)
+    high = min(low + 12.0, CODEX_TRANSPORT_RETRY_CAP_SECONDS)
+    return random.uniform(low, high)
+
+
+def _retry_codex_after_transport(
+    spec: TaskSpec,
+    task: SpecTask,
+    state: ExecutionState,
+    root: Path,
+    cfg: AgentConfig,
+    env: Mapping[str, str] | None,
+    api_key: str | None,
+    executor: Executor | None,
+    base_sha: str,
+    persist_state: bool,
+    *,
+    implement: CodexRunResult,
+    stage: str,
+    attempt: int,
+    original_prompt: str | None,
+    transport_retries: int,
+) -> CycleResult:
+    thread_id = normalize_codex_thread_id(implement.thread_id)
+    delay = _codex_transport_backoff_seconds(transport_retries)
+    emit(
+        CODEX_STARTED,
+        "codex transport retry started",
+        task_id=spec.id,
+        state=state.state.value,
+        extra={
+            "spec_task": task.id,
+            "transport_retry": transport_retries + 1,
+            "thread_id": thread_id,
+            "delay_seconds": round(delay, 3),
+        },
+    )
+    time.sleep(delay)
+    retry_prompt = _TRANSPORT_RESUME_PROMPT if thread_id else original_prompt
+    return _invoke_codex_turn(
+        spec,
+        task,
+        state,
+        root,
+        cfg,
+        env,
+        api_key,
+        executor,
+        base_sha,
+        persist_state,
+        prompt=retry_prompt,
+        original_prompt=original_prompt,
+        stage=stage,
+        attempt=attempt,
+        thread_id=thread_id,
+        transport_retries=transport_retries + 1,
+    )
+
+
+def _invoke_codex_turn(
+    spec: TaskSpec,
+    task: SpecTask,
+    state: ExecutionState,
+    root: Path,
+    cfg: AgentConfig,
+    env: Mapping[str, str] | None,
+    api_key: str | None,
+    executor: Executor | None,
+    base_sha: str,
+    persist_state: bool,
+    *,
+    prompt: str | None,
+    original_prompt: str | None,
+    stage: str,
+    attempt: int,
+    thread_id: str | None,
+    transport_retries: int,
+) -> CycleResult:
     pre_fingerprint = _preflight_current_state(root, spec, cfg)
     if pre_fingerprint is None:
         return _state_tampered_result(
@@ -776,7 +906,7 @@ def _validate_and_maybe_repair(
             base_sha,
             current_state_relpath(spec.id, cfg),
         )
-    repair_run = _invoke_codex_with_fingerprint(
+    invoked = _invoke_codex_with_fingerprint(
         spec,
         task,
         state,
@@ -792,18 +922,24 @@ def _validate_and_maybe_repair(
             env=attach_codex_api_key(env, api_key, api_key_env=cfg.codex.api_key_env),
             executor=executor,
             prompt=prompt,
-            stage="repair",
-            attempt=state.repair_attempts,
+            stage=stage,
+            attempt=attempt,
+            thread_id=thread_id,
         ),
     )
-    if isinstance(repair_run, CycleResult):
-        return repair_run
+    if isinstance(invoked, CycleResult):
+        return invoked
+    extra: dict[str, Any] = {"spec_task": task.id, "exit_code": invoked.exit_code}
+    if invoked.thread_id:
+        extra["thread_id"] = invoked.thread_id
+    if transport_retries:
+        extra["transport_retry"] = transport_retries
     emit(
         CODEX_COMPLETED,
-        "codex repair completed",
+        "codex implementation completed" if stage == "implementation" else "codex repair completed",
         task_id=spec.id,
         state=state.state.value,
-        extra={"spec_task": task.id, "exit_code": repair_run.exit_code},
+        extra=extra,
     )
     return _after_codex(
         spec,
@@ -815,11 +951,13 @@ def _validate_and_maybe_repair(
         api_key,
         executor,
         base_sha,
-        repair_run,
+        invoked,
         persist_state,
         pre_fingerprint,
-        stage="repair",
-        attempt=state.repair_attempts,
+        stage=stage,
+        attempt=attempt,
+        original_prompt=original_prompt,
+        transport_retries=transport_retries,
     )
 
 

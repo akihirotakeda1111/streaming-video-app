@@ -8,16 +8,19 @@
     "build": "run-p type-check \"build-only {@}\" --",
     "preview": "vite preview",
     "test:unit": "vitest",
-    "test:e2e": "playwright test",
+    "test:e2e": "sh -c 'if [ \"$1\" = \"--list\" ]; then E2E_ENVIRONMENT=disposable E2E_FRONTEND_URL=http://127.0.0.1:5173 E2E_API_URL=http://127.0.0.1:8000; export E2E_ENVIRONMENT E2E_FRONTEND_URL E2E_API_URL; fi; exec playwright test \"$@\"' --",
+    "test:e2e:list": "npm run test:e2e -- --list",
+    "test:e2e:helpers": "vitest run --config e2e/vitest.config.ts",
     "build-only": "vite build",
     "type-check": "vue-tsc --build",
     "lint": "run-s \"lint:*\"",
-    "lint:oxlint": "oxlint . --fix",
-    "lint:eslint": "eslint . --fix --cache",
+    "lint:oxlint": "oxlint .",
+    "lint:eslint": "eslint . --cache",
     "format": "prettier --write --experimental-cli src/"
   },
   "dependencies": {
     "pinia": "^4.0.2",
+    "video.js": "^8.23.4",
     "vue": "^3.5.40",
     "vue-router": "^5.2.0"
   },

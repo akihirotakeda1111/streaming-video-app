@@ -1,11 +1,227 @@
-<script setup lang="ts"></script>
+<script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, ref } from 'vue'
+import videojs from 'video.js'
+import type Player from 'video.js/dist/types/player'
+
+import type { VideoApiClient } from './api/client'
+import type { CreateVideoResponse, PlaybackResponse, VideoResponse, VideoStatus } from './api/contracts'
+
+export type WorkflowState = 'idle' | 'creating' | 'created' | 'uploading' | 'processing' | 'ready' | 'error'
+
+export interface WorkflowActions {
+  createVideo: VideoApiClient['createVideo']
+  uploadFile: (file: File, response: CreateVideoResponse) => Promise<void>
+  getVideoStatus: VideoApiClient['getVideoStatus']
+  getPlayback: VideoApiClient['getPlayback']
+}
+
+const props = withDefaults(
+  defineProps<{
+    workflowActions?: Partial<WorkflowActions>
+    pollIntervalMs?: number
+  }>(),
+  { pollIntervalMs: 1000 },
+)
+
+const state = ref<WorkflowState>('idle')
+const selectedFile = ref<File | null>(null)
+const createdVideo = ref<CreateVideoResponse | null>(null)
+const errorMessage = ref('')
+const playback = ref<PlaybackResponse | null>(null)
+const jobStatus = ref<VideoStatus | null>(null)
+const input = ref<HTMLInputElement | null>(null)
+const videoElement = ref<HTMLVideoElement | null>(null)
+let pollTimer: ReturnType<typeof setTimeout> | undefined
+let player: Player | undefined
+let disposed = false
+let workflowGeneration = 0
+
+function unwired(name: keyof WorkflowActions): () => Promise<never> {
+  return async () => {
+    throw new Error(`${name} is not wired`)
+  }
+}
+
+const defaultActions: WorkflowActions = {
+  createVideo: unwired('createVideo'),
+  uploadFile: unwired('uploadFile'),
+  getVideoStatus: unwired('getVideoStatus'),
+  getPlayback: unwired('getPlayback'),
+}
+
+const actions = computed(() => ({ ...defaultActions, ...props.workflowActions }))
+const active = computed(
+  () => state.value === 'creating' || state.value === 'uploading' || state.value === 'processing',
+)
+const stateLabel = computed(() =>
+  ({ idle: 'Ready to upload', creating: 'Creating video', created: 'Video created', uploading: 'Uploading', processing: 'Processing', ready: 'Ready to play', error: 'Upload error' })[
+    state.value
+  ],
+)
+
+function setError(message: string) {
+  errorMessage.value = message
+  state.value = 'error'
+}
+
+function disposePlayer() {
+  if (player) {
+    player.dispose()
+    player = undefined
+  }
+}
+
+async function initializePlayer(response: PlaybackResponse, generation: number) {
+  await nextTick()
+  if (disposed || generation !== workflowGeneration || !videoElement.value) return
+  disposePlayer()
+  player = videojs(videoElement.value, {
+    controls: true,
+    sources: [{ src: response.manifestUrl, type: response.contentType }],
+  })
+  player.on('error', () => {
+    if (!disposed && generation === workflowGeneration) {
+      setError(player?.error()?.message ?? 'Unable to play this video.')
+    }
+  })
+}
+
+function selectFile(event: Event) {
+  workflowGeneration += 1
+  clearTimer()
+  disposePlayer()
+  const files = (event.target as HTMLInputElement).files
+  selectedFile.value = files?.length === 1 ? (files[0] ?? null) : null
+  createdVideo.value = null
+  playback.value = null
+  jobStatus.value = null
+  errorMessage.value = ''
+  if (!selectedFile.value) {
+    if (files?.length) setError('Please select one MP4 video file.')
+    else state.value = 'idle'
+    return
+  }
+  if (selectedFile.value.type !== 'video/mp4' || selectedFile.value.size === 0) {
+    selectedFile.value = null
+    setError('Please choose one non-empty MP4 video file.')
+    return
+  }
+  state.value = 'idle'
+}
+
+function clearTimer() {
+  if (pollTimer !== undefined) clearTimeout(pollTimer)
+  pollTimer = undefined
+}
+
+function pollingInterval() {
+  return Math.min(Math.max(1, props.pollIntervalMs), 30_000)
+}
+
+function scheduleStatusCheck(videoId: string, generation: number) {
+  clearTimer()
+  pollTimer = setTimeout(() => {
+    void checkStatus(videoId, generation).catch((error: unknown) => {
+      if (!disposed && generation === workflowGeneration) {
+        clearTimer()
+        setError(errorMessageFor(error))
+      }
+    })
+  }, pollingInterval())
+}
+
+async function checkStatus(videoId: string, generation: number) {
+  if (disposed || generation !== workflowGeneration) return
+  const result: VideoResponse = await actions.value.getVideoStatus(videoId)
+  if (disposed || generation !== workflowGeneration) return
+  jobStatus.value = result.job.status
+  if (result.job.status === 'FAILED') {
+    clearTimer()
+    setError(`${result.job.failure?.code ?? 'PROCESSING_FAILED'}: ${result.job.failure?.message ?? 'Video processing failed.'}`)
+    return
+  }
+  if (result.job.status === 'COMPLETED') {
+    clearTimer()
+    const response = await actions.value.getPlayback(videoId)
+    if (disposed || generation !== workflowGeneration) return
+    playback.value = response
+    state.value = 'ready'
+    await initializePlayer(response, generation)
+    return
+  }
+  if (!disposed && generation === workflowGeneration) scheduleStatusCheck(videoId, generation)
+}
+
+async function submit() {
+  if (disposed || active.value) return
+  if (!selectedFile.value) {
+    setError('Choose an MP4 video before uploading.')
+    return
+  }
+  const file = selectedFile.value
+  if (file.type !== 'video/mp4' || file.size === 0) {
+    setError('Only non-empty MP4 video files are supported.')
+    return
+  }
+  workflowGeneration += 1
+  const generation = workflowGeneration
+  clearTimer()
+  disposePlayer()
+  errorMessage.value = ''
+  playback.value = null
+  createdVideo.value = null
+  jobStatus.value = null
+  try {
+    state.value = 'creating'
+    const created = await actions.value.createVideo({ fileName: file.name, contentType: 'video/mp4', sizeBytes: file.size })
+    if (disposed || generation !== workflowGeneration) return
+    createdVideo.value = created
+    jobStatus.value = created.job.status
+    state.value = 'uploading'
+    await actions.value.uploadFile(file, created)
+    if (disposed || generation !== workflowGeneration) return
+    state.value = 'processing'
+    scheduleStatusCheck(created.videoId, generation)
+  } catch (error: unknown) {
+    if (!disposed && generation === workflowGeneration) setError(errorMessageFor(error))
+  }
+}
+
+function errorMessageFor(error: unknown) {
+  return error instanceof Error && error.message ? error.message : 'Something went wrong. Please try again.'
+}
+
+function dispose() {
+  disposed = true
+  workflowGeneration += 1
+  clearTimer()
+  disposePlayer()
+}
+
+onBeforeUnmount(dispose)
+defineExpose({ createdVideo, dispose, state })
+</script>
 
 <template>
-  <h1>You did it!</h1>
-  <p>
-    Visit <a href="https://vuejs.org/" target="_blank" rel="noopener">vuejs.org</a> to read the
-    documentation
-  </p>
-</template>
+  <main class="upload-shell" :data-workflow-state="state">
+    <h1>You did it!</h1>
+    <p class="intro">Upload an MP4 video and watch it when processing is complete.</p>
 
-<style scoped></style>
+    <form class="upload-card" @submit.prevent="submit">
+      <label for="video-file">Video file</label>
+      <input id="video-file" ref="input" type="file" accept="video/mp4" :disabled="active" @change="selectFile" />
+      <p v-if="selectedFile" class="file-name">Selected: {{ selectedFile.name }}</p>
+      <p class="hint">MP4 files only. Select one video.</p>
+      <button type="submit" :disabled="active">{{ active ? 'Working…' : 'Upload video' }}</button>
+      <p class="status" role="status" aria-live="polite">{{ stateLabel }}</p>
+      <p v-if="jobStatus" data-job-status>Job status: {{ jobStatus }}</p>
+      <p v-if="errorMessage" class="error" role="alert">{{ errorMessage }}</p>
+      <section v-if="createdVideo" class="create-result" aria-label="Video creation result">
+        <p>Video ID: {{ createdVideo.videoId }}</p>
+        <p>Job ID: {{ createdVideo.job.jobId }}</p>
+        <p>Upload ready: {{ createdVideo.upload.method }} {{ createdVideo.upload.url }}</p>
+      </section>
+      <video v-if="playback" ref="videoElement" class="video-js player" controls aria-label="Uploaded video"></video>
+    </form>
+  </main>
+</template>

@@ -1,0 +1,38 @@
+{
+  "Records": [
+    {
+      "eventVersion": "2.1",
+      "eventSource": "aws:s3",
+      "awsRegion": "ap-northeast-1",
+      "eventTime": "2026-08-25T03:01:12.345Z",
+      "eventName": "ObjectCreated:Put",
+      "userIdentity": {
+        "principalId": "AWS:EXAMPLE"
+      },
+      "requestParameters": {
+        "sourceIPAddress": "203.0.113.10"
+      },
+      "responseElements": {
+        "x-amz-request-id": "EXAMPLE123456789",
+        "x-amz-id-2": "example-host-id"
+      },
+      "s3": {
+        "s3SchemaVersion": "1.0",
+        "configurationId": "phase1-source-upload",
+        "bucket": {
+          "name": "streaming-video-input",
+          "ownerIdentity": {
+            "principalId": "EXAMPLEOWNER"
+          },
+          "arn": "arn:aws:s3:::streaming-video-input"
+        },
+        "object": {
+          "key": "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4",
+          "size": 104857600,
+          "eTag": "d41d8cd98f00b204e9800998ecf8427e",
+          "sequencer": "0066CC000000000001"
+        }
+      }
+    }
+  ]
+}

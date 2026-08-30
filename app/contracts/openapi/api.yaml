@@ -1,0 +1,372 @@
+openapi: 3.1.0
+info:
+  title: Streaming Video MVP API
+  version: 1.0.0
+  description: |
+    Phase 1 contract for creating a video encoding job, polling its status,
+    and obtaining HLS playback information.
+
+    The upload URL is used directly by the browser. Upload completion is
+    signaled by an AWS S3 ObjectCreated notification sent directly to SQS;
+    this API does not publish custom encoding lifecycle events in Phase 1.
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local development
+tags:
+  - name: Videos
+
+paths:
+  /videos:
+    post:
+      tags: [Videos]
+      operationId: createVideo
+      summary: Create a video and its encoding job
+      description: |
+        Creates the video and encoding job in `UPLOADING` state and returns a
+        presigned S3 PUT URL. The client must send the returned required
+        headers unchanged when uploading the source object.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVideoRequest'
+            examples:
+              default:
+                externalValue: ../examples/api/create-video-request.json
+      responses:
+        '201':
+          description: Video and encoding job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateVideoResponse'
+              examples:
+                default:
+                  externalValue: ../examples/api/create-video-response.json
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /videos/{videoId}:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    get:
+      tags: [Videos]
+      operationId: getVideo
+      summary: Get the current video and encoding job status
+      responses:
+        '200':
+          description: Current video state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoResponse'
+              examples:
+                processing:
+                  externalValue: ../examples/api/get-video-response.json
+                completed:
+                  externalValue: ../examples/api/get-video-completed-response.json
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /videos/{videoId}/playback:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    get:
+      tags: [Videos]
+      operationId: getVideoPlayback
+      summary: Get HLS playback information
+      description: |
+        Returns playback information only after the encoding job reaches
+        `COMPLETED`. In Phase 1 the manifest URL may point directly to the S3
+        output endpoint. Private delivery through CloudFront is outside this
+        contract's scope.
+      responses:
+        '200':
+          description: HLS playback information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlaybackResponse'
+              examples:
+                default:
+                  externalValue: ../examples/api/get-playback-response.json
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The video is not ready for playback
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                notReady:
+                  externalValue: ../examples/api/playback-not-ready-response.json
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  parameters:
+    VideoId:
+      name: videoId
+      in: path
+      required: true
+      description: Canonical lowercase UUID of the video.
+      schema:
+        $ref: '#/components/schemas/CanonicalUuid'
+
+  schemas:
+    CanonicalUuid:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      description: Canonical lowercase UUID with hyphens in fixed positions.
+
+    CreateVideoRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - fileName
+        - contentType
+        - sizeBytes
+      properties:
+        fileName:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Original client-side file name. It is metadata only and is not used as an S3 key.
+          examples: [sample.mp4]
+        contentType:
+          type: string
+          enum:
+            - video/mp4
+          description: Source media type accepted in Phase 1.
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 5368709120
+          description: Source object size. The Phase 1 maximum is 5 GiB.
+
+    CreateVideoResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - videoId
+        - job
+        - upload
+        - createdAt
+      properties:
+        videoId:
+          $ref: '#/components/schemas/CanonicalUuid'
+        job:
+          $ref: '#/components/schemas/Job'
+        upload:
+          $ref: '#/components/schemas/PresignedUpload'
+        createdAt:
+          type: string
+          format: date-time
+
+    VideoResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - videoId
+        - fileName
+        - contentType
+        - sizeBytes
+        - job
+        - createdAt
+        - updatedAt
+      properties:
+        videoId:
+          $ref: '#/components/schemas/CanonicalUuid'
+        fileName:
+          type: string
+        contentType:
+          type: string
+          enum: [video/mp4]
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 1
+        job:
+          $ref: '#/components/schemas/Job'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    Job:
+      type: object
+      additionalProperties: false
+      required:
+        - jobId
+        - status
+      properties:
+        jobId:
+          $ref: '#/components/schemas/CanonicalUuid'
+        status:
+          $ref: ../domain/job-status.schema.json
+        failure:
+          oneOf:
+            - $ref: '#/components/schemas/JobFailure'
+            - type: 'null'
+          description: Present only when status is `FAILED`.
+      allOf:
+        - if:
+            properties:
+              status:
+                const: FAILED
+            required: [status]
+          then:
+            required: [failure]
+            properties:
+              failure:
+                $ref: '#/components/schemas/JobFailure'
+          else:
+            properties:
+              failure:
+                type: 'null'
+
+    JobFailure:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 100
+          examples: [ENCODING_FAILED]
+        message:
+          type: string
+          minLength: 1
+          maxLength: 500
+
+    PresignedUpload:
+      type: object
+      additionalProperties: false
+      required:
+        - method
+        - url
+        - headers
+        - expiresAt
+        - object
+      properties:
+        method:
+          type: string
+          const: PUT
+        url:
+          type: string
+          format: uri
+          description: Presigned S3 URL. Treat it as a secret until it expires.
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          required:
+            - Content-Type
+          properties:
+            Content-Type:
+              type: string
+              const: video/mp4
+        expiresAt:
+          type: string
+          format: date-time
+        object:
+          $ref: '#/components/schemas/StorageObject'
+
+    StorageObject:
+      type: object
+      additionalProperties: false
+      required:
+        - bucket
+        - key
+      properties:
+        bucket:
+          type: string
+          minLength: 3
+          maxLength: 63
+        key:
+          type: string
+          pattern: '^videos/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/jobs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/source\.mp4$'
+
+    PlaybackResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - videoId
+        - jobId
+        - protocol
+        - manifestUrl
+        - contentType
+      properties:
+        videoId:
+          $ref: '#/components/schemas/CanonicalUuid'
+        jobId:
+          $ref: '#/components/schemas/CanonicalUuid'
+        protocol:
+          type: string
+          const: HLS
+        manifestUrl:
+          type: string
+          format: uri
+        contentType:
+          type: string
+          const: application/vnd.apple.mpegurl
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          minLength: 1
+        message:
+          type: string
+          minLength: 1
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: INVALID_REQUEST
+            message: The request body is invalid.
+    NotFound:
+      description: Video not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: VIDEO_NOT_FOUND
+            message: The requested video does not exist.
+    InternalServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: INTERNAL_ERROR
+            message: An unexpected error occurred.

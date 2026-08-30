@@ -8,3 +8,14 @@ members = [
     "crates/storage",
     "crates/persistence",
 ]
+
+[workspace.dependencies]
+tokio = { version = "1.47", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = "2.5"
+aws-config = "1.8"
+aws-sdk-s3 = "1.106"
+aws-sdk-sqs = "1.84"
+tokio-postgres = "0.7"
+tempfile = "3.22"

@@ -1,14 +1,25 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! Object storage ports.  Implementations may use S3, while the worker only
+//! knows how to read and write objects.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectError(pub String);
+
+pub trait Read {
+    fn read(
+        &mut self,
+        bucket: &str,
+        key: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, ObjectError>> + Send;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+pub trait Write {
+    fn write(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        contents: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), ObjectError>> + Send;
 }
+
+pub mod s3;
