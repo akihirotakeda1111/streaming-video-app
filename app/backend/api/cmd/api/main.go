@@ -39,7 +39,7 @@ func run(ctx context.Context, lookupEnv config.LookupEnvFunc, factories runtimeF
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	return runtime.Start(ctx)
 }
