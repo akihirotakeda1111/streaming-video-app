@@ -119,10 +119,11 @@ mod tests {
         ));
         assert!(DOCKERFILE.contains("ENV FFMPEG_PATH=/usr/local/bin/ffmpeg"));
         assert!(DOCKERFILE.contains("TMPDIR=/tmp/video-worker"));
-        assert!(
-            DOCKERFILE
-                .contains("/usr/local/bin/ffmpeg -version && /usr/local/bin/ffprobe -version")
-        );
+        assert!(DOCKERFILE.contains(
+            "apt-get install -y --no-install-recommends ca-certificates"
+        ));
+        assert!(DOCKERFILE.contains("/usr/local/bin/ffmpeg -version"));
+        assert!(DOCKERFILE.contains("/usr/local/bin/ffprobe -version"));
         assert!(DOCKERFILE.contains("USER worker"));
         assert!(DOCKERFILE.contains("ENTRYPOINT [\"/usr/local/bin/video-worker\"]"));
     }

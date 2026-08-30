@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM mwader/static-ffmpeg:7.1.1 AS media-tools
 
-FROM rust:1.89.0-bookworm AS builder
+FROM rust:1.98.0-bookworm AS builder
 WORKDIR /source
 COPY . .
 RUN cargo build --locked --release -p worker
@@ -13,9 +13,13 @@ COPY --from=builder /source/target/release/worker /usr/local/bin/video-worker
 
 ENV FFMPEG_PATH=/usr/local/bin/ffmpeg \
     TMPDIR=/tmp/video-worker
-RUN /usr/local/bin/ffmpeg -version && /usr/local/bin/ffprobe -version \
+RUN mkdir -p "$TMPDIR" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && /usr/local/bin/ffmpeg -version \
+    && /usr/local/bin/ffprobe -version \
     && useradd --create-home --uid 10001 worker \
-    && mkdir -p "$TMPDIR" \
     && chown worker:worker "$TMPDIR"
 USER worker
 ENTRYPOINT ["/usr/local/bin/video-worker"]

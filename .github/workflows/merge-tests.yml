@@ -195,111 +195,11 @@ jobs:
           VIDEO_INPUT_BUCKET: ${{ vars.VIDEO_INPUT_BUCKET }}
           VIDEO_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
           FRONTEND_ORIGIN: http://localhost:5173
-          E2E_API_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_API_ACCESS_KEY_ID }}
-          E2E_API_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_API_SECRET_ACCESS_KEY }}
-          E2E_WORKER_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_WORKER_ACCESS_KEY_ID }}
-          E2E_WORKER_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_WORKER_SECRET_ACCESS_KEY }}
-        run: |
-          if [ -z "$AWS_REGION" ] || [ -z "$VIDEO_ENCODING_QUEUE_URL" ] || [ -z "$VIDEO_INPUT_BUCKET" ] || [ -z "$VIDEO_OUTPUT_BUCKET" ]; then
-            echo "AWS_REGION, VIDEO_ENCODING_QUEUE_URL, VIDEO_INPUT_BUCKET, and VIDEO_OUTPUT_BUCKET repository variables are required"
-            exit 1
-          fi
-          if [ -z "$E2E_API_ACCESS_KEY_ID" ] || [ -z "$E2E_API_SECRET_ACCESS_KEY" ]; then
-            echo "AWS_E2E_API_ACCESS_KEY_ID and AWS_E2E_API_SECRET_ACCESS_KEY repository secrets are required"
-            exit 1
-          fi
-          if [ -z "$E2E_WORKER_ACCESS_KEY_ID" ] || [ -z "$E2E_WORKER_SECRET_ACCESS_KEY" ]; then
-            echo "AWS_E2E_WORKER_ACCESS_KEY_ID and AWS_E2E_WORKER_SECRET_ACCESS_KEY repository secrets are required"
-            exit 1
-          fi
-
-          docker compose -f app/compose.yaml up -d postgres
-          for attempt in {1..30}; do
-            if docker compose -f app/compose.yaml exec -T postgres \
-              pg_isready -U streaming_video -d streaming_video; then
-              break
-            fi
-            if [ "$attempt" = 30 ]; then
-              echo "PostgreSQL did not become ready"
-              exit 1
-            fi
-            sleep 2
-          done
-
-          docker compose -f app/compose.yaml exec -T postgres \
-            psql -U streaming_video -d streaming_video -v ON_ERROR_STOP=1 \
-            < app/backend/api/internal/persistence/migrations/0001_phase1_schema.up.sql
-
-          (
-            cd app/backend/api
-            HTTP_ADDR=127.0.0.1:8000 \
-            DATABASE_URL='postgres://streaming_video:streaming_video_dev_password@127.0.0.1:5432/streaming_video?sslmode=disable' \
-            AWS_ACCESS_KEY_ID="$E2E_API_ACCESS_KEY_ID" \
-            AWS_SECRET_ACCESS_KEY="$E2E_API_SECRET_ACCESS_KEY" \
-            AWS_EC2_METADATA_DISABLED=true \
-            OUTPUT_S3_ENDPOINT="https://${VIDEO_OUTPUT_BUCKET}.s3.${AWS_REGION}.amazonaws.com" \
-            go run ./cmd/api
-          ) > "$RUNNER_TEMP/e2e-api.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/e2e-api.pid"
-
-          (
-            cd app/backend/worker
-            DATABASE_URL='postgres://streaming_video:streaming_video_dev_password@127.0.0.1:5432/streaming_video?sslmode=disable' \
-            AWS_ACCESS_KEY_ID="$E2E_WORKER_ACCESS_KEY_ID" \
-            AWS_SECRET_ACCESS_KEY="$E2E_WORKER_SECRET_ACCESS_KEY" \
-            AWS_EC2_METADATA_DISABLED=true \
-            VIDEO_ENCODING_QUEUE_URL="$VIDEO_ENCODING_QUEUE_URL" \
-            FFMPEG_PATH=/usr/bin/ffmpeg \
-            TMPDIR="$RUNNER_TEMP/e2e-worker" \
-            cargo run --locked --package worker
-          ) > "$RUNNER_TEMP/e2e-worker.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/e2e-worker.pid"
-
-          unset E2E_API_ACCESS_KEY_ID E2E_API_SECRET_ACCESS_KEY
-          unset E2E_WORKER_ACCESS_KEY_ID E2E_WORKER_SECRET_ACCESS_KEY
-
-          (
-            cd app/frontend
-            VITE_API_BASE_URL=http://127.0.0.1:8000/api/v1 \
-              npm run dev -- --host 0.0.0.0 --port 5173
-          ) > "$RUNNER_TEMP/e2e-frontend.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/e2e-frontend.pid"
-
-          wait_for() {
-            local name="$1"
-            local url="$2"
-            local log="$3"
-            for attempt in {1..60}; do
-              if curl --fail --silent --show-error "$url" >/dev/null; then
-                return 0
-              fi
-              sleep 2
-            done
-            echo "$name did not become ready"
-            tail -n 100 "$log"
-            return 1
-          }
-
-          wait_for_worker() {
-            for attempt in {1..120}; do
-              if grep -q '"message":"worker started"' "$RUNNER_TEMP/e2e-worker.log"; then
-                return 0
-              fi
-              if ! kill -0 "$(cat "$RUNNER_TEMP/e2e-worker.pid")" 2>/dev/null; then
-                echo "worker stopped before becoming ready"
-                tail -n 100 "$RUNNER_TEMP/e2e-worker.log"
-                return 1
-              fi
-              sleep 2
-            done
-            echo "worker did not become ready"
-            tail -n 100 "$RUNNER_TEMP/e2e-worker.log"
-            return 1
-          }
-
-          wait_for api http://127.0.0.1:8000/api/v1/health "$RUNNER_TEMP/e2e-api.log"
-          wait_for frontend http://localhost:5173/ "$RUNNER_TEMP/e2e-frontend.log"
-          wait_for_worker
+          API_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_API_ACCESS_KEY_ID }}
+          API_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_API_SECRET_ACCESS_KEY }}
+          WORKER_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_WORKER_ACCESS_KEY_ID }}
+          WORKER_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_WORKER_SECRET_ACCESS_KEY }}
+        run: bash app/scripts/start-e2e-compose.sh
 
       - name: Run E2E tests
         working-directory: app/frontend
@@ -313,18 +213,8 @@ jobs:
 
       - name: Show E2E runtime logs
         if: ${{ failure() }}
-        run: |
-          tail -n 100 "$RUNNER_TEMP/e2e-api.log" || true
-          tail -n 100 "$RUNNER_TEMP/e2e-frontend.log" || true
-          tail -n 100 "$RUNNER_TEMP/e2e-worker.log" || true
+        run: docker compose -f app/compose.yaml logs --no-color --tail 100 || true
 
       - name: Stop E2E runtime
         if: ${{ always() }}
-        run: |
-          for service in api frontend worker; do
-            pid_file="$RUNNER_TEMP/e2e-${service}.pid"
-            if [ -f "$pid_file" ]; then
-              kill "$(cat "$pid_file")" 2>/dev/null || true
-            fi
-          done
-          docker compose -f app/compose.yaml down --volumes || true
+        run: docker compose -f app/compose.yaml down --volumes --remove-orphans || true

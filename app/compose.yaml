@@ -20,6 +20,94 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  migrate:
+    image: migrate/migrate:v4.19.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend/api/internal/persistence/migrations:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=${COMPOSE_DATABASE_URL:-postgres://streaming_video:streaming_video_dev_password@postgres:5432/streaming_video?sslmode=disable}
+      - up
+    restart: "no"
+
+  api:
+    build:
+      context: ./backend/api
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
+      DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgres://streaming_video:streaming_video_dev_password@postgres:5432/streaming_video?sslmode=disable}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${API_AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${API_AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${API_AWS_SESSION_TOKEN:-}
+      AWS_EC2_METADATA_DISABLED: "true"
+      VIDEO_INPUT_BUCKET: ${VIDEO_INPUT_BUCKET:-}
+      VIDEO_OUTPUT_BUCKET: ${VIDEO_OUTPUT_BUCKET:-}
+      OUTPUT_S3_ENDPOINT: ${OUTPUT_S3_ENDPOINT:-}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+    ports:
+      - "${API_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - http://127.0.0.1:8080/api/v1/health
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend/worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgres://streaming_video:streaming_video_dev_password@postgres:5432/streaming_video?sslmode=disable}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${WORKER_AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${WORKER_AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${WORKER_AWS_SESSION_TOKEN:-}
+      AWS_EC2_METADATA_DISABLED: "true"
+      VIDEO_ENCODING_QUEUE_URL: ${VIDEO_ENCODING_QUEUE_URL:-}
+      VIDEO_INPUT_BUCKET: ${VIDEO_INPUT_BUCKET:-}
+      VIDEO_OUTPUT_BUCKET: ${VIDEO_OUTPUT_BUCKET:-}
+      FFMPEG_PATH: /usr/local/bin/ffmpeg
+      TMPDIR: /tmp/video-worker
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080/api/v1}
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
 volumes:
   postgres_data:
     name: streaming-video-postgres-data
