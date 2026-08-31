@@ -25,6 +25,26 @@ EXPECTED_API_EXAMPLES = {
     "get-playback-response.json",
     "playback-not-ready-response.json",
 }
+RELIABILITY_CONTRACT = "reliability-conventions.md"
+RELIABILITY_REQUIRED_SECTIONS = (
+    "## Lease fields and attempt accounting",
+    "## Atomic ownership operations",
+    "## Outcomes and SQS decisions",
+    "## Timing and crash recovery",
+)
+RELIABILITY_REQUIRED_TERMS = (
+    "worker_id",
+    "attempt",
+    "lease_expires_at",
+    "PROCESSING -> QUEUED",
+    "index.m3u8",
+    "contracts/examples/s3/object-created.json",
+    "heartbeat_interval",
+    "visibility_extension_interval",
+    "lease_duration",
+    "retry_delay",
+    "max_attempts",
+)
 
 
 class ContractError(RuntimeError):
@@ -266,6 +286,45 @@ def validate_storage_example(
         raise ContractError("playback manifest URL violates the HLS output key convention")
 
 
+def validate_reliability_contract(contracts_dir: Path, api: dict[str, Any]) -> None:
+    reliability_path = contracts_dir / "domain" / RELIABILITY_CONTRACT
+    try:
+        reliability_text = reliability_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ContractError(f"missing reliability contract: {reliability_path}") from exc
+
+    missing_sections = [
+        section for section in RELIABILITY_REQUIRED_SECTIONS if section not in reliability_text
+    ]
+    if missing_sections:
+        raise ContractError(
+            "reliability contract is missing sections: " + ", ".join(missing_sections)
+        )
+    missing_terms = [term for term in RELIABILITY_REQUIRED_TERMS if term not in reliability_text]
+    if missing_terms:
+        raise ContractError(
+            "reliability contract is missing required semantics: " + ", ".join(missing_terms)
+        )
+
+    if "never returned by the Phase 1 OpenAPI responses" not in reliability_text:
+        raise ContractError("reliability fields must remain outside the Phase 1 API contract")
+    if "heartbeat_interval < lease_duration" not in reliability_text:
+        raise ContractError("reliability timing relationships are incomplete")
+    if "Upload segments first and `index.m3u8` last" not in reliability_text:
+        raise ContractError("reliability contract must preserve manifest-last publication")
+
+    statuses = "UPLOADING, `QUEUED`, `PROCESSING`,\n`COMPLETED`, and `FAILED`"
+    if statuses not in reliability_text:
+        raise ContractError("reliability contract must preserve the Phase 1 status set")
+    key_pattern = api["components"]["schemas"]["StorageObject"]["properties"]["key"]["pattern"]
+    if "videos/{video_id}/jobs/{job_id}/hls/index.m3u8" not in reliability_text:
+        raise ContractError("reliability contract must preserve the canonical HLS manifest key")
+    if "`COMPLETED` is persisted\nonly after manifest publication" not in reliability_text:
+        raise ContractError("reliability contract must preserve completion ordering")
+    if key_pattern and "videos/" not in key_pattern:
+        raise ContractError("StorageObject key convention is unexpectedly absent")
+
+
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
     contracts_dir = repo_root / "app" / "contracts"
@@ -283,6 +342,7 @@ def main() -> int:
     referenced_examples, validators = validate_openapi_examples(api, api_path, job_status_schema)
     validate_failure_semantics(validators["Job"])
     validate_storage_example(contracts_dir, api, examples_dir)
+    validate_reliability_contract(contracts_dir, api)
 
     print(
         f"contracts valid: {len(referenced_examples)} API examples, "
