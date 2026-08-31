@@ -72,6 +72,9 @@ name: Agent Execute
 
 on:
   push:
+    branches:
+      - 'dev*'
+      - 'dev/**'
     paths:
       - "specs/tasks/**/*.md"
   workflow_dispatch:

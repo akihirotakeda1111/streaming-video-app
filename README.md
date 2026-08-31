@@ -129,7 +129,7 @@ Runtime execution stateは `.agent/state/*.json` に保存できる設計です�
 
 ### Agent Execute
 
-[`.github/workflows/agent-execute.yml`](./.github/workflows/agent-execute.yml) は `specs/tasks/**/*.md` へのpushで起動します。
+[`.github/workflows/agent-execute.yml`](./.github/workflows/agent-execute.yml) は `dev` で始まるブランチの `specs/tasks/**/*.md` へのpushで起動します。
 
 ```text
 Task Spec push
@@ -143,9 +143,13 @@ Task Spec push
 
 Frontend、Go API、Rust Worker、E2Eに必要なtoolchainは、Task Specの `allowed_paths` に応じて設定されます。E2E対象Specでは、実AWSのS3/SQSとローカルCompose runtimeを起動します。
 
+### Agent Review
+
+[`.github/workflows/agent-review.yml`](./.github/workflows/agent-review.yml) はCodeRabbitの完了イベントで起動し、prepare段階でPull Requestのベースブランチが `dev` で始まることを確認します。
+
 ### Merge Tests
 
-[`.github/workflows/merge-tests.yml`](./.github/workflows/merge-tests.yml) は `main` / `dev` の `app/**` 変更時、またはmanual dispatchで実行されます。
+[`.github/workflows/merge-tests.yml`](./.github/workflows/merge-tests.yml) は `main` または `dev` で始まるブランチの `app/**` 変更時、またはmanual dispatchで実行されます。
 
 - Frontend: dependency install、unit tests、build
 - Go API: `go test ./...`

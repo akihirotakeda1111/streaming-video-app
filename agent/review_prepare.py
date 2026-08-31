@@ -25,6 +25,8 @@ from agent.spec import (
     parse_spec_text,
 )
 
+_REVIEW_BASE_BRANCH_PREFIX = "dev"
+
 
 @dataclass(frozen=True)
 class ReviewPrepareResult:
@@ -307,6 +309,17 @@ def prepare_review(
             spec_path=spec_path,
             reason="pull request does not match the work-unit marker",
         )
+    if not _is_allowed_review_base_branch(spec.base_branch):
+        return skip(
+            pull_number=number,
+            head_sha=head_sha,
+            spec_id=spec.id,
+            spec_path=spec_path,
+            reason=(
+                f"pull request base branch {spec.base_branch!r} is not prefixed with "
+                f"{_REVIEW_BASE_BRANCH_PREFIX!r}"
+            ),
+        )
     return ReviewPrepareResult(
         should_review=True,
         pull_number=number,
@@ -322,6 +335,10 @@ def _same_commit_sha(left: str, right: str) -> bool:
     first = left.strip().lower()
     second = right.strip().lower()
     return bool(first) and first == second
+
+
+def _is_allowed_review_base_branch(base_branch: str) -> bool:
+    return base_branch.startswith(_REVIEW_BASE_BRANCH_PREFIX)
 
 
 def _unique_pull_numbers(value: Any) -> list[int]:

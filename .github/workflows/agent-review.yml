@@ -17,6 +17,8 @@
 # Security:
 # - pull_request_target is forbidden.
 # - Fork pull requests are skipped (API re-check in prepare).
+# - check_run/status do not support branch filters. Prepare accepts only Pull
+#   Requests targeting a branch whose name starts with dev.
 # - persist-credentials: false on every checkout.
 # - Classifier and Codex secrets are injected only on the orchestrator step.
 # - Codex never receives REVIEW_CLASSIFIER_API_KEY, GITHUB_TOKEN, or AGENT_PR_PAT.
@@ -116,7 +118,7 @@ jobs:
       - name: Install orchestrator
         run: python -m pip install -e .
 
-      - name: Gate CodeRabbit event
+      - name: Gate CodeRabbit event and base branch
         id: gate
         env:
           GITHUB_TOKEN: ${{ github.token }}

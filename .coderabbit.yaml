@@ -19,10 +19,10 @@ reviews:
     auto_pause_after_reviewed_commits: 5
     # Orchestrator create_pull does not set draft; GitHub default is ready.
     drafts: false
-    # Official: empty list is default-branch only; extra patterns extend it.
-    # e2e/phase7-.* is the isolated Phase 7 Real GitHub E2E base.
+    # Official: empty list is default-branch only; regex patterns extend it.
+    # Include every base branch whose name starts with dev.
     base_branches:
-      - "dev"
+      - "^dev.*"
   review_status: true
   review_progress: true
   # Explicit for dual-transport observation. review_progress publishes Checks;
