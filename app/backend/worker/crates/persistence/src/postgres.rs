@@ -147,42 +147,73 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
         })
     }
 
-    async fn acquire_lease(&mut self, job_id: &str, worker_id: &str, lease_seconds: u64) -> Result<JobOperationOutcome, PersistenceError> {
+    async fn acquire_lease(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_attempts: u32,
+    ) -> Result<JobOperationOutcome, PersistenceError> {
         let changed = self.database.execute(
-            "UPDATE jobs SET status = 'PROCESSING', worker_id = $2, lease_expires_at = NOW() + ($3::text || ' seconds')::interval, attempt = attempt + 1, updated_at = NOW() WHERE id = $1::text::uuid AND (status = 'QUEUED' OR (status = 'PROCESSING' AND lease_expires_at <= NOW())) AND (worker_id IS NULL OR lease_expires_at <= NOW())",
-            &[job_id, worker_id, &lease_seconds.to_string()],
+            "UPDATE jobs SET status = 'PROCESSING', worker_id = $3, lease_expires_at = NOW() + ($4::text || ' seconds')::interval, attempt = attempt + 1, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND status IN ('QUEUED', 'PROCESSING') AND attempt < $5::text::int AND ((worker_id IS NULL AND lease_expires_at IS NULL) OR lease_expires_at <= NOW())",
+            &[job_id, video_id, worker_id, &lease_seconds.to_string(), &max_attempts.to_string()],
         ).await.map_err(map_error)?;
         atomic_outcome(changed)
     }
 
-    async fn renew_lease(&mut self, job_id: &str, worker_id: &str, lease_seconds: u64) -> Result<JobOperationOutcome, PersistenceError> {
+    async fn renew_lease(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+    ) -> Result<JobOperationOutcome, PersistenceError> {
         let changed = self.database.execute(
-            "UPDATE jobs SET lease_expires_at = NOW() + ($3::text || ' seconds')::interval, updated_at = NOW() WHERE id = $1::text::uuid AND status = 'PROCESSING' AND worker_id = $2 AND lease_expires_at > NOW()",
-            &[job_id, worker_id, &lease_seconds.to_string()],
+            "UPDATE jobs SET lease_expires_at = NOW() + ($4::text || ' seconds')::interval, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND worker_id = $3 AND status = 'PROCESSING' AND lease_expires_at > NOW()",
+            &[job_id, video_id, worker_id, &lease_seconds.to_string()],
         ).await.map_err(map_error)?;
         atomic_outcome(changed)
     }
 
-    async fn release_for_retry(&mut self, job_id: &str, worker_id: &str) -> Result<JobOperationOutcome, PersistenceError> {
+    async fn release_for_retry(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        max_attempts: u32,
+    ) -> Result<JobOperationOutcome, PersistenceError> {
         let changed = self.database.execute(
-            "UPDATE jobs SET status = 'QUEUED', worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND status = 'PROCESSING' AND worker_id = $2",
-            &[job_id, worker_id],
+            "UPDATE jobs SET status = 'QUEUED', worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND worker_id = $3 AND status = 'PROCESSING' AND lease_expires_at > NOW() AND attempt < $4::text::int",
+            &[job_id, video_id, worker_id, &max_attempts.to_string()],
         ).await.map_err(map_error)?;
         atomic_outcome(changed)
     }
 
-    async fn complete(&mut self, job_id: &str, worker_id: &str) -> Result<JobOperationOutcome, PersistenceError> {
+    async fn complete(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+    ) -> Result<JobOperationOutcome, PersistenceError> {
         let changed = self.database.execute(
-            "UPDATE jobs SET status = 'COMPLETED', worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND status = 'PROCESSING' AND worker_id = $2",
-            &[job_id, worker_id],
+            "UPDATE jobs SET status = 'COMPLETED', worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND worker_id = $3 AND status = 'PROCESSING' AND lease_expires_at > NOW()",
+            &[job_id, video_id, worker_id],
         ).await.map_err(map_error)?;
         atomic_outcome(changed)
     }
 
-    async fn fail(&mut self, job_id: &str, worker_id: &str, reason: &str) -> Result<JobOperationOutcome, PersistenceError> {
+    async fn fail(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        reason: &str,
+        max_attempts: u32,
+    ) -> Result<JobOperationOutcome, PersistenceError> {
         let changed = self.database.execute(
-            "UPDATE jobs SET status = 'FAILED', worker_id = NULL, lease_expires_at = NULL, failure_code = 'ENCODING_FAILED', failure_message = $3, updated_at = NOW() WHERE id = $1::text::uuid AND status = 'PROCESSING' AND worker_id = $2",
-            &[job_id, worker_id, reason],
+            "UPDATE jobs SET status = 'FAILED', worker_id = NULL, lease_expires_at = NULL, failure_code = 'ENCODING_FAILED', failure_message = $4, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND worker_id = $3 AND status = 'PROCESSING' AND lease_expires_at > NOW() AND attempt >= $5::text::int AND $4 <> ''",
+            &[job_id, video_id, worker_id, reason, &max_attempts.to_string()],
         ).await.map_err(map_error)?;
         atomic_outcome(changed)
     }
@@ -219,6 +250,7 @@ mod tests {
     use super::*;
 
     struct FakeDatabase {
+        statements: Vec<String>,
         parameters: Vec<Vec<String>>,
         changed: u64,
     }
@@ -226,6 +258,7 @@ mod tests {
     impl Default for FakeDatabase {
         fn default() -> Self {
             Self {
+                statements: Vec::new(),
                 parameters: Vec::new(),
                 changed: 1,
             }
@@ -235,10 +268,11 @@ mod tests {
     impl Database for FakeDatabase {
         fn execute(
             &mut self,
-            _statement: &str,
+            statement: &str,
             parameters: &[&str],
         ) -> impl Future<Output = Result<u64, tokio_postgres::Error>> + Send {
             let result = {
+                self.statements.push(statement.to_owned());
                 self.parameters
                     .push(parameters.iter().map(|value| (*value).to_owned()).collect());
                 Ok(self.changed)
@@ -312,5 +346,97 @@ mod tests {
         assert!(jobs.mark_processing("job-id").await.is_err());
         assert!(jobs.mark_completed("job-id").await.is_err());
         assert!(jobs.mark_failed("job-id", "ffmpeg exited").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn lease_operations_bind_canonical_ids_and_attempt_budget() {
+        let mut jobs = jobs();
+        assert_eq!(
+            jobs.acquire_lease("job-id", "video-id", "worker-a", 30, 3)
+                .await
+                .unwrap(),
+            JobOperationOutcome::Applied
+        );
+        assert_eq!(
+            jobs.renew_lease("job-id", "video-id", "worker-a", 30)
+                .await
+                .unwrap(),
+            JobOperationOutcome::Applied
+        );
+        assert_eq!(
+            jobs.release_for_retry("job-id", "video-id", "worker-a", 3)
+                .await
+                .unwrap(),
+            JobOperationOutcome::Applied
+        );
+        assert_eq!(
+            jobs.complete("job-id", "video-id", "worker-a")
+                .await
+                .unwrap(),
+            JobOperationOutcome::Applied
+        );
+        assert_eq!(
+            jobs.fail("job-id", "video-id", "worker-a", "ffmpeg exited", 3)
+                .await
+                .unwrap(),
+            JobOperationOutcome::Applied
+        );
+
+        assert_eq!(
+            jobs.database.parameters[0],
+            ["job-id", "video-id", "worker-a", "30", "3"]
+        );
+        assert_eq!(
+            jobs.database.parameters[1],
+            ["job-id", "video-id", "worker-a", "30"]
+        );
+        assert_eq!(
+            jobs.database.parameters[2],
+            ["job-id", "video-id", "worker-a", "3"]
+        );
+        assert_eq!(jobs.database.parameters[3], ["job-id", "video-id", "worker-a"]);
+        assert_eq!(
+            jobs.database.parameters[4],
+            ["job-id", "video-id", "worker-a", "ffmpeg exited", "3"]
+        );
+
+        let acquire = &jobs.database.statements[0];
+        assert!(acquire.contains("video_id = $2::text::uuid"));
+        assert!(acquire.contains("attempt < $5::text::int"));
+        assert!(acquire.contains("worker_id IS NULL AND lease_expires_at IS NULL"));
+        assert!(acquire.contains("status IN ('QUEUED', 'PROCESSING')"));
+
+        assert!(jobs.database.statements[1].contains("lease_expires_at > NOW()"));
+        assert!(jobs.database.statements[2].contains("lease_expires_at > NOW()"));
+        assert!(jobs.database.statements[2].contains("attempt < $4::text::int"));
+        assert!(jobs.database.statements[3].contains("lease_expires_at > NOW()"));
+        assert!(jobs.database.statements[4].contains("lease_expires_at > NOW()"));
+        assert!(jobs.database.statements[4].contains("attempt >= $5::text::int"));
+    }
+
+    #[tokio::test]
+    async fn zero_row_lease_operation_is_not_owner() {
+        let mut jobs = PostgresJobState::new(FakeDatabase {
+            changed: 0,
+            ..FakeDatabase::default()
+        });
+        assert_eq!(
+            jobs.acquire_lease("job-id", "video-id", "worker-a", 30, 3)
+                .await
+                .unwrap(),
+            JobOperationOutcome::NotOwner
+        );
+        assert_eq!(
+            jobs.complete("job-id", "video-id", "worker-a")
+                .await
+                .unwrap(),
+            JobOperationOutcome::NotOwner
+        );
+        assert_eq!(
+            jobs.fail("job-id", "video-id", "worker-a", "ffmpeg exited", 3)
+                .await
+                .unwrap(),
+            JobOperationOutcome::NotOwner
+        );
     }
 }
