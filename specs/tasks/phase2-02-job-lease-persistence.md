@@ -3,7 +3,7 @@ schema_version: 1
 id: phase2-job-lease-persistence
 title: Phase 2 Job Lease Persistence
 status: PENDING
-base_branch: dev
+base_branch: dev/phase2
 target_branch: feature/phase2-job-lease-persistence
 
 allowed_paths:
