@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the Phase 1 API, examples, and storage contract as one contract set."""
+"""Validate the shared API, storage, and reliability contract set."""
 
 from __future__ import annotations
 
@@ -25,6 +25,15 @@ EXPECTED_API_EXAMPLES = {
     "get-playback-response.json",
     "playback-not-ready-response.json",
 }
+EXPECTED_INTERNAL_FIELDS = ["worker_id", "attempt", "lease_expires_at"]
+FORBIDDEN_PUBLIC_FIELDS = {
+    "worker_id",
+    "workerId",
+    "attempt",
+    "lease_expires_at",
+    "leaseExpiresAt",
+}
+CANONICAL_SOURCE_KEY = "videos/{video_id}/jobs/{job_id}/source.mp4"
 
 
 class ContractError(RuntimeError):
@@ -43,6 +52,24 @@ def load_yaml(path: Path) -> Any:
         return yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise ContractError(f"cannot load YAML {path}: {exc}") from exc
+
+
+def load_markdown_contract(path: Path) -> tuple[dict[str, Any], str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ContractError(f"cannot load reliability contract {path}: {exc}") from exc
+
+    match = re.match(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", text, re.DOTALL)
+    if match is None:
+        raise ContractError("reliability-contract.md must start with YAML metadata")
+    try:
+        metadata = yaml.safe_load(match.group(1))
+    except yaml.YAMLError as exc:
+        raise ContractError(f"invalid reliability contract metadata: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise ContractError("reliability contract metadata must be an object")
+    return metadata, text[match.end() :]
 
 
 def rewrite_refs(value: Any) -> Any:
@@ -195,6 +222,15 @@ def validate_storage_example(
 ) -> None:
     storage_path = contracts_dir / "domain" / "storage-conventions.md"
     storage_text = storage_path.read_text(encoding="utf-8")
+    normalized_storage = re.sub(r"\s+", " ", storage_text)
+    if "Upload segments first and `index.m3u8` last." not in normalized_storage:
+        raise ContractError("storage contract must preserve manifest-last publication")
+    if (
+        "Set the job to `COMPLETED` only after all referenced objects have been "
+        "uploaded successfully."
+        not in normalized_storage
+    ):
+        raise ContractError("storage contract must complete only after publication")
     s3_path = contracts_dir / "examples" / "s3" / "object-created.json"
     if "contracts/examples/s3/object-created.json" not in storage_text:
         raise ContractError("storage-conventions.md must reference the S3 example")
@@ -266,6 +302,85 @@ def validate_storage_example(
         raise ContractError("playback manifest URL violates the HLS output key convention")
 
 
+def canonical_source_key_pattern(api: dict[str, Any]) -> str:
+    canonical_uuid = api["components"]["schemas"]["CanonicalUuid"]["pattern"]
+    id_capture = canonical_uuid.removeprefix("^").removesuffix("$")
+    return rf"^videos/{id_capture}/jobs/{id_capture}/source\.mp4$"
+
+
+def validate_reliability_contract(contracts_dir: Path, api: dict[str, Any]) -> None:
+    reliability_path = contracts_dir / "domain" / "reliability-conventions.md"
+    metadata, body = load_markdown_contract(reliability_path)
+
+    if metadata.get("contract_version") != 1:
+        raise ContractError("reliability contract must use contract_version 1")
+    if metadata.get("contract_id") != "phase2-reliability":
+        raise ContractError("reliability contract has an unexpected contract_id")
+
+    expected_references = {
+        "status_schema": contracts_dir / "domain" / "job-status.schema.json",
+        "storage_contract": contracts_dir / "domain" / "storage-conventions.md",
+        "s3_event_fixture": contracts_dir / "examples" / "s3" / "object-created.json",
+    }
+    for field, expected_path in expected_references.items():
+        reference = metadata.get(field)
+        if not isinstance(reference, str):
+            raise ContractError(f"reliability contract is missing {field}")
+        actual_path = (reliability_path.parent / reference).resolve()
+        if actual_path != expected_path.resolve() or not actual_path.is_file():
+            raise ContractError(f"reliability contract {field} must reference {expected_path.name}")
+
+    if metadata.get("internal_fields") != EXPECTED_INTERNAL_FIELDS:
+        raise ContractError("reliability contract must define the three Phase 2 lease fields")
+    if metadata.get("public_api_exposes_internal_fields") is not False:
+        raise ContractError("reliability fields must remain internal")
+
+    publication = metadata.get("publication")
+    if publication != {
+        "manifest_name": "index.m3u8",
+        "segments_before_manifest": True,
+        "completed_after_manifest": True,
+    }:
+        raise ContractError("reliability publication metadata contradicts manifest-last ordering")
+
+    component_schemas = api.get("components", {}).get("schemas", {})
+    public_property_names: set[str] = set()
+
+    def collect_property_names(value: Any) -> None:
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                public_property_names.update(properties)
+            for item in value.values():
+                collect_property_names(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect_property_names(item)
+
+    collect_property_names(component_schemas)
+    exposed_fields = FORBIDDEN_PUBLIC_FIELDS & public_property_names
+    if exposed_fields:
+        raise ContractError(
+            "OpenAPI exposes internal reliability fields: "
+            + ", ".join(sorted(exposed_fields))
+        )
+
+    key_pattern = api["components"]["schemas"]["StorageObject"]["properties"]["key"]["pattern"]
+    expected_source_pattern = canonical_source_key_pattern(api)
+    if key_pattern != expected_source_pattern:
+        raise ContractError(
+            "StorageObject.key.pattern must equal the canonical source object key "
+            f"{CANONICAL_SOURCE_KEY}"
+        )
+    if (
+        "multi-record notification is acknowledged only when every record is durably"
+        not in body
+    ):
+        raise ContractError(
+            "reliability contract must aggregate SQS acknowledgement across S3 Records"
+        )
+
+
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
     contracts_dir = repo_root / "app" / "contracts"
@@ -283,10 +398,11 @@ def main() -> int:
     referenced_examples, validators = validate_openapi_examples(api, api_path, job_status_schema)
     validate_failure_semantics(validators["Job"])
     validate_storage_example(contracts_dir, api, examples_dir)
+    validate_reliability_contract(contracts_dir, api)
 
     print(
         f"contracts valid: {len(referenced_examples)} API examples, "
-        "1 S3 event example, and FAILED/failure semantics"
+        "1 S3 event example, FAILED/failure semantics, and Phase 2 reliability"
     )
     return 0
 
