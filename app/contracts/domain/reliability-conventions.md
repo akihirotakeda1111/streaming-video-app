@@ -1,154 +1,265 @@
-# Phase 2 reliability conventions
+---
+contract_version: 1
+contract_id: phase2-reliability
+status_schema: job-status.schema.json
+storage_contract: storage-conventions.md
+s3_event_fixture: ../examples/s3/object-created.json
+internal_fields:
+  - worker_id
+  - attempt
+  - lease_expires_at
+public_api_exposes_internal_fields: false
+publication:
+  manifest_name: index.m3u8
+  segments_before_manifest: true
+  completed_after_manifest: true
+---
 
-This document is the source of truth for processing ownership, retries, SQS
-acknowledgement, and publication. It extends the Phase 1 contracts without
-changing the public API, the status schema, the S3 event fixture, or storage
-keys. `worker_id`, `attempt`, and `lease_expires_at` are database-only fields;
-they are never returned by the Phase 1 OpenAPI responses.
+# Phase 2 reliability contract
 
-## Lease fields and attempt accounting
+This document is the source of truth for Phase 2 worker reliability. It extends
+the Phase 1 contracts named in the metadata above; it does not replace or widen
+the browser-facing API, the standard S3 notification, or the storage layout.
 
-Each job has:
+The authoritative public statuses remain `UPLOADING`, `QUEUED`, `PROCESSING`,
+`COMPLETED`, and `FAILED`. The reliability fields below are database and worker
+implementation details. They MUST NOT be added to OpenAPI responses, examples,
+custom queue events, or playback data.
 
-| Field | Semantics |
+## Lease fields and ownership
+
+Each job has the following internal fields in addition to its Phase 1 fields:
+
+| Field | Contract |
 | --- | --- |
-| `worker_id` | Nullable opaque worker owner. It is set on acquisition and compared on every owned mutation. |
-| `attempt` | Non-negative integer budget counter. Acquisition of an expired or newly queued job increments it exactly once; renewals and retries do not. |
-| `lease_expires_at` | Nullable UTC timestamp. Ownership is valid only while it is greater than the database current time. It is set to `current_time + lease_duration` on acquisition and renewal. |
+| `worker_id` | Nullable, non-empty opaque identifier for the worker that owns the current processing attempt. It is not an authentication credential. |
+| `attempt` | Non-negative integer initialized to `0`. One successful lease acquisition increments it exactly once; claims, busy deliveries, heartbeats, releases, and acknowledgements do not increment it. It never decreases. |
+| `lease_expires_at` | Nullable UTC database timestamp. A lease is active only while `lease_expires_at > CURRENT_TIMESTAMP`; equality is expired. Database time, not a worker clock, decides ownership. |
 
-The first `UPLOADING -> QUEUED` conditional claim from the Phase 1 storage
-contract remains the first ownership boundary. Processing ownership begins
-when a worker acquires a lease for `QUEUED` work. A job in `COMPLETED` is
-immutable. A final `FAILED` job is not reacquired.
+An unowned job has both `worker_id` and `lease_expires_at` set to `NULL`. An
+owned job has both set. Only the matching `worker_id` with an unexpired lease
+may renew or release the lease, publish more output, persist `COMPLETED`, or
+persist terminal `FAILED`. A zero-row conditional update means ownership was
+not obtained or was lost; the worker MUST stop processing that job and MUST NOT
+perform a terminal state change.
 
-## Atomic ownership operations
+`COMPLETED` is immutable. No acquisition or state-changing statement has
+`COMPLETED` in its eligible statuses.
 
-Every statement below is one transactionally atomic conditional update. The
-worker proceeds only when exactly one row is affected. `now` means the database
-current timestamp, and `worker_id` is the caller's stable identity.
+## Event gate and atomic acquisition
 
-Acquire a new or recovered job, incrementing `attempt` exactly once:
+Workers continue to accept only the standard S3 `ObjectCreated:*` shape in
+`../examples/s3/object-created.json`, the configured input bucket, and the exact
+`videos/{video_id}/jobs/{job_id}/source.mp4` key from
+`storage-conventions.md`. The Phase 1 conditional claim remains the first
+ownership boundary for a newly uploaded job:
 
 ```sql
 UPDATE jobs
-SET status = 'PROCESSING', worker_id = $worker_id,
+SET status = 'QUEUED',
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1
+  AND video_id = $2
+  AND status = 'UPLOADING';
+```
+
+Whether this claim affects one row or the event is a redelivery, processing may
+start only after the worker obtains the separate lease below. A zero-row Phase
+1 claim never authorizes work by itself.
+
+Lease acquisition is one conditional update. It acquires an unowned `QUEUED`
+job or replaces an expired owner of a `QUEUED` or `PROCESSING` job, changes the
+job to `PROCESSING`, and consumes one attempt:
+
+```sql
+UPDATE jobs
+SET status = 'PROCESSING',
+    worker_id = $3,
+    lease_expires_at = CURRENT_TIMESTAMP + $4::interval,
     attempt = attempt + 1,
-    lease_expires_at = now + $lease_duration,
-    updated_at = now
-WHERE id = $job_id
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1
+  AND video_id = $2
   AND status IN ('QUEUED', 'PROCESSING')
-  AND (lease_expires_at IS NULL OR lease_expires_at <= now);
+  AND attempt < $5
+  AND (
+        (worker_id IS NULL AND lease_expires_at IS NULL)
+        OR lease_expires_at <= CURRENT_TIMESTAMP
+      )
+RETURNING attempt, lease_expires_at;
 ```
 
-An expired `PROCESSING` lease is therefore recoverable by the same acquisition
-operation and does not increment `attempt` twice. Implementations may instead
-make it `QUEUED` in the same transaction, but the status and lease predicates
-remain mandatory. An unexpired `QUEUED` or `PROCESSING` lease is busy and
-cannot be acquired by another worker.
+`$3` is the new `worker_id`, `$4` is the configured lease duration, and `$5` is
+the configured maximum attempts. Exactly one returned row means acquired. This
+single statement is the only operation that increments `attempt`. An active
+lease is busy even when the status is `QUEUED`; an expired lease on either
+`QUEUED` or `PROCESSING` is recoverable. Reacquisition restarts processing from
+the canonical source object and may overwrite deterministic output keys.
 
-Renew only the current, unexpired owner before expiry:
+## Owner-only updates
+
+Every owner update uses the job IDs, current `worker_id`, eligible status, and
+an unexpired lease in the same SQL statement. Implementations may return more
+columns, but MUST preserve these predicates.
+
+### Renewal
 
 ```sql
 UPDATE jobs
-SET lease_expires_at = now + $lease_duration, updated_at = now
-WHERE id = $job_id AND worker_id = $worker_id
-  AND status = 'PROCESSING' AND lease_expires_at > now;
+SET lease_expires_at = CURRENT_TIMESTAMP + $4::interval,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1
+  AND video_id = $2
+  AND worker_id = $3
+  AND status = 'PROCESSING'
+  AND lease_expires_at > CURRENT_TIMESTAMP;
 ```
 
-Release an owned retryable failure back to `QUEUED`, without public failure
-details or an attempt increment:
+Renewal does not change `status` or `attempt`. A late renewal cannot revive an
+expired lease.
+
+### Retry release
+
+A processing failure while `attempt < maximum_attempts` is retryable. The
+current owner releases it with:
 
 ```sql
 UPDATE jobs
-SET status = 'QUEUED', worker_id = NULL, lease_expires_at = NULL,
-    failure = NULL, updated_at = now
-WHERE id = $job_id AND worker_id = $worker_id
-  AND status = 'PROCESSING' AND lease_expires_at > now
-  AND attempt < $max_attempts;
+SET status = 'QUEUED',
+    worker_id = NULL,
+    lease_expires_at = NULL,
+    failure_code = NULL,
+    failure_message = NULL,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1
+  AND video_id = $2
+  AND worker_id = $3
+  AND status = 'PROCESSING'
+  AND lease_expires_at > CURRENT_TIMESTAMP
+  AND attempt < $4;
 ```
 
-Complete only the current unexpired owner, and only after the manifest has
-been uploaded last and verified published:
+This owned retry release is the only permitted `PROCESSING -> QUEUED`
+transition. It exposes no failure details through the API. After a successful
+release, the worker requests the configured bounded retry visibility delay and
+does not delete the SQS message.
+
+### Completion
 
 ```sql
 UPDATE jobs
-SET status = 'COMPLETED', worker_id = NULL, lease_expires_at = NULL,
-    updated_at = now
-WHERE id = $job_id AND worker_id = $worker_id
-  AND status = 'PROCESSING' AND lease_expires_at > now;
+SET status = 'COMPLETED',
+    worker_id = NULL,
+    lease_expires_at = NULL,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1
+  AND video_id = $2
+  AND worker_id = $3
+  AND status = 'PROCESSING'
+  AND lease_expires_at > CURRENT_TIMESTAMP;
 ```
 
-Write terminal failure only for the current unexpired owner whose attempt
-budget is exhausted; failure details are required and non-empty:
+This update is attempted only after every referenced segment and then
+`index.m3u8` have been uploaded successfully. One updated row is durable
+completion; zero rows is ownership loss, not success.
+
+### Exhausted terminal failure
+
+An owned processing failure at `attempt >= maximum_attempts` is terminal. Both
+failure values are non-empty and become the existing public `failure` object:
 
 ```sql
 UPDATE jobs
-SET status = 'FAILED', worker_id = NULL, lease_expires_at = NULL,
-    failure = $failure, updated_at = now
-WHERE id = $job_id AND worker_id = $worker_id
-  AND status = 'PROCESSING' AND lease_expires_at > now
-  AND attempt >= $max_attempts;
+SET status = 'FAILED',
+    worker_id = NULL,
+    lease_expires_at = NULL,
+    failure_code = $4,
+    failure_message = $5,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1
+  AND video_id = $2
+  AND worker_id = $3
+  AND status = 'PROCESSING'
+  AND lease_expires_at > CURRENT_TIMESTAMP
+  AND attempt >= $6
+  AND $4 <> ''
+  AND $5 <> '';
 ```
 
-`PROCESSING -> QUEUED` is permitted only for an owned retryable failure.
-Expired `PROCESSING` work is recovered and may be reacquired; an expired
-owner may not complete or finally fail it. Loss of lease or SQS visibility
-ownership stops publication and terminal state changes.
+Only an exhausted owned attempt writes `FAILED`. Invalid events, unknown jobs,
+busy deliveries, expired owners, and retryable failures do not write terminal
+failure details.
 
-## Outcomes and SQS decisions
+## SQS outcome and acknowledgement table
 
-The worker deletes (acknowledges) an SQS message only when the event has been
-handled as a deliberate no-work outcome. Otherwise it leaves the message for
-visibility timeout and source-queue redrive; the worker does not produce a
-DLQ message.
+Deleting the received SQS message is the acknowledgement. The worker deletes a
+message only after every S3 `Records` item in that message has a durable
+`COMPLETED` outcome, including already-completed redelivery. Not deleting it is
+a failed delivery for queue purposes; the source queue visibility timeout and
+redrive policy decide when it is retried or isolated. The worker never sends a
+message directly to a DLQ.
 
-| Situation | Database/work result | Acknowledge? |
-| --- | --- | --- |
-| Acquired | Lease acquired and processing runs under the current `worker_id`. | Yes after the owned outcome is durable. |
-| Busy/unexpired | Another valid lease owns the job; do no work. | No; redelivery may retry after visibility timeout. |
-| Completed | Durable `COMPLETED` is immutable; do no download, FFmpeg, or upload. | Yes; acknowledge-only redelivery. |
-| Failed | Final `FAILED` with non-empty failure details is immutable. | No; source redrive isolates the message. |
-| Invalid/unknown | Invalid event or unknown canonical job is not successful work. | No; allow source redrive. |
-| Retryable failure | Current owner releases to `QUEUED`, clears public failure details, and applies bounded retry delay. | Yes after release is durable. |
-| Exhausted failure | Current owner writes terminal `FAILED` with non-empty failure details. | No; source redrive may isolate it. |
-| Post-completion delete failure | `COMPLETED` remains durable and immutable even if SQS delete fails. | Retry delete/redelivery; redelivery is acknowledge-only. |
+| Outcome | Worker action | Database result | Delete message? |
+| --- | --- | --- | --- |
+| Acquired | Download, encode, heartbeat, and publish only while ownership remains valid. | `PROCESSING`, new owner, `attempt + 1`. | Not yet; decide from the eventual outcome. |
+| Busy / unexpired | Do no download, FFmpeg, upload, release, or terminal update. | No change. | No. Allow redelivery/redrive. |
+| Already `COMPLETED` | Perform no download, FFmpeg, or upload. | No change; `COMPLETED` is immutable. | Yes. |
+| Final `FAILED` | Perform no processing or state change. | No change. | No. Allow redrive isolation. |
+| Invalid event or unknown canonical job | Perform no processing or state change. | No change. | No. Allow redrive isolation. |
+| Retryable owned failure | Conditionally release to `QUEUED`, then request the configured retry delay. | Owner and lease cleared; no public failure details. | No. |
+| Exhausted owned failure | Conditionally write `FAILED` with non-empty failure details. | Terminal `FAILED`; owner and lease cleared. | No. Allow redrive isolation. |
+| Delete failure after durable completion | Do not roll back completion or repeat work. On redelivery, take the already-`COMPLETED` path. | Remains `COMPLETED`. | Retry deletion on redelivery. |
 
-An active lease, final `FAILED` job, invalid event, and unknown canonical job
-are not acknowledged as successful work. A message may therefore be isolated
-by the source queue's redrive policy.
+A failed DeleteMessage call never changes the durable outcome. In particular,
+redelivery after durable completion exists only to acknowledge the message. A
+multi-record notification is acknowledged only when every record is durably
+`COMPLETED` or already `COMPLETED`; any busy, retryable, invalid, unknown, or
+final-failed record keeps the message unacknowledged.
 
-## Timing and crash recovery
+## Heartbeats and bounded configuration
 
-The deployment configures positive bounded values for `heartbeat_interval`,
-`visibility_extension_interval`, `lease_duration`, `retry_delay`, and
-`max_attempts`. They must satisfy these relationships:
+Let `H` be the heartbeat interval, `V` the visibility extension measured from a
+successful SQS extension, `L` the database lease duration measured from a
+successful renewal, `R` the retry delay, and `A` the maximum attempts. They are
+deployment configuration, not constants in this contract. Startup validation
+must enforce:
 
 ```text
-heartbeat_interval < lease_duration
-visibility_extension_interval < SQS_visibility_timeout
-heartbeat_interval <= visibility_extension_interval
-retry_delay <= configured maximum retry delay
-attempt <= max_attempts
+0 < H < min(V, L)
+0 < R <= the queue service's supported per-message visibility bound
+1 <= A <= an implementation-defined finite safety bound
 ```
 
-Heartbeats renew both SQS visibility and the database lease periodically, with
-bounded intervals and enough margin for one delayed heartbeat. Losing either
-signal stops publication and completion/final-failure updates. Retry delay and
-maximum attempts are configurable and bounded; deployment values must not be
-hard-coded here.
+`H` must leave a configured operational safety margin before both `V` and `L`
+expire. `V` and `L` may differ; each must independently exceed `H`. `R` starts
+only after the database lease has been released, so it need not be ordered
+relative to `L`; it is bounded separately. Queue redrive `maxReceiveCount` is
+configured with `A` so repeated non-acknowledged deliveries are eventually
+isolated, but queue receives do not change the database `attempt` counter.
 
-If a worker crashes, the SQS message becomes visible again and an expired
-`QUEUED` or `PROCESSING` lease can be recovered by another worker. Partial HLS
-objects are unpublished and deterministic keys may be overwritten by the next
-valid lease owner. Upload segments first and `index.m3u8` last. `COMPLETED` is persisted
-only after manifest publication; incomplete attempts never become playable.
+During owned work, each heartbeat cycle extends SQS visibility and renews the
+database lease. The cycle is successful only when both operations succeed. If
+either operation fails or cannot finish before its deadline, the worker marks
+local ownership lost, cancels download/FFmpeg where possible, publishes no more
+objects, and performs no release, completion, or terminal failure update.
 
-## Unchanged Phase 1 references
+## Crash recovery and publication
 
-The standard fixture remains `contracts/examples/s3/object-created.json`.
-The authoritative statuses remain UPLOADING, `QUEUED`, `PROCESSING`,
-`COMPLETED`, and `FAILED`. The Phase 1 status set is UPLOADING, `QUEUED`, `PROCESSING`,
-`COMPLETED`, and `FAILED`. The OpenAPI response shape remains unchanged, and
-the HLS manifest remains
-`videos/{video_id}/jobs/{job_id}/hls/index.m3u8` with the manifest uploaded
-last.
+- A crash before the Phase 1 claim leaves `UPLOADING`; a redelivery may claim it.
+- A crash after the claim but before acquisition leaves an unowned `QUEUED` job;
+  a redelivery may acquire it.
+- A crash after acquisition leaves a lease that another worker may replace only
+  after expiry and while `attempt < A`. The new acquisition increments once.
+- If a final attempt crashes rather than reporting a failure, no non-owner may
+  fabricate `FAILED` or exceed `A`; the message remains unacknowledged for source
+  queue redrive isolation.
+- A crash after durable `COMPLETED` but before message deletion is handled as an
+  already-completed redelivery and never repeats media work.
+
+All attempts use the unchanged HLS prefix and deterministic segment names in
+`storage-conventions.md`. Partial segments and manifests do not make a job
+playable through the API. A valid owner may overwrite partial deterministic
+objects left by an older attempt. It uploads all segments first and
+`index.m3u8` last, then conditionally persists `COMPLETED`. Loss of either
+heartbeat signal stops further publication and terminal state changes. The
+playback API exposes the manifest only from durable `COMPLETED` state.
