@@ -4,7 +4,7 @@ use std::future::Future;
 
 use tokio_postgres::{Client, NoTls, types::ToSql};
 
-use crate::{JobState, PersistenceError};
+use crate::{JobClaimOutcome, JobOperationOutcome, JobState, PersistenceError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobStatus {
@@ -137,6 +137,62 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
             &[JobStatus::Failed.as_contract_value(), "ENCODING_FAILED", reason, job_id],
         ).await.map_err(map_error)?;
         require_one(changed)
+    }
+
+    async fn claim_upload(&mut self, job_id: &str, video_id: &str) -> Result<JobClaimOutcome, PersistenceError> {
+        Ok(if self.claim(job_id, video_id).await? {
+            JobClaimOutcome::Claimed
+        } else {
+            JobClaimOutcome::NotClaimed
+        })
+    }
+
+    async fn acquire_lease(&mut self, job_id: &str, worker_id: &str, lease_seconds: u64) -> Result<JobOperationOutcome, PersistenceError> {
+        let changed = self.database.execute(
+            "UPDATE jobs SET status = 'PROCESSING', worker_id = $2, lease_expires_at = NOW() + ($3::text || ' seconds')::interval, attempt = attempt + 1, updated_at = NOW() WHERE id = $1::text::uuid AND (status = 'QUEUED' OR (status = 'PROCESSING' AND lease_expires_at <= NOW())) AND (worker_id IS NULL OR lease_expires_at <= NOW())",
+            &[job_id, worker_id, &lease_seconds.to_string()],
+        ).await.map_err(map_error)?;
+        atomic_outcome(changed)
+    }
+
+    async fn renew_lease(&mut self, job_id: &str, worker_id: &str, lease_seconds: u64) -> Result<JobOperationOutcome, PersistenceError> {
+        let changed = self.database.execute(
+            "UPDATE jobs SET lease_expires_at = NOW() + ($3::text || ' seconds')::interval, updated_at = NOW() WHERE id = $1::text::uuid AND status = 'PROCESSING' AND worker_id = $2 AND lease_expires_at > NOW()",
+            &[job_id, worker_id, &lease_seconds.to_string()],
+        ).await.map_err(map_error)?;
+        atomic_outcome(changed)
+    }
+
+    async fn release_for_retry(&mut self, job_id: &str, worker_id: &str) -> Result<JobOperationOutcome, PersistenceError> {
+        let changed = self.database.execute(
+            "UPDATE jobs SET status = 'QUEUED', worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND status = 'PROCESSING' AND worker_id = $2",
+            &[job_id, worker_id],
+        ).await.map_err(map_error)?;
+        atomic_outcome(changed)
+    }
+
+    async fn complete(&mut self, job_id: &str, worker_id: &str) -> Result<JobOperationOutcome, PersistenceError> {
+        let changed = self.database.execute(
+            "UPDATE jobs SET status = 'COMPLETED', worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND status = 'PROCESSING' AND worker_id = $2",
+            &[job_id, worker_id],
+        ).await.map_err(map_error)?;
+        atomic_outcome(changed)
+    }
+
+    async fn fail(&mut self, job_id: &str, worker_id: &str, reason: &str) -> Result<JobOperationOutcome, PersistenceError> {
+        let changed = self.database.execute(
+            "UPDATE jobs SET status = 'FAILED', worker_id = NULL, lease_expires_at = NULL, failure_code = 'ENCODING_FAILED', failure_message = $3, updated_at = NOW() WHERE id = $1::text::uuid AND status = 'PROCESSING' AND worker_id = $2",
+            &[job_id, worker_id, reason],
+        ).await.map_err(map_error)?;
+        atomic_outcome(changed)
+    }
+}
+
+fn atomic_outcome(changed: u64) -> Result<JobOperationOutcome, PersistenceError> {
+    match changed {
+        0 => Ok(JobOperationOutcome::NotOwner),
+        1 => Ok(JobOperationOutcome::Applied),
+        count => Err(PersistenceError(format!("updated {count} jobs; expected one"))),
     }
 }
 

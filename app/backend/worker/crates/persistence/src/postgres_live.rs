@@ -15,6 +15,9 @@ use crate::PersistenceError;
 
 const SCHEMA_SQL: &str =
     include_str!("../../../../api/internal/persistence/migrations/0001_phase1_schema.up.sql");
+const LEASE_SCHEMA_SQL: &str = include_str!(
+    "../../../../api/internal/persistence/migrations/0002_job_lease_persistence.up.sql"
+);
 const DEFAULT_URL: &str = "postgres://streaming_video:streaming_video_dev_password@localhost:5432/streaming_video?sslmode=disable";
 const VIDEO_ID: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910a";
 const JOB_ID: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd67";
@@ -116,6 +119,14 @@ async fn setup() -> Option<Live> {
         if !statement.is_empty() {
             admin.execute(statement, &[]).await.unwrap_or_else(|error| {
                 panic!("apply schema statement {statement:?}: {error}");
+            });
+        }
+    }
+    for statement in LEASE_SCHEMA_SQL.split(';') {
+        let statement = statement.trim();
+        if !statement.is_empty() {
+            admin.execute(statement, &[]).await.unwrap_or_else(|error| {
+                panic!("apply lease schema statement {statement:?}: {error}");
             });
         }
     }
