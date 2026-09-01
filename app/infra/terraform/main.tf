@@ -73,6 +73,7 @@ data "aws_iam_policy_document" "worker_local_execution" {
     sid    = "AllowQueueConsumption"
     effect = "Allow"
     actions = [
+      "sqs:ChangeMessageVisibility",
       "sqs:ReceiveMessage",
       "sqs:DeleteMessage",
       "sqs:GetQueueAttributes",
@@ -123,7 +124,72 @@ resource "aws_s3_bucket" "video_output" {
 }
 
 resource "aws_sqs_queue" "video_encoding" {
-  name = "${local.name_prefix}-encoding"
+  name                       = "${local.name_prefix}-encoding"
+  visibility_timeout_seconds = var.source_visibility_timeout_seconds
+  sqs_managed_sse_enabled    = true
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.video_encoding_dlq.arn
+    maxReceiveCount     = var.queue_max_receive_count
+  })
+
+  lifecycle {
+    precondition {
+      condition     = var.queue_max_receive_count == var.worker_maximum_attempts
+      error_message = "queue_max_receive_count must equal worker_maximum_attempts."
+    }
+    precondition {
+      condition     = var.worker_heartbeat_interval_seconds < var.worker_visibility_extension_seconds && var.worker_heartbeat_interval_seconds < var.worker_lease_duration_seconds && var.worker_heartbeat_interval_seconds < var.source_visibility_timeout_seconds
+      error_message = "The worker heartbeat must be shorter than visibility, lease, and source queue timeouts."
+    }
+  }
+}
+
+resource "aws_sqs_queue" "video_encoding_dlq" {
+  name                    = "${local.name_prefix}-encoding-dlq"
+  sqs_managed_sse_enabled = true
+}
+
+resource "aws_cloudwatch_metric_alarm" "video_encoding_oldest_message" {
+  alarm_name          = "${local.name_prefix}-encoding-oldest-message"
+  alarm_description   = "Source encoding queue has an old message."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateAgeOfOldestMessage"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = var.source_oldest_message_age_alarm_seconds
+  treat_missing_data  = "notBreaching"
+  dimensions          = { QueueName = aws_sqs_queue.video_encoding.name }
+}
+
+resource "aws_cloudwatch_metric_alarm" "video_encoding_visible_messages" {
+  alarm_name          = "${local.name_prefix}-encoding-visible-messages"
+  alarm_description   = "Source encoding queue backlog is growing."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = var.source_visible_messages_alarm_threshold
+  treat_missing_data  = "notBreaching"
+  dimensions          = { QueueName = aws_sqs_queue.video_encoding.name }
+}
+
+resource "aws_cloudwatch_metric_alarm" "video_encoding_dlq_visible_messages" {
+  alarm_name          = "${local.name_prefix}-encoding-dlq-visible-messages"
+  alarm_description   = "Encoding DLQ contains visible messages."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = var.dlq_visible_messages_alarm_threshold
+  treat_missing_data  = "notBreaching"
+  dimensions          = { QueueName = aws_sqs_queue.video_encoding_dlq.name }
 }
 
 resource "aws_iam_user" "api_local_execution" {
