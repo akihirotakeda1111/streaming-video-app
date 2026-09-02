@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Statically validate the Phase 1 Terraform architecture contract.
+"""Statically validate the Terraform architecture contracts.
 
 This validator deliberately does not invoke Terraform, contact AWS, install providers,
 or evaluate HCL expressions. It checks only the structural and security properties that
@@ -24,7 +24,6 @@ FORBIDDEN_RESOURCE_PREFIXES = (
     "aws_appautoscaling_",
     "aws_autoscaling_",
     "aws_cloudfront_",
-    "aws_cloudwatch_",
     "aws_db_",
     "aws_dynamodb_",
     "aws_ec2_",
@@ -340,14 +339,6 @@ def check_forbidden_resources(config: Configuration, checks: Checks) -> None:
             f"{block.location}: resource {block.type_name} is outside Phase 1 scope",
         )
 
-        if block.type_name == "aws_sqs_queue":
-            checks.reject(
-                _has(block.body, "redrive_policy")
-                or _has(block.body, "redrive_allow_policy")
-                or _has(block.body, "dead_letter"),
-                f"{block.location}: DLQ/redrive configuration is outside Phase 1 scope",
-            )
-
 
 def _bucket_reference(block: Block) -> set[str]:
     return _resource_references(block.body, "aws_s3_bucket")
@@ -625,6 +616,7 @@ def check_iam_separation(
         "s3:getobject",
         "s3:putobject",
         "sqs:deletemessage",
+        "sqs:changemessagevisibility",
         "sqs:getqueueattributes",
         "sqs:getqueueurl",
         "sqs:receivemessage",
@@ -745,25 +737,16 @@ def check_dangerous_configuration(config: Configuration, checks: Checks) -> None
 
         if block.type_name in POLICY_RESOURCE_TYPES:
             policy = _policy_text(config, block)
-            checks.reject(
-                _has_wildcard_action(policy),
-                f"{block.location}: wildcard IAM actions are forbidden",
-            )
-            checks.reject(
-                _has_wildcard_resource(policy),
-                f"{block.location}: wildcard IAM resources are forbidden",
-            )
+            checks.reject(_has_wildcard_action(policy), f"{block.location}: wildcard IAM actions are forbidden")
+            checks.reject(_has_wildcard_resource(policy), f"{block.location}: wildcard IAM resources are forbidden")
             if _has_public_principal(policy):
-                actions = _policy_actions(policy)
                 checks.reject(
-                    bool(actions & WRITE_ACTIONS),
+                    bool(_policy_actions(policy) & WRITE_ACTIONS),
                     f"{block.location}: unauthenticated S3 write/delete access is forbidden",
                 )
 
     provider_blocks = [
-        block
-        for block in config.blocks
-        if block.kind == "provider" and block.type_name == "aws"
+        block for block in config.blocks if block.kind == "provider" and block.type_name == "aws"
     ]
     for block in provider_blocks:
         for name in ("access_key", "secret_key", "token"):
@@ -775,23 +758,235 @@ def check_dangerous_configuration(config: Configuration, checks: Checks) -> None
     scanned_files = list(config.files) + sorted(config.root.glob("*.tfvars*"))
     for path in scanned_files:
         text = path.read_text(encoding="utf-8")
+        checks.reject(re.search(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", text) is not None, f"{path.name}: possible AWS access key is committed")
+        checks.reject("-----BEGIN " in text and " PRIVATE KEY-----" in text, f"{path.name}: private key material is committed")
         checks.reject(
-            re.search(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", text) is not None,
-            f"{path.name}: possible AWS access key is committed",
-        )
-        checks.reject(
-            "-----BEGIN " in text and " PRIVATE KEY-----" in text,
-            f"{path.name}: private key material is committed",
-        )
-        checks.reject(
-            re.search(
-                r'(?im)^\s*(?:aws_)?(?:secret_access_key|access_key|password|token)\s*=\s*"[^"$]+"',
-                text,
-            )
-            is not None,
+            re.search(r'(?im)^\s*(?:aws_)?(?:secret_access_key|access_key|password|token)\s*=\s*"[^"$]+"', text) is not None,
             f"{path.name}: credential or secret appears to be hard-coded",
         )
 
+
+def _var_reference(expression: str | None) -> str | None:
+    if expression is None:
+        return None
+    match = re.fullmatch(r"var\.([A-Za-z_][A-Za-z0-9_-]*)", expression.strip())
+    return match.group(1) if match else None
+
+
+def _variable_blocks(config: Configuration) -> dict[str, Block]:
+    return {
+        (block.name or block.type_name): block
+        for block in config.blocks
+        if block.kind == "variable"
+    }
+
+
+def _integer_default(block: Block) -> int | None:
+    raw = _attribute(block.body, "default")
+    if raw is None or re.fullmatch(r"-?\d+", raw.strip()) is None:
+        return None
+    return int(raw.strip())
+
+
+def _requires_whole_number(block: Block) -> bool:
+    name = block.name or block.type_name
+    compact = re.sub(r"\s+", "", block.body)
+    return f"floor(var.{name})" in compact
+
+
+def _bounded_by_sqs_visibility(block: Block) -> bool:
+    return re.search(r"<=\s*43200", block.body) is not None
+
+
+def _alarm_covers_metric(alarm: Block, metric: str, queue_name: str) -> bool:
+    metric_name = _attribute(alarm.body, "metric_name")
+    if metric_name is None or metric_name.strip().strip('"') != metric:
+        return False
+    dimensions = _attribute(alarm.body, "dimensions") or ""
+    if "QueueName" not in dimensions:
+        return False
+    return _resource_references(dimensions, "aws_sqs_queue") == {queue_name}
+
+
+def check_reliability(
+    config: Configuration,
+    checks: Checks,
+    input_name: str | None,
+    output_name: str | None,
+) -> None:
+    """Check Phase 2 queue relationships without evaluating Terraform or AWS."""
+    queues = _named_blocks(config, "resource", "aws_sqs_queue")
+    notifications = config.resources("aws_s3_bucket_notification")
+    source_names = {
+        name
+        for notification in notifications
+        if "s3:ObjectCreated:*" in _strings(notification.body)
+        for name in _resource_references(notification.body, "aws_sqs_queue")
+    }
+    source_names &= set(queues)
+    checks.require(bool(source_names), "reliability validation requires an S3 source queue")
+    checks.require(
+        len(queues) == 2,
+        "reliability validation requires exactly one source queue and one DLQ",
+    )
+    source_name = next(iter(source_names), None)
+    dlq_names = set(queues) - source_names
+    checks.require(len(dlq_names) == 1, "exactly one DLQ must accompany the source queue")
+    dlq_name = next(iter(dlq_names), None)
+
+    if source_name is not None:
+        source = queues[source_name]
+        checks.require(
+            _attribute(source.body, "visibility_timeout_seconds") is not None,
+            f"{source.location}: source visibility timeout must be explicit",
+        )
+        checks.require(
+            _has(source.body, "redrive_policy")
+            and dlq_name is not None
+            and dlq_name in _resource_references(source.body, "aws_sqs_queue"),
+            f"{source.location}: source queue must redrive to the declared DLQ",
+        )
+        checks.require(
+            _attribute_is_true(source.body, "sqs_managed_sse_enabled")
+            or _attribute(source.body, "kms_master_key_id") is not None,
+            f"{source.location}: source queue encryption is required",
+        )
+
+    if dlq_name is not None:
+        dlq = queues[dlq_name]
+        checks.require(
+            _attribute_is_true(dlq.body, "sqs_managed_sse_enabled")
+            or _attribute(dlq.body, "kms_master_key_id") is not None,
+            f"{dlq.location}: DLQ encryption is required",
+        )
+
+    variables = _variable_blocks(config)
+    defaults = {
+        name: default
+        for name, block in variables.items()
+        if (default := _integer_default(block)) is not None
+    }
+    source_body = queues[source_name].body if source_name is not None else ""
+    visibility_var = _var_reference(_attribute(source_body, "visibility_timeout_seconds"))
+    receive_matches = re.findall(
+        r"maxReceiveCount\s*=\s*var\.([A-Za-z_][A-Za-z0-9_-]*)",
+        source_body,
+    )
+    receive_var = receive_matches[0] if receive_matches else None
+    attempts_var = None
+    for left, right in re.findall(
+        r"var\.([A-Za-z_][A-Za-z0-9_-]*)\s*==\s*var\.([A-Za-z_][A-Za-z0-9_-]*)",
+        source_body,
+    ):
+        if receive_var == left and right != left:
+            attempts_var = right
+            break
+        if receive_var == right and left != right:
+            attempts_var = left
+            break
+
+    checks.require(receive_var is not None, "queue maxReceiveCount must be configurable")
+    checks.require(attempts_var is not None, "worker maximum attempts must be configurable")
+    if receive_var is not None and attempts_var is not None:
+        receive_block = variables.get(receive_var)
+        attempts_block = variables.get(attempts_var)
+        checks.require(
+            receive_block is not None and _requires_whole_number(receive_block),
+            "queue maxReceiveCount must be constrained to a whole number",
+        )
+        checks.require(
+            attempts_block is not None and _requires_whole_number(attempts_block),
+            "worker maximum attempts must be constrained to a whole number",
+        )
+        max_receive = defaults.get(receive_var)
+        max_attempts = defaults.get(attempts_var)
+        checks.require(
+            max_receive is not None
+            and max_attempts is not None
+            and max_receive == max_attempts
+            and 1 <= max_receive <= 10,
+            "queue maxReceiveCount must equal worker maximum attempts and stay in the MVP range 1..10",
+        )
+
+    greater_than: dict[str, set[str]] = {}
+    for left, right in re.findall(
+        r"var\.([A-Za-z_][A-Za-z0-9_-]*)\s*<\s*var\.([A-Za-z_][A-Za-z0-9_-]*)",
+        source_body,
+    ):
+        greater_than.setdefault(left, set()).add(right)
+
+    heartbeat_var = None
+    duration_vars: set[str] = set()
+    if visibility_var is not None:
+        for left, rights in greater_than.items():
+            if visibility_var in rights and len(rights) >= 3:
+                heartbeat_var = left
+                duration_vars = rights - {visibility_var}
+                break
+
+    checks.require(
+        heartbeat_var is not None and len(duration_vars) == 2,
+        "worker heartbeat must be shorter than visibility extension, lease duration, and source timeout",
+    )
+
+    excluded = {heartbeat_var, visibility_var, receive_var, attempts_var, *duration_vars}
+    retry_var = next(
+        (
+            name
+            for name, block in variables.items()
+            if name not in excluded and _bounded_by_sqs_visibility(block) and name in defaults
+        ),
+        None,
+    )
+    heartbeat = defaults.get(heartbeat_var) if heartbeat_var else None
+    visibility = defaults.get(visibility_var) if visibility_var else None
+    durations = [defaults.get(name) for name in duration_vars]
+    retry = defaults.get(retry_var) if retry_var else None
+    checks.require(
+        heartbeat is not None
+        and visibility is not None
+        and retry is not None
+        and all(value is not None for value in durations)
+        and 0 < heartbeat < min(value for value in durations if value is not None)
+        and 0 < heartbeat < visibility
+        and 0 < retry <= 43200,
+        "worker heartbeat, visibility extension, lease, and retry settings violate reliability timing bounds",
+    )
+
+    alarms = config.resources("aws_cloudwatch_metric_alarm")
+    checks.require(bool(alarms), "CloudWatch reliability alarms are required")
+    for metric, queue_name in (
+        ("ApproximateAgeOfOldestMessage", source_name),
+        ("ApproximateNumberOfMessagesVisible", source_name),
+        ("ApproximateNumberOfMessagesVisible", dlq_name),
+    ):
+        checks.require(
+            queue_name is not None
+            and any(_alarm_covers_metric(alarm, metric, queue_name) for alarm in alarms),
+            f"an alarm for {metric} must cover the expected queue",
+        )
+
+    worker_policies = [
+        block
+        for block in config.resources()
+        if block.type_name in {"aws_iam_policy", "aws_iam_role_policy", "aws_iam_user_policy"}
+    ]
+    visibility_policies = [
+        (block, _policy_text(config, block))
+        for block in worker_policies
+        if "sqs:changemessagevisibility" in _policy_actions(_policy_text(config, block))
+    ]
+    checks.require(bool(visibility_policies), "worker policy must allow ChangeMessageVisibility")
+    for block, policy in visibility_policies:
+        refs = _resource_references(policy, "aws_sqs_queue")
+        checks.require(
+            source_name is not None and refs == {source_name},
+            f"{block.location}: ChangeMessageVisibility must target only the source queue",
+        )
+        checks.reject(
+            bool(_policy_actions(policy) & {"sqs:sendmessage", "sqs:purgequeue"}),
+            f"{block.location}: worker policy must not send to the DLQ or purge queues",
+        )
 
 def validate(config: Configuration, stage: str) -> list[str]:
     checks = Checks()
@@ -801,8 +996,12 @@ def validate(config: Configuration, stage: str) -> list[str]:
 
     input_name: str | None = None
     output_name: str | None = None
-    if stage in {"storage-queue", "complete"}:
+    if stage in {"storage-queue", "reliability", "complete"}:
         input_name, output_name = check_storage_queue(config, checks)
+    if stage == "reliability":
+        check_iam_separation(config, checks, input_name, output_name)
+        check_outputs(config, checks, input_name, output_name)
+        check_reliability(config, checks, input_name, output_name)
     if stage == "complete":
         check_iam_separation(config, checks, input_name, output_name)
         check_outputs(config, checks, input_name, output_name)
@@ -820,7 +1019,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("foundation", "storage-queue", "complete"),
+        choices=("foundation", "storage-queue", "reliability", "complete"),
         default="complete",
         help="Task completion stage to validate (default: complete)",
     )
