@@ -113,8 +113,8 @@ variable "worker_maximum_attempts" {
   description = "Maximum worker attempts; MVP safety bound is 1 through 10."
   default     = 5
   validation {
-    condition     = var.worker_maximum_attempts >= 1 && var.worker_maximum_attempts <= 10
-    error_message = "worker_maximum_attempts must be between 1 and 10."
+    condition     = var.worker_maximum_attempts >= 1 && var.worker_maximum_attempts <= 10 && var.worker_maximum_attempts == floor(var.worker_maximum_attempts)
+    error_message = "worker_maximum_attempts must be a whole number between 1 and 10."
   }
 }
 
@@ -123,8 +123,8 @@ variable "queue_max_receive_count" {
   description = "SQS redrive receive count; MVP safety bound is 1 through 10."
   default     = 5
   validation {
-    condition     = var.queue_max_receive_count >= 1 && var.queue_max_receive_count <= 10
-    error_message = "queue_max_receive_count must be between 1 and 10."
+    condition     = var.queue_max_receive_count >= 1 && var.queue_max_receive_count <= 10 && var.queue_max_receive_count == floor(var.queue_max_receive_count)
+    error_message = "queue_max_receive_count must be a whole number between 1 and 10."
   }
 }
 
