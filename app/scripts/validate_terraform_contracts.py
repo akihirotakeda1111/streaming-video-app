@@ -766,17 +766,46 @@ def check_dangerous_configuration(config: Configuration, checks: Checks) -> None
         )
 
 
-def _variable_defaults(config: Configuration) -> dict[str, int]:
-    defaults: dict[str, int] = {}
-    for variable in config.blocks:
-        if variable.kind != "variable":
-            continue
-        variable_name = variable.name or variable.type_name
-        try:
-            defaults[variable_name] = int(_attribute(variable.body, "default") or "")
-        except ValueError:
-            continue
-    return defaults
+def _var_reference(expression: str | None) -> str | None:
+    if expression is None:
+        return None
+    match = re.fullmatch(r"var\.([A-Za-z_][A-Za-z0-9_-]*)", expression.strip())
+    return match.group(1) if match else None
+
+
+def _variable_blocks(config: Configuration) -> dict[str, Block]:
+    return {
+        (block.name or block.type_name): block
+        for block in config.blocks
+        if block.kind == "variable"
+    }
+
+
+def _integer_default(block: Block) -> int | None:
+    raw = _attribute(block.body, "default")
+    if raw is None or re.fullmatch(r"-?\d+", raw.strip()) is None:
+        return None
+    return int(raw.strip())
+
+
+def _requires_whole_number(block: Block) -> bool:
+    name = block.name or block.type_name
+    compact = re.sub(r"\s+", "", block.body)
+    return f"floor(var.{name})" in compact
+
+
+def _bounded_by_sqs_visibility(block: Block) -> bool:
+    return re.search(r"<=\s*43200", block.body) is not None
+
+
+def _alarm_covers_metric(alarm: Block, metric: str, queue_name: str) -> bool:
+    metric_name = _attribute(alarm.body, "metric_name")
+    if metric_name is None or metric_name.strip().strip('"') != metric:
+        return False
+    dimensions = _attribute(alarm.body, "dimensions") or ""
+    if "QueueName" not in dimensions:
+        return False
+    return _resource_references(dimensions, "aws_sqs_queue") == {queue_name}
 
 
 def check_reliability(
@@ -831,41 +860,95 @@ def check_reliability(
             f"{dlq.location}: DLQ encryption is required",
         )
 
-    defaults = _variable_defaults(config)
-    redrive_variables = (
-        re.findall(r"maxReceiveCount\s*=\s*var\.([A-Za-z_][A-Za-z0-9_-]*)", config.text)
+    variables = _variable_blocks(config)
+    defaults = {
+        name: default
+        for name, block in variables.items()
+        if (default := _integer_default(block)) is not None
+    }
+    source_body = queues[source_name].body if source_name is not None else ""
+    visibility_var = _var_reference(_attribute(source_body, "visibility_timeout_seconds"))
+    receive_matches = re.findall(
+        r"maxReceiveCount\s*=\s*var\.([A-Za-z_][A-Za-z0-9_-]*)",
+        source_body,
     )
-    attempt_variables = re.findall(
+    receive_var = receive_matches[0] if receive_matches else None
+    attempts_var = None
+    for left, right in re.findall(
         r"var\.([A-Za-z_][A-Za-z0-9_-]*)\s*==\s*var\.([A-Za-z_][A-Za-z0-9_-]*)",
-        config.text,
-    )
-    max_receive = defaults.get(redrive_variables[0]) if redrive_variables else None
-    max_attempts = next(
-        (defaults.get(name) for pair in attempt_variables for name in pair if name != (redrive_variables[0] if redrive_variables else "") and name in defaults),
-        None,
-    )
-    checks.require(max_receive is not None, "queue maxReceiveCount must be configurable")
-    checks.require(max_attempts is not None, "worker maximum attempts must be configurable")
-    if max_receive is not None and max_attempts is not None:
+        source_body,
+    ):
+        if receive_var == left and right != left:
+            attempts_var = right
+            break
+        if receive_var == right and left != right:
+            attempts_var = left
+            break
+
+    checks.require(receive_var is not None, "queue maxReceiveCount must be configurable")
+    checks.require(attempts_var is not None, "worker maximum attempts must be configurable")
+    if receive_var is not None and attempts_var is not None:
+        receive_block = variables.get(receive_var)
+        attempts_block = variables.get(attempts_var)
         checks.require(
-            max_receive == max_attempts and 1 <= max_receive <= 10,
+            receive_block is not None and _requires_whole_number(receive_block),
+            "queue maxReceiveCount must be constrained to a whole number",
+        )
+        checks.require(
+            attempts_block is not None and _requires_whole_number(attempts_block),
+            "worker maximum attempts must be constrained to a whole number",
+        )
+        max_receive = defaults.get(receive_var)
+        max_attempts = defaults.get(attempts_var)
+        checks.require(
+            max_receive is not None
+            and max_attempts is not None
+            and max_receive == max_attempts
+            and 1 <= max_receive <= 10,
             "queue maxReceiveCount must equal worker maximum attempts and stay in the MVP range 1..10",
         )
 
-    timing_values = [value for name, value in defaults.items() if re.search(rf"\bvar\.{re.escape(name)}\b", config.text)]
-    heartbeat_candidates = [value for value in timing_values if value > 0]
-    timing = next(
-        ((h, v, l, r) for h in heartbeat_candidates for v in timing_values for l in timing_values for r in timing_values if 0 < h < min(v, l) and 0 < r <= 43200),
+    greater_than: dict[str, set[str]] = {}
+    for left, right in re.findall(
+        r"var\.([A-Za-z_][A-Za-z0-9_-]*)\s*<\s*var\.([A-Za-z_][A-Za-z0-9_-]*)",
+        source_body,
+    ):
+        greater_than.setdefault(left, set()).add(right)
+
+    heartbeat_var = None
+    duration_vars: set[str] = set()
+    if visibility_var is not None:
+        for left, rights in greater_than.items():
+            if visibility_var in rights and len(rights) >= 3:
+                heartbeat_var = left
+                duration_vars = rights - {visibility_var}
+                break
+
+    checks.require(
+        heartbeat_var is not None and len(duration_vars) == 2,
+        "worker heartbeat must be shorter than visibility extension, lease duration, and source timeout",
+    )
+
+    excluded = {heartbeat_var, visibility_var, receive_var, attempts_var, *duration_vars}
+    retry_var = next(
+        (
+            name
+            for name, block in variables.items()
+            if name not in excluded and _bounded_by_sqs_visibility(block) and name in defaults
+        ),
         None,
     )
-    heartbeat, extension, lease, retry = timing or (None, None, None, None)
+    heartbeat = defaults.get(heartbeat_var) if heartbeat_var else None
+    visibility = defaults.get(visibility_var) if visibility_var else None
+    durations = [defaults.get(name) for name in duration_vars]
+    retry = defaults.get(retry_var) if retry_var else None
     checks.require(
-        None not in (heartbeat, extension, lease, retry)
-        and heartbeat is not None
-        and extension is not None
-        and lease is not None
+        heartbeat is not None
+        and visibility is not None
         and retry is not None
-        and 0 < heartbeat < min(extension, lease)
+        and all(value is not None for value in durations)
+        and 0 < heartbeat < min(value for value in durations if value is not None)
+        and 0 < heartbeat < visibility
         and 0 < retry <= 43200,
         "worker heartbeat, visibility extension, lease, and retry settings violate reliability timing bounds",
     )
@@ -878,12 +961,8 @@ def check_reliability(
         ("ApproximateNumberOfMessagesVisible", dlq_name),
     ):
         checks.require(
-            any(
-                metric in _strings(alarm.body)
-                and queue_name is not None
-                and queue_name in _resource_references(alarm.body, "aws_sqs_queue")
-                for alarm in alarms
-            ),
+            queue_name is not None
+            and any(_alarm_covers_metric(alarm, metric, queue_name) for alarm in alarms),
             f"an alarm for {metric} must cover the expected queue",
         )
 
