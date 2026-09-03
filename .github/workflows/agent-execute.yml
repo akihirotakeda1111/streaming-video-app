@@ -279,6 +279,15 @@ jobs:
         if: ${{ always() && needs.parse-spec.outputs.e2e == 'true' }}
         run: docker compose -f app/compose.yaml down --volumes --remove-orphans || true
 
+      - name: Check artifact endpoint
+        run: |
+          echo "=== DNS ==="
+          getent hosts results-receiver.actions.githubusercontent.com || true
+
+          echo "=== HTTPS ==="
+          curl -v --connect-timeout 10 \
+            https://results-receiver.actions.githubusercontent.com/health || true
+
       - name: Upload work report
         id: upload-work-report
         if: ${{ !cancelled() }}
