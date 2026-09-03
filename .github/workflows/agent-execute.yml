@@ -253,7 +253,7 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
       - name: Bootstrap Codex sandbox
-        uses: openai/codex-action@v1
+        uses: openai/codex-action@v1.11
         with:
           openai-api-key: unused-bootstrap-placeholder
           sandbox: workspace-write
