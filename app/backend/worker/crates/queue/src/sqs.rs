@@ -2,7 +2,10 @@
 
 use std::{future::Future, time::Duration};
 
-use aws_sdk_sqs::{Client, types::MessageSystemAttributeName};
+use aws_sdk_sqs::{
+    Client,
+    types::{Message as AwsMessage, MessageSystemAttributeName},
+};
 
 use crate::{ChangeVisibility, Delete, Message, QueueError, Receive};
 
@@ -31,6 +34,27 @@ pub struct AwsSqsApi {
     client: Client,
 }
 
+fn normalize_received_message(message: AwsMessage) -> Result<Message, String> {
+    let receipt_handle = message
+        .receipt_handle
+        .filter(|handle| !handle.is_empty())
+        .ok_or_else(|| "received message has no receipt".to_string())?;
+    let receive_count = message
+        .attributes
+        .as_ref()
+        .and_then(|attributes| attributes.get(&MessageSystemAttributeName::ApproximateReceiveCount))
+        .ok_or_else(|| "received message has no delivery count".to_string())?
+        .parse::<u32>()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| "received message has invalid delivery count".to_string())?;
+    Ok(Message {
+        receipt_handle,
+        body: message.body.unwrap_or_default(),
+        receive_count,
+    })
+}
+
 impl SqsApi for AwsSqsApi {
     async fn receive(
         &mut self,
@@ -50,28 +74,7 @@ impl SqsApi for AwsSqsApi {
         response
             .messages
             .and_then(|messages| messages.into_iter().next())
-            .map(|message| {
-                let receipt_handle = message
-                    .receipt_handle
-                    .filter(|handle| !handle.is_empty())
-                    .ok_or_else(|| "received message has no receipt".to_string())?;
-                let receive_count = message
-                    .attributes
-                    .as_ref()
-                    .and_then(|attributes| {
-                        attributes.get(&MessageSystemAttributeName::ApproximateReceiveCount)
-                    })
-                    .ok_or_else(|| "received message has no delivery count".to_string())?
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|count| *count > 0)
-                    .ok_or_else(|| "received message has invalid delivery count".to_string())?;
-                Ok(Message {
-                    receipt_handle,
-                    body: message.body.unwrap_or_default(),
-                    receive_count,
-                })
-            })
+            .map(normalize_received_message)
             .transpose()
     }
 
@@ -171,6 +174,60 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn aws_message(receipt_handle: Option<&str>, receive_count: Option<&str>) -> AwsMessage {
+        let mut builder = AwsMessage::builder()
+            .body("body")
+            .set_receipt_handle(receipt_handle.map(str::to_owned));
+        if let Some(receive_count) = receive_count {
+            builder = builder.attributes(
+                MessageSystemAttributeName::ApproximateReceiveCount,
+                receive_count,
+            );
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn normalization_maps_valid_received_metadata() {
+        assert_eq!(
+            normalize_received_message(aws_message(Some("receipt"), Some("2"))).unwrap(),
+            Message {
+                receipt_handle: "receipt".into(),
+                body: "body".into(),
+                receive_count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn normalization_rejects_missing_or_empty_receipts() {
+        for receipt_handle in [None, Some("")] {
+            assert_eq!(
+                normalize_received_message(aws_message(receipt_handle, Some("1"))).unwrap_err(),
+                "received message has no receipt"
+            );
+        }
+    }
+
+    #[test]
+    fn normalization_rejects_missing_delivery_count() {
+        assert_eq!(
+            normalize_received_message(aws_message(Some("receipt"), None)).unwrap_err(),
+            "received message has no delivery count"
+        );
+    }
+
+    #[test]
+    fn normalization_rejects_malformed_zero_or_negative_delivery_counts() {
+        for receive_count in ["invalid", "0", "-1"] {
+            assert_eq!(
+                normalize_received_message(aws_message(Some("receipt"), Some(receive_count)))
+                    .unwrap_err(),
+                "received message has invalid delivery count"
+            );
+        }
+    }
+
     #[derive(Default)]
     struct FakeApi {
         calls: Vec<Vec<String>>,
@@ -256,14 +313,12 @@ mod tests {
 
         assert_eq!(
             queue.api.calls,
-            vec![
-                vec![
-                    "visibility".to_string(),
-                    "https://example.test/configured".to_string(),
-                    "current-receipt".to_string(),
-                    "90".to_string(),
-                ],
-            ]
+            vec![vec![
+                "visibility".to_string(),
+                "https://example.test/configured".to_string(),
+                "current-receipt".to_string(),
+                "90".to_string(),
+            ],]
         );
     }
 
@@ -274,14 +329,18 @@ mod tests {
             api: FakeApi::default(),
         };
 
-        assert!(queue
-            .change_visibility("", Duration::from_secs(1))
-            .await
-            .is_err());
-        assert!(queue
-            .change_visibility("receipt", Duration::from_secs(43_201))
-            .await
-            .is_err());
+        assert!(
+            queue
+                .change_visibility("", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            queue
+                .change_visibility("receipt", Duration::from_secs(43_201))
+                .await
+                .is_err()
+        );
         assert!(queue.api.calls.is_empty());
     }
 }
