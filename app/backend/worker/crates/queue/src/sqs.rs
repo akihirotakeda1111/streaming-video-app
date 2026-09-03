@@ -1,10 +1,12 @@
 //! Amazon SQS adapter using the configured region and queue URL.
 
-use std::future::Future;
+use std::{future::Future, time::Duration};
 
-use aws_sdk_sqs::Client;
+use aws_sdk_sqs::{Client, types::MessageSystemAttributeName};
 
-use crate::{Delete, Message, QueueError, Receive};
+use crate::{ChangeVisibility, Delete, Message, QueueError, Receive};
+
+const MAX_VISIBILITY_TIMEOUT_SECS: u64 = 43_200;
 
 trait SqsApi {
     fn receive(
@@ -16,6 +18,12 @@ trait SqsApi {
         &mut self,
         queue_url: &str,
         receipt_handle: &str,
+    ) -> impl Future<Output = Result<(), String>> + Send;
+    fn change_visibility(
+        &mut self,
+        queue_url: &str,
+        receipt_handle: &str,
+        visibility_timeout_secs: i32,
     ) -> impl Future<Output = Result<(), String>> + Send;
 }
 
@@ -35,16 +43,36 @@ impl SqsApi for AwsSqsApi {
             .queue_url(queue_url)
             .max_number_of_messages(1)
             .wait_time_seconds(wait_time_seconds)
+            .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
             .send()
             .await
-            .map_err(|error| error.to_string())?;
-        Ok(response
+            .map_err(|_| "receive request failed".to_string())?;
+        response
             .messages
             .and_then(|messages| messages.into_iter().next())
-            .map(|message| Message {
-                receipt_handle: message.receipt_handle.unwrap_or_default(),
-                body: message.body.unwrap_or_default(),
-            }))
+            .map(|message| {
+                let receipt_handle = message
+                    .receipt_handle
+                    .filter(|handle| !handle.is_empty())
+                    .ok_or_else(|| "received message has no receipt".to_string())?;
+                let receive_count = message
+                    .attributes
+                    .as_ref()
+                    .and_then(|attributes| {
+                        attributes.get(&MessageSystemAttributeName::ApproximateReceiveCount)
+                    })
+                    .ok_or_else(|| "received message has no delivery count".to_string())?
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|count| *count > 0)
+                    .ok_or_else(|| "received message has invalid delivery count".to_string())?;
+                Ok(Message {
+                    receipt_handle,
+                    body: message.body.unwrap_or_default(),
+                    receive_count,
+                })
+            })
+            .transpose()
     }
 
     async fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String> {
@@ -55,7 +83,24 @@ impl SqsApi for AwsSqsApi {
             .send()
             .await
             .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|_| "delete request failed".to_string())
+    }
+
+    async fn change_visibility(
+        &mut self,
+        queue_url: &str,
+        receipt_handle: &str,
+        visibility_timeout_secs: i32,
+    ) -> Result<(), String> {
+        self.client
+            .change_message_visibility()
+            .queue_url(queue_url)
+            .receipt_handle(receipt_handle)
+            .visibility_timeout(visibility_timeout_secs)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|_| "visibility request failed".to_string())
     }
 }
 
@@ -98,9 +143,33 @@ impl<A: SqsApi + Send> Delete for SqsQueue<A> {
     }
 }
 
+impl<A: SqsApi + Send> ChangeVisibility for SqsQueue<A> {
+    async fn change_visibility(
+        &mut self,
+        receipt_handle: &str,
+        visibility_timeout: Duration,
+    ) -> Result<(), QueueError> {
+        if receipt_handle.is_empty()
+            || visibility_timeout.as_secs() > MAX_VISIBILITY_TIMEOUT_SECS
+            || visibility_timeout.subsec_nanos() != 0
+        {
+            return Err(QueueError("invalid visibility request".into()));
+        }
+        self.api
+            .change_visibility(
+                &self.queue_url,
+                receipt_handle,
+                visibility_timeout.as_secs() as i32,
+            )
+            .await
+            .map_err(QueueError)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct FakeApi {
@@ -120,6 +189,7 @@ mod tests {
             Ok(Some(Message {
                 receipt_handle: "receipt".into(),
                 body: "body".into(),
+                receive_count: 1,
             }))
         }
         async fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String> {
@@ -127,6 +197,21 @@ mod tests {
                 "delete".into(),
                 queue_url.into(),
                 receipt_handle.into(),
+            ]);
+            Ok(())
+        }
+
+        async fn change_visibility(
+            &mut self,
+            queue_url: &str,
+            receipt_handle: &str,
+            visibility_timeout_secs: i32,
+        ) -> Result<(), String> {
+            self.calls.push(vec![
+                "visibility".into(),
+                queue_url.into(),
+                receipt_handle.into(),
+                visibility_timeout_secs.to_string(),
             ]);
             Ok(())
         }
@@ -155,5 +240,48 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn visibility_uses_configured_queue_receipt_and_duration_without_aws() {
+        let mut queue = SqsQueue {
+            queue_url: "https://example.test/configured".into(),
+            api: FakeApi::default(),
+        };
+
+        queue
+            .change_visibility("current-receipt", Duration::from_secs(90))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            queue.api.calls,
+            vec![
+                vec![
+                    "visibility".to_string(),
+                    "https://example.test/configured".to_string(),
+                    "current-receipt".to_string(),
+                    "90".to_string(),
+                ],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn visibility_rejects_unbounded_or_empty_requests_without_aws() {
+        let mut queue = SqsQueue {
+            queue_url: "https://example.test/configured".into(),
+            api: FakeApi::default(),
+        };
+
+        assert!(queue
+            .change_visibility("", Duration::from_secs(1))
+            .await
+            .is_err());
+        assert!(queue
+            .change_visibility("receipt", Duration::from_secs(43_201))
+            .await
+            .is_err());
+        assert!(queue.api.calls.is_empty());
     }
 }
