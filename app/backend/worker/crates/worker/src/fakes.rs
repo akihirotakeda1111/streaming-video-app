@@ -6,11 +6,12 @@ use std::{
     fs,
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use encoding::{Command, Execute, Output, ProcessError};
 use persistence::{JobState, PersistenceError};
-use queue::{Delete, Message, QueueError, Receive};
+use queue::{ChangeVisibility, Delete, Message, QueueError, Receive};
 use storage::{ObjectError, Read, Write};
 
 use crate::{Clock, Timestamp};
@@ -19,6 +20,10 @@ use crate::{Clock, Timestamp};
 pub enum Call {
     Receive,
     Delete(String),
+    ChangeVisibility {
+        receipt_handle: String,
+        visibility_timeout: Duration,
+    },
     Read {
         bucket: String,
         key: String,
@@ -66,6 +71,7 @@ pub struct FakeQueue {
     messages: VecDeque<Message>,
     receive_failures: VecDeque<String>,
     delete_failures: VecDeque<String>,
+    visibility_failures: VecDeque<String>,
 }
 
 impl FakeQueue {
@@ -75,6 +81,7 @@ impl FakeQueue {
             messages: VecDeque::new(),
             receive_failures: VecDeque::new(),
             delete_failures: VecDeque::new(),
+            visibility_failures: VecDeque::new(),
         }
     }
     pub fn push_message(&mut self, message: Message) {
@@ -85,6 +92,9 @@ impl FakeQueue {
     }
     pub fn fail_delete(&mut self, message: impl Into<String>) {
         self.delete_failures.push_back(message.into());
+    }
+    pub fn fail_visibility(&mut self, message: impl Into<String>) {
+        self.visibility_failures.push_back(message.into());
     }
 }
 
@@ -106,6 +116,23 @@ impl Delete for FakeQueue {
         }
         self.messages
             .retain(|message| message.receipt_handle != receipt_handle);
+        Ok(())
+    }
+}
+
+impl ChangeVisibility for FakeQueue {
+    async fn change_visibility(
+        &mut self,
+        receipt_handle: &str,
+        visibility_timeout: Duration,
+    ) -> Result<(), QueueError> {
+        self.log.push(Call::ChangeVisibility {
+            receipt_handle: receipt_handle.into(),
+            visibility_timeout,
+        });
+        if let Some(error) = self.visibility_failures.pop_front() {
+            return Err(QueueError(error));
+        }
         Ok(())
     }
 }

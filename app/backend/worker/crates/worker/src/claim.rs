@@ -249,6 +249,7 @@ mod tests {
         Message {
             receipt_handle: "receipt".into(),
             body: FIXTURE.into(),
+            receive_count: 1,
         }
     }
 

@@ -217,6 +217,7 @@ mod tests {
         Message {
             receipt_handle: "receipt".into(),
             body: EVENT.into(),
+            receive_count: 1,
         }
     }
 
@@ -594,6 +595,7 @@ mod tests {
                 ("ObjectCreated:Put", INPUT, KEY),
                 ("ObjectCreated:Put", INPUT, KEY_2),
             ]),
+            receive_count: 1,
         }
     }
 
@@ -790,6 +792,7 @@ mod tests {
                 ("ObjectCreated:Put", "other-bucket", KEY_2),
                 ("ObjectCreated:Put", INPUT, KEY_2),
             ]),
+            receive_count: 1,
         };
 
         p.process(message).await.unwrap();
