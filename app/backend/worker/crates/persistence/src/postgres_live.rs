@@ -11,7 +11,7 @@ use std::{
 use tokio_postgres::{Client, NoTls, Row, types::ToSql};
 
 use super::{JobState, PostgresJobState};
-use crate::{JobOperationOutcome, PersistenceError};
+use crate::{JobOperationOutcome, LeaseAcquisitionOutcome, PersistenceError};
 
 const SCHEMA_SQL: &str =
     include_str!("../../../../api/internal/persistence/migrations/0001_phase1_schema.up.sql");
@@ -29,6 +29,13 @@ const LEASE_SECONDS: u64 = 30;
 const MAX_ATTEMPTS: u32 = 3;
 
 static SCHEMA_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn acquired_attempt(outcome: LeaseAcquisitionOutcome) -> u32 {
+    match outcome {
+        LeaseAcquisitionOutcome::Acquired { attempt, .. } => attempt,
+        other => panic!("expected acquired lease, got {other:?}"),
+    }
+}
 
 struct Live {
     url: String,
@@ -345,7 +352,7 @@ async fn two_connections_only_one_lease_succeeds() {
 
     let owned = [first_result.unwrap(), second_result.unwrap()]
         .into_iter()
-        .filter(|outcome| *outcome == JobOperationOutcome::Applied)
+        .filter(|outcome| matches!(outcome, LeaseAcquisitionOutcome::Acquired { .. }))
         .count();
     assert_eq!(owned, 1);
     let row = lease_row(&live.admin, JOB_ID).await;
@@ -366,24 +373,28 @@ async fn unowned_processing_and_expired_leases_can_be_acquired() {
     assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
     jobs.mark_processing(JOB_ID).await.unwrap();
     assert_eq!(
-        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
-            .await
-            .unwrap(),
-        JobOperationOutcome::Applied
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        1
     );
     assert_eq!(
         jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, MAX_ATTEMPTS)
             .await
             .unwrap(),
-        JobOperationOutcome::NotOwner
+        LeaseAcquisitionOutcome::Busy
     );
 
     expire_lease(&live.admin, JOB_ID).await;
     assert_eq!(
-        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, MAX_ATTEMPTS)
-            .await
-            .unwrap(),
-        JobOperationOutcome::Applied
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        2
     );
     let recovered = lease_row(&live.admin, JOB_ID).await;
     assert_eq!(recovered.get::<_, String>(0), "PROCESSING");
@@ -395,10 +406,12 @@ async fn unowned_processing_and_expired_leases_can_be_acquired() {
 
     assert!(jobs.claim(JOB_ID_2, VIDEO_ID_2).await.unwrap());
     assert_eq!(
-        jobs.acquire_lease(JOB_ID_2, VIDEO_ID_2, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
-            .await
-            .unwrap(),
-        JobOperationOutcome::Applied
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID_2, VIDEO_ID_2, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        1
     );
     live.cleanup().await;
 }
@@ -415,13 +428,15 @@ async fn mismatched_active_terminal_and_unknown_jobs_are_not_acquired() {
         jobs.acquire_lease(JOB_ID, VIDEO_ID_2, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
             .await
             .unwrap(),
-        JobOperationOutcome::NotOwner
+        LeaseAcquisitionOutcome::UnknownOrMismatched
     );
     assert_eq!(
-        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
-            .await
-            .unwrap(),
-        JobOperationOutcome::Applied
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        1
     );
     assert_eq!(
         jobs.complete(JOB_ID, VIDEO_ID, WORKER_A).await.unwrap(),
@@ -431,14 +446,51 @@ async fn mismatched_active_terminal_and_unknown_jobs_are_not_acquired() {
         jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, MAX_ATTEMPTS)
             .await
             .unwrap(),
-        JobOperationOutcome::NotOwner
+        LeaseAcquisitionOutcome::Completed
     );
     assert_eq!(
         jobs.acquire_lease(JOB_ID_2, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
             .await
             .unwrap(),
-        JobOperationOutcome::NotOwner
+        LeaseAcquisitionOutcome::UnknownOrMismatched
     );
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn exhausted_attempt_is_busy_until_expiry_then_remains_unacquired() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    assert_eq!(
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, 1)
+                .await
+                .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, 1)
+            .await
+            .unwrap(),
+        LeaseAcquisitionOutcome::Busy
+    );
+
+    expire_lease(&live.admin, JOB_ID).await;
+    assert_eq!(
+        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, 1)
+            .await
+            .unwrap(),
+        LeaseAcquisitionOutcome::AttemptExhausted
+    );
+    let row = lease_row(&live.admin, JOB_ID).await;
+    assert_eq!(row.get::<_, String>(0), "PROCESSING");
+    assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some(WORKER_A));
+    assert_eq!(row.get::<_, i32>(3), 1);
     live.cleanup().await;
 }
 
@@ -451,10 +503,12 @@ async fn owner_updates_require_unexpired_matching_lease() {
     let mut jobs = live.job_state().await;
     assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
     assert_eq!(
-        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
-            .await
-            .unwrap(),
-        JobOperationOutcome::Applied
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        1
     );
 
     assert_eq!(
@@ -515,10 +569,12 @@ async fn retry_release_and_terminal_outcomes_clear_lease_fields() {
 
     assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
     assert_eq!(
-        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
-            .await
-            .unwrap(),
-        JobOperationOutcome::Applied
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        1
     );
     assert_eq!(
         jobs.fail(JOB_ID, VIDEO_ID, WORKER_A, "too early", MAX_ATTEMPTS)
@@ -541,10 +597,12 @@ async fn retry_release_and_terminal_outcomes_clear_lease_fields() {
     assert!(retried.get::<_, Option<String>>(5).is_none());
 
     assert_eq!(
-        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
-            .await
-            .unwrap(),
-        JobOperationOutcome::Applied
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        2
     );
     assert_eq!(
         jobs.complete(JOB_ID, VIDEO_ID, WORKER_A).await.unwrap(),
@@ -557,10 +615,12 @@ async fn retry_release_and_terminal_outcomes_clear_lease_fields() {
 
     assert!(jobs.claim(JOB_ID_2, VIDEO_ID_2).await.unwrap());
     assert_eq!(
-        jobs.acquire_lease(JOB_ID_2, VIDEO_ID_2, WORKER_A, LEASE_SECONDS, 1)
-            .await
-            .unwrap(),
-        JobOperationOutcome::Applied
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID_2, VIDEO_ID_2, WORKER_A, LEASE_SECONDS, 1)
+                .await
+                .unwrap()
+        ),
+        1
     );
     assert_eq!(
         jobs.release_for_retry(JOB_ID_2, VIDEO_ID_2, WORKER_A, 1)
@@ -590,7 +650,7 @@ async fn retry_release_and_terminal_outcomes_clear_lease_fields() {
         jobs.acquire_lease(JOB_ID_2, VIDEO_ID_2, WORKER_B, LEASE_SECONDS, 1)
             .await
             .unwrap(),
-        JobOperationOutcome::NotOwner
+        LeaseAcquisitionOutcome::Failed
     );
     live.cleanup().await;
 }

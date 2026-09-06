@@ -1,7 +1,7 @@
 //! Job state ports.  State transitions are deliberately separate so callers
 //! cannot accidentally treat a claim or failure as a successful completion.
 
-use std::{fmt, future::Future};
+use std::{fmt, future::Future, time::SystemTime};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistenceError(pub String);
@@ -14,9 +14,8 @@ impl fmt::Display for PersistenceError {
 
 impl std::error::Error for PersistenceError {}
 
-/// The result of a conditional state transition.  A non-owner result is a
-/// normal outcome: the row may be missing, terminal, or owned by another
-/// worker.
+/// The result of a conditional owner-only state transition after acquisition.
+/// A non-owner result is a normal outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobOperationOutcome {
     Applied,
@@ -27,6 +26,20 @@ pub enum JobOperationOutcome {
 pub enum JobClaimOutcome {
     Claimed,
     NotClaimed,
+}
+
+/// The complete result of one atomic lease-acquisition attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaseAcquisitionOutcome {
+    Acquired {
+        attempt: u32,
+        lease_expires_at: SystemTime,
+    },
+    Busy,
+    Completed,
+    Failed,
+    UnknownOrMismatched,
+    AttemptExhausted,
 }
 
 pub trait JobState: Send {
@@ -70,9 +83,13 @@ pub trait JobState: Send {
         worker_id: &str,
         lease_seconds: u64,
         max_attempts: u32,
-    ) -> impl Future<Output = Result<JobOperationOutcome, PersistenceError>> + Send {
+    ) -> impl Future<Output = Result<LeaseAcquisitionOutcome, PersistenceError>> + Send {
         let _ = (job_id, video_id, worker_id, lease_seconds, max_attempts);
-        async { Err(PersistenceError("lease acquisition is not implemented".into())) }
+        async {
+            Err(PersistenceError(
+                "lease acquisition is not implemented".into(),
+            ))
+        }
     }
 
     fn renew_lease(

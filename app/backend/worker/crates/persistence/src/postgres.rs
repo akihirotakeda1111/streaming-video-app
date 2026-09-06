@@ -1,10 +1,18 @@
 //! PostgreSQL implementation of the job-state port.
 
-use std::future::Future;
+use std::{future::Future, time::SystemTime};
 
 use tokio_postgres::{Client, NoTls, types::ToSql};
 
-use crate::{JobClaimOutcome, JobOperationOutcome, JobState, PersistenceError};
+use crate::{
+    JobClaimOutcome, JobOperationOutcome, JobState, LeaseAcquisitionOutcome, PersistenceError,
+};
+
+struct LeaseAcquisitionRecord {
+    disposition: String,
+    attempt: Option<i32>,
+    lease_expires_at: Option<SystemTime>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobStatus {
@@ -33,6 +41,12 @@ trait Database {
         statement: &str,
         parameters: &[&str],
     ) -> impl Future<Output = Result<u64, tokio_postgres::Error>> + Send;
+
+    fn query_lease_acquisition(
+        &mut self,
+        statement: &str,
+        parameters: &[&str],
+    ) -> impl Future<Output = Result<LeaseAcquisitionRecord, tokio_postgres::Error>> + Send;
 }
 
 impl Database for Client {
@@ -46,6 +60,23 @@ impl Database for Client {
             .map(|value| value as &(dyn ToSql + Sync))
             .collect();
         Client::execute(self, statement, &values).await
+    }
+
+    async fn query_lease_acquisition(
+        &mut self,
+        statement: &str,
+        parameters: &[&str],
+    ) -> Result<LeaseAcquisitionRecord, tokio_postgres::Error> {
+        let values: Vec<&(dyn ToSql + Sync)> = parameters
+            .iter()
+            .map(|value| value as &(dyn ToSql + Sync))
+            .collect();
+        let row = Client::query_one(self, statement, &values).await?;
+        Ok(LeaseAcquisitionRecord {
+            disposition: row.get(0),
+            attempt: row.get(1),
+            lease_expires_at: row.get(2),
+        })
     }
 }
 
@@ -139,7 +170,11 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
         require_one(changed)
     }
 
-    async fn claim_upload(&mut self, job_id: &str, video_id: &str) -> Result<JobClaimOutcome, PersistenceError> {
+    async fn claim_upload(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+    ) -> Result<JobClaimOutcome, PersistenceError> {
         Ok(if self.claim(job_id, video_id).await? {
             JobClaimOutcome::Claimed
         } else {
@@ -154,12 +189,40 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
         worker_id: &str,
         lease_seconds: u64,
         max_attempts: u32,
-    ) -> Result<JobOperationOutcome, PersistenceError> {
-        let changed = self.database.execute(
-            "UPDATE jobs SET status = 'PROCESSING', worker_id = $3, lease_expires_at = NOW() + ($4::text || ' seconds')::interval, attempt = attempt + 1, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND status IN ('QUEUED', 'PROCESSING') AND attempt < $5::text::int AND ((worker_id IS NULL AND lease_expires_at IS NULL) OR lease_expires_at <= NOW())",
+    ) -> Result<LeaseAcquisitionOutcome, PersistenceError> {
+        let record = self.database.query_lease_acquisition(
+            "WITH acquired AS (
+                UPDATE jobs
+                SET status = 'PROCESSING',
+                    worker_id = $3,
+                    lease_expires_at = CURRENT_TIMESTAMP + ($4::text || ' seconds')::interval,
+                    attempt = attempt + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1::text::uuid
+                  AND video_id = $2::text::uuid
+                  AND status IN ('QUEUED', 'PROCESSING')
+                  AND attempt < $5::text::int
+                  AND ((worker_id IS NULL AND lease_expires_at IS NULL) OR lease_expires_at <= CURRENT_TIMESTAMP)
+                RETURNING attempt, lease_expires_at
+            ), target AS MATERIALIZED (
+                SELECT status, attempt, lease_expires_at
+                FROM jobs
+                WHERE id = $1::text::uuid AND video_id = $2::text::uuid
+            )
+            SELECT CASE
+                     WHEN EXISTS (SELECT 1 FROM acquired) THEN 'ACQUIRED'
+                     WHEN NOT EXISTS (SELECT 1 FROM target) THEN 'UNKNOWN_OR_MISMATCHED'
+                     WHEN (SELECT status FROM target) = 'COMPLETED' THEN 'COMPLETED'
+                     WHEN (SELECT status FROM target) = 'FAILED' THEN 'FAILED'
+                     WHEN COALESCE((SELECT lease_expires_at > CURRENT_TIMESTAMP FROM target), FALSE) THEN 'BUSY'
+                     WHEN COALESCE((SELECT attempt >= $5::text::int FROM target), FALSE) THEN 'ATTEMPT_EXHAUSTED'
+                     ELSE 'BUSY'
+                   END,
+                   (SELECT attempt FROM acquired),
+                   (SELECT lease_expires_at FROM acquired)",
             &[job_id, video_id, worker_id, &lease_seconds.to_string(), &max_attempts.to_string()],
         ).await.map_err(map_error)?;
-        atomic_outcome(changed)
+        map_lease_acquisition(record)
     }
 
     async fn renew_lease(
@@ -219,11 +282,42 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
     }
 }
 
+fn map_lease_acquisition(
+    record: LeaseAcquisitionRecord,
+) -> Result<LeaseAcquisitionOutcome, PersistenceError> {
+    match record.disposition.as_str() {
+        "ACQUIRED" => {
+            let attempt = record
+                .attempt
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| PersistenceError("acquired lease has an invalid attempt".into()))?;
+            let lease_expires_at = record.lease_expires_at.ok_or_else(|| {
+                PersistenceError("acquired lease has no expiration timestamp".into())
+            })?;
+            Ok(LeaseAcquisitionOutcome::Acquired {
+                attempt,
+                lease_expires_at,
+            })
+        }
+        "BUSY" => Ok(LeaseAcquisitionOutcome::Busy),
+        "COMPLETED" => Ok(LeaseAcquisitionOutcome::Completed),
+        "FAILED" => Ok(LeaseAcquisitionOutcome::Failed),
+        "UNKNOWN_OR_MISMATCHED" => Ok(LeaseAcquisitionOutcome::UnknownOrMismatched),
+        "ATTEMPT_EXHAUSTED" => Ok(LeaseAcquisitionOutcome::AttemptExhausted),
+        other => Err(PersistenceError(format!(
+            "unknown lease acquisition disposition {other:?}"
+        ))),
+    }
+}
+
 fn atomic_outcome(changed: u64) -> Result<JobOperationOutcome, PersistenceError> {
     match changed {
         0 => Ok(JobOperationOutcome::NotOwner),
         1 => Ok(JobOperationOutcome::Applied),
-        count => Err(PersistenceError(format!("updated {count} jobs; expected one"))),
+        count => Err(PersistenceError(format!(
+            "updated {count} jobs; expected one"
+        ))),
     }
 }
 
@@ -253,6 +347,7 @@ mod tests {
         statements: Vec<String>,
         parameters: Vec<Vec<String>>,
         changed: u64,
+        lease_acquisition: LeaseAcquisitionRecord,
     }
 
     impl Default for FakeDatabase {
@@ -261,6 +356,11 @@ mod tests {
                 statements: Vec::new(),
                 parameters: Vec::new(),
                 changed: 1,
+                lease_acquisition: LeaseAcquisitionRecord {
+                    disposition: "ACQUIRED".into(),
+                    attempt: Some(1),
+                    lease_expires_at: Some(SystemTime::UNIX_EPOCH),
+                },
             }
         }
     }
@@ -278,6 +378,22 @@ mod tests {
                 Ok(self.changed)
             };
             std::future::ready(result)
+        }
+
+        fn query_lease_acquisition(
+            &mut self,
+            statement: &str,
+            parameters: &[&str],
+        ) -> impl Future<Output = Result<LeaseAcquisitionRecord, tokio_postgres::Error>> + Send
+        {
+            self.statements.push(statement.to_owned());
+            self.parameters
+                .push(parameters.iter().map(|value| (*value).to_owned()).collect());
+            std::future::ready(Ok(LeaseAcquisitionRecord {
+                disposition: self.lease_acquisition.disposition.clone(),
+                attempt: self.lease_acquisition.attempt,
+                lease_expires_at: self.lease_acquisition.lease_expires_at,
+            }))
         }
     }
 
@@ -355,7 +471,10 @@ mod tests {
             jobs.acquire_lease("job-id", "video-id", "worker-a", 30, 3)
                 .await
                 .unwrap(),
-            JobOperationOutcome::Applied
+            LeaseAcquisitionOutcome::Acquired {
+                attempt: 1,
+                lease_expires_at: SystemTime::UNIX_EPOCH,
+            }
         );
         assert_eq!(
             jobs.renew_lease("job-id", "video-id", "worker-a", 30)
@@ -394,7 +513,10 @@ mod tests {
             jobs.database.parameters[2],
             ["job-id", "video-id", "worker-a", "3"]
         );
-        assert_eq!(jobs.database.parameters[3], ["job-id", "video-id", "worker-a"]);
+        assert_eq!(
+            jobs.database.parameters[3],
+            ["job-id", "video-id", "worker-a"]
+        );
         assert_eq!(
             jobs.database.parameters[4],
             ["job-id", "video-id", "worker-a", "ffmpeg exited", "3"]
@@ -405,6 +527,7 @@ mod tests {
         assert!(acquire.contains("attempt < $5::text::int"));
         assert!(acquire.contains("worker_id IS NULL AND lease_expires_at IS NULL"));
         assert!(acquire.contains("status IN ('QUEUED', 'PROCESSING')"));
+        assert!(acquire.contains("RETURNING attempt, lease_expires_at"));
 
         assert!(jobs.database.statements[1].contains("lease_expires_at > NOW()"));
         assert!(jobs.database.statements[2].contains("lease_expires_at > NOW()"));
@@ -415,16 +538,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_row_lease_operation_is_not_owner() {
+    async fn typed_non_acquisition_and_zero_row_owner_updates_are_safe() {
         let mut jobs = PostgresJobState::new(FakeDatabase {
             changed: 0,
+            lease_acquisition: LeaseAcquisitionRecord {
+                disposition: "BUSY".into(),
+                attempt: None,
+                lease_expires_at: None,
+            },
             ..FakeDatabase::default()
         });
         assert_eq!(
             jobs.acquire_lease("job-id", "video-id", "worker-a", 30, 3)
                 .await
                 .unwrap(),
-            JobOperationOutcome::NotOwner
+            LeaseAcquisitionOutcome::Busy
         );
         assert_eq!(
             jobs.complete("job-id", "video-id", "worker-a")

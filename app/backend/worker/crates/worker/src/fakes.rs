@@ -10,7 +10,7 @@ use std::{
 };
 
 use encoding::{Command, Execute, Output, ProcessError};
-use persistence::{JobState, PersistenceError};
+use persistence::{JobState, LeaseAcquisitionOutcome, PersistenceError};
 use queue::{ChangeVisibility, Delete, Message, QueueError, Receive};
 use storage::{ObjectError, Read, Write};
 
@@ -37,6 +37,13 @@ pub enum Call {
     Claim {
         job_id: String,
         video_id: String,
+    },
+    AcquireLease {
+        job_id: String,
+        video_id: String,
+        worker_id: String,
+        lease_seconds: u64,
+        max_attempts: u32,
     },
     MarkProcessing(String),
     MarkCompleted(String),
@@ -227,6 +234,7 @@ pub struct FakeJobState {
     processing_failures: VecDeque<String>,
     completed_failures: VecDeque<String>,
     mark_failed_failures: VecDeque<String>,
+    lease_acquisitions: VecDeque<Result<LeaseAcquisitionOutcome, PersistenceError>>,
     claim_skip: usize,
 }
 
@@ -239,6 +247,7 @@ impl FakeJobState {
             processing_failures: VecDeque::new(),
             completed_failures: VecDeque::new(),
             mark_failed_failures: VecDeque::new(),
+            lease_acquisitions: VecDeque::new(),
             claim_skip: 0,
         }
     }
@@ -260,6 +269,13 @@ impl FakeJobState {
     }
     pub fn fail_mark_failed(&mut self, message: impl Into<String>) {
         self.mark_failed_failures.push_back(message.into());
+    }
+    pub fn add_lease_acquisition(&mut self, outcome: LeaseAcquisitionOutcome) {
+        self.lease_acquisitions.push_back(Ok(outcome));
+    }
+    pub fn fail_lease_acquisition(&mut self, message: impl Into<String>) {
+        self.lease_acquisitions
+            .push_back(Err(PersistenceError(message.into())));
     }
 }
 
@@ -320,6 +336,25 @@ impl JobState for FakeJobState {
             reason: reason.into(),
         });
         take_failure(&mut self.mark_failed_failures)
+    }
+    async fn acquire_lease(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_attempts: u32,
+    ) -> Result<LeaseAcquisitionOutcome, PersistenceError> {
+        self.log.push(Call::AcquireLease {
+            job_id: job_id.into(),
+            video_id: video_id.into(),
+            worker_id: worker_id.into(),
+            lease_seconds,
+            max_attempts,
+        });
+        self.lease_acquisitions
+            .pop_front()
+            .unwrap_or(Ok(LeaseAcquisitionOutcome::UnknownOrMismatched))
     }
 }
 
