@@ -4,6 +4,7 @@ pub mod acquisition;
 pub mod claim;
 pub mod event;
 pub mod fakes;
+pub mod heartbeat;
 pub mod publish;
 pub mod runtime;
 pub mod terminal;
@@ -27,6 +28,9 @@ const INPUT_BUCKET: &str = "VIDEO_INPUT_BUCKET";
 const OUTPUT_BUCKET: &str = "VIDEO_OUTPUT_BUCKET";
 const FFMPEG_PATH: &str = "FFMPEG_PATH";
 const TEMPORARY_DIRECTORY: &str = "TMPDIR";
+const HEARTBEAT_INTERVAL_SECONDS: &str = "WORKER_HEARTBEAT_INTERVAL_SECONDS";
+const VISIBILITY_EXTENSION_SECONDS: &str = "WORKER_VISIBILITY_EXTENSION_SECONDS";
+const LEASE_DURATION_SECONDS: &str = "WORKER_LEASE_DURATION_SECONDS";
 
 /// All runtime settings required by the worker.
 #[derive(Clone, PartialEq, Eq)]
@@ -38,6 +42,9 @@ pub struct Config {
     pub output_bucket: String,
     pub ffmpeg_path: PathBuf,
     pub temporary_directory: PathBuf,
+    pub heartbeat_interval_seconds: u64,
+    pub visibility_extension_seconds: u64,
+    pub lease_duration_seconds: u64,
 }
 
 impl Config {
@@ -57,6 +64,24 @@ impl Config {
         let output_bucket = required(&lookup, OUTPUT_BUCKET)?;
         let ffmpeg_path = PathBuf::from(required(&lookup, FFMPEG_PATH)?);
         let temporary_directory = PathBuf::from(required(&lookup, TEMPORARY_DIRECTORY)?);
+        let heartbeat_interval_seconds = positive_seconds(&lookup, HEARTBEAT_INTERVAL_SECONDS)?;
+        let visibility_extension_seconds = positive_seconds(&lookup, VISIBILITY_EXTENSION_SECONDS)?;
+        let lease_duration_seconds = positive_seconds(&lookup, LEASE_DURATION_SECONDS)?;
+
+        if visibility_extension_seconds > 43_200 {
+            return Err(ConfigError::invalid(
+                VISIBILITY_EXTENSION_SECONDS,
+                "must not exceed 43200 seconds",
+            ));
+        }
+        if heartbeat_interval_seconds >= visibility_extension_seconds
+            || heartbeat_interval_seconds >= lease_duration_seconds
+        {
+            return Err(ConfigError::invalid(
+                HEARTBEAT_INTERVAL_SECONDS,
+                "must be shorter than lease duration and visibility extension",
+            ));
+        }
 
         validate_postgres_url(&database_url)?;
         validate_region(&aws_region)?;
@@ -78,6 +103,9 @@ impl Config {
             output_bucket,
             ffmpeg_path,
             temporary_directory,
+            heartbeat_interval_seconds,
+            visibility_extension_seconds,
+            lease_duration_seconds,
         })
     }
 }
@@ -93,6 +121,15 @@ impl fmt::Debug for Config {
             .field("output_bucket", &self.output_bucket)
             .field("ffmpeg_path", &self.ffmpeg_path)
             .field("temporary_directory", &self.temporary_directory)
+            .field(
+                "heartbeat_interval_seconds",
+                &self.heartbeat_interval_seconds,
+            )
+            .field(
+                "visibility_extension_seconds",
+                &self.visibility_extension_seconds,
+            )
+            .field("lease_duration_seconds", &self.lease_duration_seconds)
             .finish()
     }
 }
@@ -130,6 +167,20 @@ where
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_owned())
         .ok_or_else(|| ConfigError::invalid(variable, "is required"))
+}
+
+fn positive_seconds<F>(lookup: &F, variable: &'static str) -> Result<u64, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = required(lookup, variable)?;
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| ConfigError::invalid(variable, "must be a positive integer"))?;
+    if seconds == 0 {
+        return Err(ConfigError::invalid(variable, "must be a positive integer"));
+    }
+    Ok(seconds)
 }
 
 fn validate_postgres_url(value: &str) -> Result<(), ConfigError> {
@@ -241,6 +292,9 @@ mod tests {
             (OUTPUT_BUCKET, "video-output".into()),
             (FFMPEG_PATH, "/usr/bin/ffmpeg".into()),
             (TEMPORARY_DIRECTORY, "/tmp/video-worker".into()),
+            (HEARTBEAT_INTERVAL_SECONDS, "30".into()),
+            (VISIBILITY_EXTENSION_SECONDS, "120".into()),
+            (LEASE_DURATION_SECONDS, "300".into()),
         ])
     }
 
