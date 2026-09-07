@@ -13,6 +13,7 @@ pub enum PublishError {
     Filesystem(io::Error),
     Storage(ObjectError),
     InvalidSegmentPath,
+    OwnershipLost,
 }
 
 impl fmt::Display for PublishError {
@@ -23,6 +24,7 @@ impl fmt::Display for PublishError {
             Self::InvalidSegmentPath => {
                 formatter.write_str("validated HLS segment has no filename")
             }
+            Self::OwnershipLost => formatter.write_str("lease ownership was lost"),
         }
     }
 }
@@ -50,6 +52,22 @@ pub async fn publish_hls<W: Write>(
     job_id: &str,
     output: &HlsOutput,
 ) -> Result<(), PublishError> {
+    publish_hls_with_checkpoint(storage, output_bucket, video_id, job_id, output, || true).await
+}
+
+/// Upload segments, then check ownership immediately before the manifest.
+pub async fn publish_hls_with_checkpoint<W, F>(
+    storage: &mut W,
+    output_bucket: &str,
+    video_id: &str,
+    job_id: &str,
+    output: &HlsOutput,
+    mut owned: F,
+) -> Result<(), PublishError>
+where
+    W: Write,
+    F: FnMut() -> bool,
+{
     let prefix = format!("videos/{video_id}/jobs/{job_id}/hls");
 
     for segment in &output.segments {
@@ -66,6 +84,10 @@ pub async fn publish_hls<W: Write>(
                 &contents,
             )
             .await?;
+    }
+
+    if !owned() {
+        return Err(PublishError::OwnershipLost);
     }
 
     let playlist = tokio::fs::read(&output.playlist).await?;
