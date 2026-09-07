@@ -392,12 +392,6 @@ mod tests {
         async fn mark_processing(&mut self, _: &str) -> Result<(), PersistenceError> {
             panic!("legacy processing")
         }
-        async fn mark_completed(&mut self, _: &str) -> Result<(), PersistenceError> {
-            panic!("legacy completion")
-        }
-        async fn mark_failed(&mut self, _: &str, _: &str) -> Result<(), PersistenceError> {
-            panic!("legacy failure")
-        }
         async fn complete(
             &mut self,
             job: &str,

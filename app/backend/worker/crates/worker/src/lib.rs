@@ -1,7 +1,6 @@
 //! Configuration and lifecycle support for the encoding worker.
 
 pub mod acquisition;
-pub mod claim;
 pub mod completion;
 pub mod event;
 pub mod fakes;
@@ -9,15 +8,6 @@ pub mod heartbeat;
 pub mod publish;
 pub mod retry;
 pub mod runtime;
-pub mod terminal;
-
-/// A deterministic representation of wall-clock time used by worker ports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Timestamp(pub u64);
-
-pub trait Clock {
-    fn now(&mut self) -> Timestamp;
-}
 
 use std::{env, fmt, path::PathBuf};
 

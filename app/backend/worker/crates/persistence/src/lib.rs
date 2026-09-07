@@ -52,16 +52,6 @@ pub trait JobState: Send {
         &mut self,
         job_id: &str,
     ) -> impl Future<Output = Result<(), PersistenceError>> + Send;
-    fn mark_completed(
-        &mut self,
-        job_id: &str,
-    ) -> impl Future<Output = Result<(), PersistenceError>> + Send;
-    fn mark_failed(
-        &mut self,
-        job_id: &str,
-        reason: &str,
-    ) -> impl Future<Output = Result<(), PersistenceError>> + Send;
-
     fn claim_upload(
         &mut self,
         job_id: &str,

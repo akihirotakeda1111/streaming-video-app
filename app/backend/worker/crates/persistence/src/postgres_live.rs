@@ -11,7 +11,7 @@ use std::{
 use tokio_postgres::{Client, NoTls, Row, types::ToSql};
 
 use super::{JobState, PostgresJobState};
-use crate::{JobOperationOutcome, LeaseAcquisitionOutcome, PersistenceError};
+use crate::{JobOperationOutcome, LeaseAcquisitionOutcome};
 
 const SCHEMA_SQL: &str =
     include_str!("../../../../api/internal/persistence/migrations/0001_phase1_schema.up.sql");
@@ -245,92 +245,6 @@ async fn two_connections_only_one_claim_succeeds() {
         .count();
     assert_eq!(owned, 1);
     assert_eq!(job_status(&live.admin, JOB_ID).await, "QUEUED");
-    live.cleanup().await;
-}
-
-#[tokio::test]
-async fn queued_to_processing_to_completed() {
-    let Some(live) = setup().await else {
-        return;
-    };
-    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
-    let mut jobs = live.job_state().await;
-
-    assert!(jobs.mark_processing(JOB_ID).await.is_err());
-    assert_eq!(job_status(&live.admin, JOB_ID).await, "UPLOADING");
-
-    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
-    jobs.mark_processing(JOB_ID).await.unwrap();
-    assert_eq!(job_status(&live.admin, JOB_ID).await, "PROCESSING");
-
-    jobs.mark_completed(JOB_ID).await.unwrap();
-    let completed = job_row(&live.admin, JOB_ID).await;
-    assert_eq!(completed.get::<_, String>(0), "COMPLETED");
-    assert!(completed.get::<_, Option<String>>(1).is_none());
-    assert!(completed.get::<_, Option<String>>(2).is_none());
-    live.cleanup().await;
-}
-
-#[tokio::test]
-async fn queued_or_processing_can_fail() {
-    let Some(live) = setup().await else {
-        return;
-    };
-    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
-    insert_job(&live.admin, VIDEO_ID_2, JOB_ID_2, "UPLOADING").await;
-    let mut jobs = live.job_state().await;
-
-    assert!(jobs.mark_failed(JOB_ID, "too early").await.is_err());
-    assert_eq!(job_status(&live.admin, JOB_ID).await, "UPLOADING");
-
-    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
-    jobs.mark_failed(JOB_ID, "queued failed").await.unwrap();
-    let queued_failed = job_row(&live.admin, JOB_ID).await;
-    assert_eq!(queued_failed.get::<_, String>(0), "FAILED");
-    assert_eq!(queued_failed.get::<_, String>(1), "ENCODING_FAILED");
-    assert_eq!(queued_failed.get::<_, String>(2), "queued failed");
-
-    assert!(jobs.claim(JOB_ID_2, VIDEO_ID_2).await.unwrap());
-    jobs.mark_processing(JOB_ID_2).await.unwrap();
-    jobs.mark_failed(JOB_ID_2, "processing failed")
-        .await
-        .unwrap();
-    let processing_failed = job_row(&live.admin, JOB_ID_2).await;
-    assert_eq!(processing_failed.get::<_, String>(0), "FAILED");
-    assert_eq!(processing_failed.get::<_, String>(1), "ENCODING_FAILED");
-    assert_eq!(processing_failed.get::<_, String>(2), "processing failed");
-    live.cleanup().await;
-}
-
-#[tokio::test]
-async fn completed_job_is_not_overwritten() {
-    let Some(live) = setup().await else {
-        return;
-    };
-    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
-    let mut jobs = live.job_state().await;
-    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
-    jobs.mark_processing(JOB_ID).await.unwrap();
-    jobs.mark_completed(JOB_ID).await.unwrap();
-
-    assert!(matches!(
-        jobs.mark_processing(JOB_ID).await,
-        Err(PersistenceError(message)) if message.contains("job not found")
-    ));
-    assert!(matches!(
-        jobs.mark_completed(JOB_ID).await,
-        Err(PersistenceError(message)) if message.contains("job not found")
-    ));
-    assert!(matches!(
-        jobs.mark_failed(JOB_ID, "late failure").await,
-        Err(PersistenceError(message)) if message.contains("job not found")
-    ));
-    assert!(!jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
-
-    let completed = job_row(&live.admin, JOB_ID).await;
-    assert_eq!(completed.get::<_, String>(0), "COMPLETED");
-    assert!(completed.get::<_, Option<String>>(1).is_none());
-    assert!(completed.get::<_, Option<String>>(2).is_none());
     live.cleanup().await;
 }
 

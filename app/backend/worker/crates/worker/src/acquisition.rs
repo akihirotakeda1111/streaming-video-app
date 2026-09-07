@@ -467,21 +467,6 @@ mod tests {
             std::future::ready(Ok(()))
         }
 
-        fn mark_completed(
-            &mut self,
-            _job_id: &str,
-        ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
-            std::future::ready(Ok(()))
-        }
-
-        fn mark_failed(
-            &mut self,
-            _job_id: &str,
-            _reason: &str,
-        ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
-            std::future::ready(Ok(()))
-        }
-
         fn acquire_lease(
             &mut self,
             _job_id: &str,

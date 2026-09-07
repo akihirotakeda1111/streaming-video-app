@@ -153,23 +153,6 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
         .await
     }
 
-    async fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError> {
-        self.set_status(
-            job_id,
-            JobStatus::Completed,
-            JobStatus::Processing.as_contract_value(),
-        )
-        .await
-    }
-
-    async fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError> {
-        let changed = self.database.execute(
-            "UPDATE jobs SET status = $1, failure_code = $2, failure_message = $3, updated_at = NOW() WHERE id = $4::text::uuid AND status IN ('QUEUED', 'PROCESSING')",
-            &[JobStatus::Failed.as_contract_value(), "ENCODING_FAILED", reason, job_id],
-        ).await.map_err(map_error)?;
-        require_one(changed)
-    }
-
     async fn claim_upload(
         &mut self,
         job_id: &str,
@@ -428,20 +411,6 @@ mod tests {
             processing.database.parameters,
             [["PROCESSING", "job-id", "QUEUED"]]
         );
-
-        let mut completed = jobs();
-        completed.mark_completed("job-id").await.unwrap();
-        assert_eq!(
-            completed.database.parameters,
-            [["COMPLETED", "job-id", "PROCESSING"]]
-        );
-
-        let mut failed = jobs();
-        failed.mark_failed("job-id", "ffmpeg exited").await.unwrap();
-        assert_eq!(
-            failed.database.parameters,
-            [["FAILED", "ENCODING_FAILED", "ffmpeg exited", "job-id"]]
-        );
     }
 
     #[tokio::test]
@@ -460,8 +429,6 @@ mod tests {
             ..FakeDatabase::default()
         });
         assert!(jobs.mark_processing("job-id").await.is_err());
-        assert!(jobs.mark_completed("job-id").await.is_err());
-        assert!(jobs.mark_failed("job-id", "ffmpeg exited").await.is_err());
     }
 
     #[tokio::test]

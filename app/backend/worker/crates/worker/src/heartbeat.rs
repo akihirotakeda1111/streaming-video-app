@@ -474,12 +474,6 @@ mod tests {
         async fn mark_processing(&mut self, _: &str) -> Result<(), PersistenceError> {
             panic!("unexpected processing")
         }
-        async fn mark_completed(&mut self, _: &str) -> Result<(), PersistenceError> {
-            panic!("unexpected completion")
-        }
-        async fn mark_failed(&mut self, _: &str, _: &str) -> Result<(), PersistenceError> {
-            panic!("unexpected failure")
-        }
         async fn renew_lease(
             &mut self,
             job: &str,
