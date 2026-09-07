@@ -4,29 +4,27 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/akihirotakeda1111/streaming-video-app/backend/api/internal/testutil"
 )
 
-const defaultIntegrationPostgresURL = "postgres://streaming_video:streaming_video_dev_password@localhost:5432/streaming_video?sslmode=disable"
-
-func integrationPostgresURL() (dsn string, required bool) {
-	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
-		return dsn, true
+func TestPostgresRepositoryCreateAndGetRoundTrip(t *testing.T) {
+	migrations := testutil.Migrations(t)
+	for index, migration := range migrations {
+		t.Run("schema_"+migration.Version, func(t *testing.T) {
+			testRepositoryRoundTrip(t, migrations[:index+1])
+		})
 	}
-	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
-		return dsn, false
-	}
-	return defaultIntegrationPostgresURL, false
 }
 
-func TestPostgresRepositoryCreateAndGetRoundTrip(t *testing.T) {
-	db, repo := setupIntegrationPostgres(t)
+func testRepositoryRoundTrip(t *testing.T, migrations []testutil.Migration) {
+	t.Helper()
+	db := testutil.OpenPostgres(t)
+	testutil.ApplyMigrations(t, db, migrations)
+	repo := NewPostgresRepository(db)
 	ctx := context.Background()
 	input := testCreateVideoInput(time.Date(2026, time.August, 25, 3, 0, 0, 0, time.UTC))
 
@@ -210,43 +208,8 @@ VALUES ('44444444-4444-4444-4444-444444444444', '33333333-3333-3333-3333-3333333
 
 func setupIntegrationPostgres(t *testing.T) (*sql.DB, *PostgresRepository) {
 	t.Helper()
-
-	dsn, required := integrationPostgresURL()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open postgres: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		if required {
-			t.Fatalf("postgres is not available: %v", err)
-		}
-		t.Skipf("postgres is not available: %v", err)
-	}
-
-	schema := fmt.Sprintf("repo_test_%d", time.Now().UnixNano())
-	if _, err := db.ExecContext(ctx, "CREATE SCHEMA "+schema); err != nil {
-		_ = db.Close()
-		t.Fatalf("create schema: %v", err)
-	}
-
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	if _, err := db.Exec("SET search_path TO " + schema); err != nil {
-		_ = db.Close()
-		t.Fatalf("set search_path: %v", err)
-	}
-
+	db := testutil.OpenPostgres(t)
 	execSQL(t, db, readMigration(t, "0001_phase1_schema.up.sql"))
-
-	t.Cleanup(func() {
-		_, _ = db.Exec("DROP SCHEMA IF EXISTS " + schema + " CASCADE")
-		_ = db.Close()
-	})
-
 	return db, NewPostgresRepository(db)
 }
 
