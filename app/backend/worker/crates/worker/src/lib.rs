@@ -74,6 +74,9 @@ impl Config {
         let lease_duration_seconds = positive_seconds(&lookup, LEASE_DURATION_SECONDS)?;
         let retry_delay_seconds = positive_seconds(&lookup, RETRY_DELAY_SECONDS)?;
         let maximum_attempts = positive_u32(&lookup, MAXIMUM_ATTEMPTS)?;
+        if maximum_attempts > 10 {
+            return Err(ConfigError::invalid(MAXIMUM_ATTEMPTS, "must not exceed 10"));
+        }
 
         if visibility_extension_seconds > 43_200 {
             return Err(ConfigError::invalid(
@@ -337,6 +340,31 @@ mod tests {
         let config = Config::from_lookup(|name| values.get(name).cloned()).unwrap();
         assert_eq!(config.input_bucket, "video-input");
         assert!(!format!("{config:?}").contains("password"));
+    }
+
+    #[test]
+    fn validates_retry_configuration_bounds() {
+        for (variable, values) in [
+            (
+                MAXIMUM_ATTEMPTS,
+                vec!["0", "11", "4294967295", "4294967296", "-1", "1.5"],
+            ),
+            (RETRY_DELAY_SECONDS, vec!["0", "43201", "-1"]),
+        ] {
+            for value in values {
+                let mut config = valid();
+                config.insert(variable, value.into());
+                assert_eq!(load(&config).unwrap_err().variable, variable);
+            }
+        }
+        for attempts in ["1", "10"] {
+            for delay in ["1", "43200"] {
+                let mut config = valid();
+                config.insert(MAXIMUM_ATTEMPTS, attempts.into());
+                config.insert(RETRY_DELAY_SECONDS, delay.into());
+                load(&config).unwrap();
+            }
+        }
     }
 
     #[test]

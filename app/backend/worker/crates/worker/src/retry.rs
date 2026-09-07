@@ -27,6 +27,9 @@ impl RetrySettings {
         if maximum_attempts == 0 {
             return Err(RetrySettingsError::ZeroAttempts);
         }
+        if maximum_attempts > 10 {
+            return Err(RetrySettingsError::TooManyAttempts);
+        }
         if retry_delay_seconds == 0 || retry_delay_seconds > 43_200 {
             return Err(RetrySettingsError::DelayOutOfRange);
         }
@@ -40,6 +43,7 @@ impl RetrySettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetrySettingsError {
     ZeroAttempts,
+    TooManyAttempts,
     DelayOutOfRange,
 }
 
@@ -47,6 +51,7 @@ impl fmt::Display for RetrySettingsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::ZeroAttempts => "maximum attempts must be positive",
+            Self::TooManyAttempts => "maximum attempts must not exceed 10",
             Self::DelayOutOfRange => "retry delay must be between 1 and 43200 seconds",
         })
     }
