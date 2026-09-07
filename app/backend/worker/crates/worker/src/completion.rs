@@ -358,6 +358,9 @@ mod tests {
     #[derive(Default)]
     struct State {
         jobs: HashMap<String, &'static str>,
+        acquired_attempts: HashMap<String, u32>,
+        output_log: CallLog,
+        output_at_completion: Vec<crate::fakes::Call>,
         calls: Vec<String>,
         renewal_failure: bool,
         visibility_failure: bool,
@@ -410,8 +413,14 @@ mod tests {
                 "EXHAUSTED" => Ok(LeaseAcquisitionOutcome::AttemptExhausted),
                 _ => {
                     s.jobs.insert(id.into(), "PROCESSING");
+                    let initial_attempt = s.attempt.max(1);
+                    let attempt = s
+                        .acquired_attempts
+                        .entry(id.into())
+                        .and_modify(|attempt| *attempt += 1)
+                        .or_insert(initial_attempt);
                     Ok(LeaseAcquisitionOutcome::Acquired {
-                        attempt: s.attempt.max(1),
+                        attempt: *attempt,
                         lease_expires_at: SystemTime::UNIX_EPOCH,
                     })
                 }
@@ -445,6 +454,7 @@ mod tests {
             if s.completion_failure {
                 return Err(PersistenceError("uncertain".into()));
             }
+            s.output_at_completion = s.output_log.calls();
             s.jobs.insert(id.into(), "COMPLETED");
             Ok(JobOperationOutcome::Applied)
         }
@@ -526,16 +536,24 @@ mod tests {
     }
     impl Fixture {
         fn new(delay: Duration, fail_first: bool) -> Self {
+            Self::with_storage(delay, |storage| {
+                if fail_first {
+                    storage.fail_read("download failed");
+                }
+            })
+        }
+        fn with_storage(delay: Duration, configure: impl FnOnce(&mut FakeStorage)) -> Self {
             let root = tempfile::tempdir().unwrap();
-            let state = Arc::new(StdMutex::new(State::default()));
             let log = CallLog::default();
+            let state = Arc::new(StdMutex::new(State {
+                output_log: log.clone(),
+                ..State::default()
+            }));
             let mut storage = FakeStorage::new(log.clone());
             for id in [FIRST, SECOND] {
                 storage.add_read("input", &source_key(VIDEO, id), b"source".to_vec());
             }
-            if fail_first {
-                storage.fail_read("download failed");
-            }
+            configure(&mut storage);
             let processor = MessageCompletionProcessor::new(
                 Jobs(state.clone()),
                 storage,
@@ -591,6 +609,73 @@ mod tests {
             .unwrap();
         }
     }
+    #[tokio::test]
+    async fn partial_upload_redelivery_reacquires_and_publishes_before_acknowledgement() {
+        use crate::fakes::Call;
+
+        let f = Fixture::with_storage(Duration::ZERO, |storage| {
+            storage.fail_write_after(1, "second segment upload failed");
+        });
+        let prefix = format!("videos/{VIDEO}/jobs/{FIRST}/hls");
+        let write_keys = || {
+            f.log
+                .calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    Call::Write { key, .. } => Some(key),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        f.run(&[FIRST]).await;
+        {
+            let s = f.state.lock().unwrap();
+            assert_eq!(s.jobs.get(FIRST), Some(&"QUEUED"));
+            assert_eq!(s.acquired_attempts.get(FIRST), Some(&1));
+            assert!(s.calls.contains(&format!("release:{FIRST}")));
+            assert_eq!(s.calls.last().unwrap(), "visibility:1000");
+            assert!(!s.calls.iter().any(|call| call == "delete"
+                || call.starts_with("complete:")
+                || call.starts_with("fail:")));
+        }
+        assert_eq!(
+            write_keys(),
+            [
+                format!("{prefix}/segment-00000.ts"),
+                format!("{prefix}/segment-00001.ts"),
+            ]
+        );
+
+        // Redeliver the same notification against the retained job and output state.
+        let mut redelivery = Fixture::message(&[FIRST]);
+        redelivery.receipt_handle = "redelivery-receipt".into();
+        redelivery.receive_count = 2;
+        f.processor.process(redelivery).await.unwrap();
+
+        assert_eq!(
+            write_keys(),
+            [
+                format!("{prefix}/segment-00000.ts"),
+                format!("{prefix}/segment-00001.ts"),
+                format!("{prefix}/segment-00000.ts"),
+                format!("{prefix}/segment-00001.ts"),
+                format!("{prefix}/index.m3u8"),
+            ]
+        );
+        let s = f.state.lock().unwrap();
+        assert_eq!(s.jobs.get(FIRST), Some(&"COMPLETED"));
+        assert_eq!(s.acquired_attempts.get(FIRST), Some(&2));
+        assert_eq!(s.output_at_completion, f.log.calls());
+        assert_eq!(s.calls.iter().filter(|call| *call == "encode").count(), 2);
+        assert_eq!(s.calls.iter().filter(|call| *call == "delete").count(), 1);
+        assert_eq!(
+            &s.calls[s.calls.len() - 2..],
+            [format!("complete:{FIRST}"), "delete".into()]
+        );
+        assert!(std::fs::read_dir(f._root.path()).unwrap().next().is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn runtime_shutdown_stops_processing_and_joins_heartbeat_without_ack() {
         let f = Fixture::new(Duration::from_secs(3600), false);

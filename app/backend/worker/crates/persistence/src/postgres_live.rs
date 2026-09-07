@@ -495,6 +495,134 @@ async fn exhausted_attempt_is_busy_until_expiry_then_remains_unacquired() {
 }
 
 #[tokio::test]
+async fn expired_worker_is_fenced_out_after_replacement_acquires_and_completes() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut first = live.job_state().await;
+    let mut replacement = live.job_state().await;
+    let maximum_attempts = 2;
+    assert!(first.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    assert_eq!(
+        acquired_attempt(
+            first
+                .acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, maximum_attempts,)
+                .await
+                .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        replacement
+            .acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, maximum_attempts,)
+            .await
+            .unwrap(),
+        LeaseAcquisitionOutcome::Busy
+    );
+
+    // Simulate a worker that stopped renewing, without waiting for wall-clock expiry.
+    expire_lease(&live.admin, JOB_ID).await;
+    assert_eq!(
+        acquired_attempt(
+            replacement
+                .acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, maximum_attempts,)
+                .await
+                .unwrap()
+        ),
+        2
+    );
+    let recovered = lease_row(&live.admin, JOB_ID).await;
+    assert_eq!(recovered.get::<_, String>(1), WORKER_B);
+
+    assert_eq!(
+        first
+            .renew_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS)
+            .await
+            .unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    assert_eq!(
+        first
+            .release_for_retry(JOB_ID, VIDEO_ID, WORKER_A, maximum_attempts)
+            .await
+            .unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    assert_eq!(
+        first.complete(JOB_ID, VIDEO_ID, WORKER_A).await.unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    // The attempt budget is exhausted, so failure must be rejected by ownership.
+    assert_eq!(
+        first
+            .fail(JOB_ID, VIDEO_ID, WORKER_A, "late failure", maximum_attempts)
+            .await
+            .unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    let unchanged = lease_row(&live.admin, JOB_ID).await;
+    assert_eq!(unchanged.get::<_, String>(0), "PROCESSING");
+    assert_eq!(unchanged.get::<_, String>(1), WORKER_B);
+    assert_eq!(
+        unchanged.get::<_, SystemTime>(2),
+        recovered.get::<_, SystemTime>(2)
+    );
+    assert_eq!(unchanged.get::<_, i32>(3), 2);
+    assert!(unchanged.get::<_, Option<String>>(4).is_none());
+    assert!(unchanged.get::<_, Option<String>>(5).is_none());
+
+    assert_eq!(
+        replacement
+            .complete(JOB_ID, VIDEO_ID, WORKER_B)
+            .await
+            .unwrap(),
+        JobOperationOutcome::Applied
+    );
+    let completed = lease_row(&live.admin, JOB_ID).await;
+    assert_eq!(completed.get::<_, String>(0), "COMPLETED");
+    assert!(completed.get::<_, Option<String>>(1).is_none());
+    assert!(completed.get::<_, Option<SystemTime>>(2).is_none());
+    assert_eq!(completed.get::<_, i32>(3), 2);
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn current_owner_renewal_extends_expiry_without_changing_owner_or_attempt() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    assert_eq!(
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        1
+    );
+    let before = lease_row(&live.admin, JOB_ID).await;
+
+    // A longer renewal duration makes the extension observable without sleeping.
+    assert_eq!(
+        jobs.renew_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS * 2)
+            .await
+            .unwrap(),
+        JobOperationOutcome::Applied
+    );
+
+    let after = lease_row(&live.admin, JOB_ID).await;
+    assert!(after.get::<_, SystemTime>(2) > before.get::<_, SystemTime>(2));
+    assert_eq!(after.get::<_, String>(0), "PROCESSING");
+    assert_eq!(after.get::<_, String>(1), WORKER_A);
+    assert_eq!(after.get::<_, i32>(3), before.get::<_, i32>(3));
+    assert_eq!(after.get::<_, i32>(3), 1);
+    live.cleanup().await;
+}
+
+#[tokio::test]
 async fn owner_updates_require_unexpired_matching_lease() {
     let Some(live) = setup().await else {
         return;
