@@ -41,6 +41,30 @@ impl fmt::Display for WorkerIdentityError {
 
 impl std::error::Error for WorkerIdentityError {}
 
+/// Provides one identity for the lifetime of a worker process.
+#[derive(Clone, Debug)]
+pub struct WorkerIdentityProvider {
+    identity: WorkerIdentity,
+}
+
+impl WorkerIdentityProvider {
+    pub fn new() -> Self {
+        Self {
+            identity: WorkerIdentity::generate(),
+        }
+    }
+
+    pub fn identity(&self) -> WorkerIdentity {
+        self.identity.clone()
+    }
+}
+
+impl Default for WorkerIdentityProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Ownership data required by heartbeat and processing tasks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcquiredJob {
