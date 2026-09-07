@@ -2,6 +2,7 @@
 
 pub mod acquisition;
 pub mod claim;
+pub mod completion;
 pub mod event;
 pub mod fakes;
 pub mod heartbeat;

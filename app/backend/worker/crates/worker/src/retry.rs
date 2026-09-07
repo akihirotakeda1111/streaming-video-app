@@ -1,6 +1,14 @@
 //! Retry-safe processing for one already acquired lease.
 
-use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use encoding::{Execute, HlsError, encode_hls, runtime::JobDirectory};
 use persistence::{JobOperationOutcome, JobState, PersistenceError};
@@ -85,6 +93,7 @@ pub struct OwnedAttemptProcessor<J, S, E> {
     ffmpeg_path: PathBuf,
     temporary_directory: PathBuf,
     settings: RetrySettings,
+    activity: Option<Arc<AtomicBool>>,
 }
 
 impl<J, S, E> Clone for OwnedAttemptProcessor<J, S, E> {
@@ -97,6 +106,7 @@ impl<J, S, E> Clone for OwnedAttemptProcessor<J, S, E> {
             ffmpeg_path: self.ffmpeg_path.clone(),
             temporary_directory: self.temporary_directory.clone(),
             settings: self.settings,
+            activity: self.activity.clone(),
         }
     }
 }
@@ -120,11 +130,44 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
             ffmpeg_path: ffmpeg_path.into(),
             temporary_directory: temporary_directory.into(),
             settings,
+            activity: None,
+        }
+    }
+
+    pub fn from_shared(
+        jobs: Arc<Mutex<J>>,
+        storage: Arc<Mutex<S>>,
+        executor: Arc<Mutex<E>>,
+        output_bucket: impl Into<String>,
+        ffmpeg_path: impl Into<PathBuf>,
+        temporary_directory: impl Into<PathBuf>,
+        settings: RetrySettings,
+    ) -> Self {
+        Self {
+            jobs,
+            storage,
+            executor,
+            output_bucket: output_bucket.into(),
+            ffmpeg_path: ffmpeg_path.into(),
+            temporary_directory: temporary_directory.into(),
+            settings,
+            activity: None,
         }
     }
 
     fn owned(cancelled: &watch::Receiver<bool>) -> bool {
         !*cancelled.borrow()
+    }
+
+    pub fn with_activity(mut self, activity: Arc<AtomicBool>) -> Self {
+        self.activity = Some(activity);
+        self
+    }
+
+    fn retire(&self) {
+        if let Some(active) = &self.activity {
+            active.store(false, Ordering::SeqCst);
+        }
     }
 
     pub async fn process(
@@ -179,14 +222,15 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
                 if !Self::owned(cancelled) {
                     return Ok(ProcessingOutcome::OwnershipLost);
                 }
-                let outcome = match jobs
+                let outcome = jobs
                     .complete(
                         &acquired.item.job_id,
                         &acquired.item.video_id,
                         acquired.worker_id.as_str(),
                     )
-                    .await
-                {
+                    .await;
+                self.retire();
+                let outcome = match outcome {
                     Ok(outcome) => outcome,
                     Err(_) => return Ok(ProcessingOutcome::InfrastructureFailure),
                 };
@@ -290,6 +334,7 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
             .await
         }
         .map_err(|_: PersistenceError| ProcessingError("persist processing outcome".into()));
+        self.retire();
         let operation = match operation {
             Ok(operation) => operation,
             Err(_) => return Ok(ProcessingOutcome::InfrastructureFailure),

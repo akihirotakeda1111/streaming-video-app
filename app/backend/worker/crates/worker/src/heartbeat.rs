@@ -1,6 +1,13 @@
 //! Cancellable ownership renewal for one received message.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use persistence::{JobOperationOutcome, JobState, PersistenceError};
 use queue::{ChangeVisibility, QueueError};
@@ -90,17 +97,21 @@ pub struct HeartbeatDeadlines {
 
 struct OwnershipDeadlines {
     leases: Vec<Instant>,
+    active: Vec<Arc<AtomicBool>>,
     visibility: Instant,
 }
 
 impl OwnershipDeadlines {
     fn earliest(&self, acquired: &[AcquiredJob]) -> (Instant, HeartbeatLoss) {
-        let (index, lease) = self
+        let Some((index, lease)) = self
             .leases
             .iter()
             .enumerate()
+            .filter(|(index, _)| self.active[*index].load(Ordering::SeqCst))
             .min_by_key(|(_, d)| *d)
-            .expect("heartbeat requires an acquired job");
+        else {
+            return (self.visibility, HeartbeatLoss::VisibilityDeadlineExceeded);
+        };
         if *lease <= self.visibility {
             (
                 *lease,
@@ -115,18 +126,26 @@ impl OwnershipDeadlines {
 }
 
 async fn before_deadline<T>(
-    deadline: (Instant, HeartbeatLoss),
+    deadlines: &OwnershipDeadlines,
+    acquired: &[AcquiredJob],
     operation: impl std::future::Future<Output = Result<T, HeartbeatLoss>>,
 ) -> Result<T, HeartbeatLoss> {
-    if Instant::now() >= deadline.0 {
-        return Err(deadline.1);
-    }
-    tokio::select! {
-        biased;
-        _ = sleep_until(deadline.0) => Err(deadline.1),
-        result = operation => {
-            // A ready operation must not win after its ownership budget expired.
-            if Instant::now() >= deadline.0 { Err(deadline.1) } else { result }
+    tokio::pin!(operation);
+    loop {
+        let deadline = deadlines.earliest(acquired);
+        if Instant::now() >= deadline.0 {
+            return Err(deadline.1);
+        }
+        tokio::select! {
+            biased;
+            _ = sleep_until(deadline.0) => {
+                // A record may have retired while we were waiting. Recompute
+                // its relevance without restarting an in-flight port call.
+            }
+            result = &mut operation => {
+                let current = deadlines.earliest(acquired);
+                return if Instant::now() >= current.0 { Err(current.1) } else { result };
+            }
         }
     }
 }
@@ -135,6 +154,9 @@ async fn before_deadline<T>(
 /// completion and shutdown; dropping it aborts the task as a leak safeguard.
 pub struct HeartbeatHandle {
     cancel: watch::Sender<bool>,
+    ownership_lost: watch::Receiver<bool>,
+    active: Vec<Arc<AtomicBool>>,
+    visibility_deadline: Arc<std::sync::Mutex<Instant>>,
     task: Option<JoinHandle<Result<(), HeartbeatLoss>>>,
 }
 
@@ -147,6 +169,20 @@ impl Drop for HeartbeatHandle {
 }
 
 impl HeartbeatHandle {
+    pub fn visibility_deadline(&self) -> Instant {
+        *self
+            .visibility_deadline
+            .lock()
+            .expect("visibility deadline lock poisoned")
+    }
+    pub fn ownership_lost(&self) -> watch::Receiver<bool> {
+        self.ownership_lost.clone()
+    }
+
+    pub fn activity(&self, index: usize) -> Arc<AtomicBool> {
+        self.active[index].clone()
+    }
+
     pub fn cancel(&self) {
         let _ = self.cancel.send(true);
     }
@@ -224,43 +260,71 @@ where
 
     let receipt_handle = receipt_handle.into();
     let (cancel, mut cancellation) = watch::channel(false);
+    let (lost, ownership_lost) = watch::channel(
+        Instant::now() >= initial_deadlines.lease || Instant::now() >= initial_deadlines.visibility,
+    );
+    // Every exit, including panic or abort, revokes processing permission.
+    struct RevokeOnDrop(watch::Sender<bool>);
+    impl Drop for RevokeOnDrop {
+        fn drop(&mut self) {
+            self.0.send_replace(true);
+        }
+    }
+    let revoke = RevokeOnDrop(lost);
+    let active: Vec<_> = acquired
+        .iter()
+        .map(|_| Arc::new(AtomicBool::new(true)))
+        .collect();
+    let tracked = active.clone();
+    let visibility_deadline = Arc::new(std::sync::Mutex::new(initial_deadlines.visibility));
+    let current_visibility = visibility_deadline.clone();
     let first_tick = Instant::now() + settings.interval;
     let task = tokio::spawn(async move {
+        let _revoke = revoke;
         let mut cadence = interval_at(first_tick, settings.interval);
         cadence.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut deadlines = OwnershipDeadlines {
             leases: vec![initial_deadlines.lease; acquired.len()],
+            active: tracked,
             visibility: initial_deadlines.visibility,
         };
         loop {
             tokio::select! {
                 biased;
                 _ = cancellation.changed() => return Ok(()),
-                result = before_deadline(deadlines.earliest(&acquired), async {
+                result = before_deadline(&deadlines, &acquired, async {
                     cadence.tick().await;
                     Ok(())
                 }) => result?,
             }
 
-            let tick = renew_tick(
-                jobs.clone(),
-                queue.clone(),
-                &receipt_handle,
-                &acquired,
-                settings,
-                &mut deadlines,
-            );
-            tokio::pin!(tick);
-            tokio::select! {
-                biased;
-                _ = cancellation.changed() => return Ok(()),
-                result = &mut tick => result?,
+            {
+                let tick = renew_tick(
+                    jobs.clone(),
+                    queue.clone(),
+                    &receipt_handle,
+                    &acquired,
+                    settings,
+                    &mut deadlines,
+                );
+                tokio::pin!(tick);
+                tokio::select! {
+                    biased;
+                    _ = cancellation.changed() => return Ok(()),
+                    result = &mut tick => result?,
+                }
             }
+            *current_visibility
+                .lock()
+                .expect("visibility deadline lock poisoned") = deadlines.visibility;
         }
     });
 
     Some(HeartbeatHandle {
         cancel,
+        ownership_lost,
+        active,
+        visibility_deadline,
         task: Some(task),
     })
 }
@@ -278,18 +342,24 @@ where
     Q: ChangeVisibility + Send + 'static,
 {
     for (index, job) in acquired.iter().enumerate() {
+        if !deadlines.active[index].load(Ordering::SeqCst) {
+            continue;
+        }
         let started = Instant::now();
-        let outcome = before_deadline(deadlines.earliest(acquired), async {
-            jobs.lock()
-                .await
-                .renew_lease(
-                    &job.item.job_id,
-                    &job.item.video_id,
-                    job.worker_id.as_str(),
-                    settings.lease_duration.as_secs(),
-                )
-                .await
-                .map_err(HeartbeatLoss::Database)
+        let outcome = before_deadline(deadlines, acquired, async {
+            let mut jobs = jobs.lock().await;
+            // The attempt retires under this same lock after its state update.
+            if !deadlines.active[index].load(Ordering::SeqCst) {
+                return Ok(JobOperationOutcome::Applied);
+            }
+            jobs.renew_lease(
+                &job.item.job_id,
+                &job.item.video_id,
+                job.worker_id.as_str(),
+                settings.lease_duration.as_secs(),
+            )
+            .await
+            .map_err(HeartbeatLoss::Database)
         })
         .await?;
         if outcome != JobOperationOutcome::Applied {
@@ -305,7 +375,7 @@ where
     }
 
     let started = Instant::now();
-    before_deadline(deadlines.earliest(acquired), async {
+    before_deadline(deadlines, acquired, async {
         queue
             .lock()
             .await
@@ -495,6 +565,7 @@ mod tests {
                 .collect()
         }
         async fn loss(&self, handle: HeartbeatHandle, expected: HeartbeatLoss) {
+            let cancelled = handle.ownership_lost();
             // A timeout makes failure bounded even if the watchdog regresses.
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(1), handle.join())
@@ -504,6 +575,10 @@ mod tests {
                 Err(expected)
             );
             assert_eq!(self.active.load(Ordering::SeqCst), 0);
+            assert!(
+                *cancelled.borrow(),
+                "heartbeat failure must reach processing"
+            );
             let calls = self.calls();
             advance(400).await;
             assert_eq!(self.calls(), calls);
@@ -516,6 +591,58 @@ mod tests {
     }
     fn lease_loss(job: &str) -> HeartbeatLoss {
         HeartbeatLoss::LeaseDeadlineExceeded { job_id: job.into() }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retiring_a_record_while_renewal_waits_for_the_database_skips_it() {
+        let f = Fixture::new();
+        let h = f.start(2, 300, 120).unwrap();
+        let guard = f.jobs.lock().await;
+        advance(30).await;
+        h.activity(0).store(false, Ordering::SeqCst);
+        drop(guard);
+        advance(1).await;
+        assert_eq!(
+            f.calls()
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect::<Vec<_>>(),
+            ["job-1", "visibility"]
+        );
+        assert_eq!(h.cancel_and_join().await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retired_deadline_does_not_cancel_a_pending_visibility_update() {
+        let acquired = vec![AcquiredJob {
+            item: WorkItem {
+                job_id: "job-0".into(),
+                video_id: "video".into(),
+                bucket: "input".into(),
+                key: "key".into(),
+            },
+            worker_id: WorkerIdentity::from_value("worker").unwrap(),
+            attempt: 1,
+            lease_expires_at: SystemTime::UNIX_EPOCH,
+        }];
+        let active = Arc::new(AtomicBool::new(true));
+        let deadlines = OwnershipDeadlines {
+            leases: vec![Instant::now() + Duration::from_secs(5)],
+            active: vec![active.clone()],
+            visibility: Instant::now() + Duration::from_secs(30),
+        };
+        let operation = before_deadline(&deadlines, &acquired, async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(())
+        });
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            _ = &mut operation => panic!("operation must still be pending"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        active.store(false, Ordering::SeqCst);
+        assert_eq!(operation.await, Ok(()));
     }
 
     #[tokio::test(start_paused = true)]

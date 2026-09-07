@@ -161,6 +161,7 @@ mod tests {
             receipt_handle: format!("receipt-{body}"),
             body: body.into(),
             receive_count: 1,
+            visibility_deadline: None,
         }
     }
 

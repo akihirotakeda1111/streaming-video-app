@@ -4,7 +4,7 @@ use std::{future::Future, time::Duration};
 
 use aws_sdk_sqs::{
     Client,
-    types::{Message as AwsMessage, MessageSystemAttributeName},
+    types::{Message as AwsMessage, MessageSystemAttributeName, QueueAttributeName},
 };
 
 use crate::{ChangeVisibility, Delete, Message, QueueError, Receive};
@@ -12,10 +12,15 @@ use crate::{ChangeVisibility, Delete, Message, QueueError, Receive};
 const MAX_VISIBILITY_TIMEOUT_SECS: u64 = 43_200;
 
 trait SqsApi {
+    fn visibility_timeout(
+        &mut self,
+        queue_url: &str,
+    ) -> impl Future<Output = Result<u64, String>> + Send;
     fn receive(
         &mut self,
         queue_url: &str,
         wait_time_seconds: i32,
+        visibility_timeout: i32,
     ) -> impl Future<Output = Result<Option<Message>, String>> + Send;
     fn delete(
         &mut self,
@@ -52,14 +57,33 @@ fn normalize_received_message(message: AwsMessage) -> Result<Message, String> {
         receipt_handle,
         body: message.body.unwrap_or_default(),
         receive_count,
+        visibility_deadline: None,
     })
 }
 
 impl SqsApi for AwsSqsApi {
+    async fn visibility_timeout(&mut self, queue_url: &str) -> Result<u64, String> {
+        let attributes = self
+            .client
+            .get_queue_attributes()
+            .queue_url(queue_url)
+            .attribute_names(QueueAttributeName::VisibilityTimeout)
+            .send()
+            .await
+            .map_err(|_| "queue visibility lookup failed".to_string())?;
+        attributes
+            .attributes
+            .as_ref()
+            .and_then(|values| values.get(&QueueAttributeName::VisibilityTimeout))
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| "queue visibility timeout is invalid".to_string())
+    }
+
     async fn receive(
         &mut self,
         queue_url: &str,
         wait_time_seconds: i32,
+        visibility_timeout: i32,
     ) -> Result<Option<Message>, String> {
         let response = self
             .client
@@ -67,6 +91,7 @@ impl SqsApi for AwsSqsApi {
             .queue_url(queue_url)
             .max_number_of_messages(1)
             .wait_time_seconds(wait_time_seconds)
+            .visibility_timeout(visibility_timeout)
             .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
             .send()
             .await
@@ -130,10 +155,26 @@ impl SqsQueue<AwsSqsApi> {
 
 impl<A: SqsApi + Send> Receive for SqsQueue<A> {
     async fn receive(&mut self) -> Result<Option<Message>, QueueError> {
-        self.api
-            .receive(&self.queue_url, 20)
+        let seconds = self
+            .api
+            .visibility_timeout(&self.queue_url)
             .await
-            .map_err(QueueError)
+            .map_err(QueueError)?;
+        if seconds == 0 || seconds > MAX_VISIBILITY_TIMEOUT_SECS {
+            return Err(QueueError("queue visibility timeout is invalid".into()));
+        }
+        // Pin the current queue timeout on the request and account for the
+        // entire receive latency, including long polling and SDK retries.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        let mut message = self
+            .api
+            .receive(&self.queue_url, 20, seconds as i32)
+            .await
+            .map_err(QueueError)?;
+        if let Some(message) = &mut message {
+            message.visibility_deadline = Some(deadline);
+        }
+        Ok(message)
     }
 }
 
@@ -195,6 +236,7 @@ mod tests {
                 receipt_handle: "receipt".into(),
                 body: "body".into(),
                 receive_count: 2,
+                visibility_deadline: None,
             }
         );
     }
@@ -231,22 +273,30 @@ mod tests {
     #[derive(Default)]
     struct FakeApi {
         calls: Vec<Vec<String>>,
+        receive_delay: Duration,
     }
     impl SqsApi for FakeApi {
+        async fn visibility_timeout(&mut self, _: &str) -> Result<u64, String> {
+            Ok(120)
+        }
         async fn receive(
             &mut self,
             queue_url: &str,
             wait_time_seconds: i32,
+            visibility_timeout: i32,
         ) -> Result<Option<Message>, String> {
             self.calls.push(vec![
                 "receive".into(),
                 queue_url.into(),
                 wait_time_seconds.to_string(),
+                visibility_timeout.to_string(),
             ]);
+            tokio::time::sleep(self.receive_delay).await;
             Ok(Some(Message {
                 receipt_handle: "receipt".into(),
                 body: "body".into(),
                 receive_count: 1,
+                visibility_deadline: None,
             }))
         }
         async fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String> {
@@ -275,6 +325,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receive_deadline_includes_time_spent_waiting_for_sqs() {
+        let mut queue = SqsQueue {
+            queue_url: "queue".into(),
+            api: FakeApi {
+                receive_delay: Duration::from_millis(40),
+                ..FakeApi::default()
+            },
+        };
+        let start = tokio::time::Instant::now();
+        let message = queue.receive().await.unwrap().unwrap();
+        let deadline = message.visibility_deadline.unwrap();
+        assert!(deadline >= start + Duration::from_secs(120));
+        assert!(
+            deadline
+                < tokio::time::Instant::now() + Duration::from_secs(120)
+                    - Duration::from_millis(20)
+        );
+    }
+
+    #[tokio::test]
     async fn adapter_uses_configured_queue_and_long_polling_without_aws() {
         let mut queue = SqsQueue {
             queue_url: "https://example.test/configured".into(),
@@ -289,6 +359,7 @@ mod tests {
                     "receive".to_string(),
                     "https://example.test/configured".to_string(),
                     "20".to_string(),
+                    "120".to_string(),
                 ],
                 vec![
                     "delete".to_string(),
