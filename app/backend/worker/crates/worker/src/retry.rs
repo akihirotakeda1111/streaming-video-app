@@ -189,23 +189,29 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         if !Self::owned(cancelled) {
             return Err("ownership lost".into());
         }
-        let source = self
-            .storage
-            .lock()
-            .await
+        let mut storage = self.storage.lock().await;
+        if !Self::owned(cancelled) {
+            return Err("ownership lost".into());
+        }
+        let source = storage
             .read(&acquired.item.bucket, &acquired.item.key)
             .await
             .map_err(|e: ObjectError| format!("download source: {}", e.0))?;
+        drop(storage);
+        if !Self::owned(cancelled) {
+            return Err("ownership lost".into());
+        }
         tokio::fs::write(directory.path().join("source.mp4"), source)
             .await
             .map_err(|e| format!("write source: {e}"))?;
-        let output = encode_hls(
-            &mut *self.executor.lock().await,
-            self.ffmpeg_path.clone(),
-            directory.path(),
-        )
+        let mut executor = self.executor.lock().await;
+        if !Self::owned(cancelled) {
+            return Err("ownership lost".into());
+        }
+        let output = encode_hls(&mut *executor, self.ffmpeg_path.clone(), directory.path())
         .await
         .map_err(|e: HlsError| format!("encode HLS: {e}"))?;
+        drop(executor);
         if !Self::owned(cancelled) {
             return Err("ownership lost".into());
         }

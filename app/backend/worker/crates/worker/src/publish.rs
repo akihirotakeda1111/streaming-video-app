@@ -55,7 +55,8 @@ pub async fn publish_hls<W: Write>(
     publish_hls_with_checkpoint(storage, output_bucket, video_id, job_id, output, || true).await
 }
 
-/// Upload segments, then check ownership immediately before the manifest.
+/// Check ownership immediately before each upload, publishing the manifest last.
+/// This checkpoint cannot revoke an object write that is already in flight.
 pub async fn publish_hls_with_checkpoint<W, F>(
     storage: &mut W,
     output_bucket: &str,
@@ -76,6 +77,9 @@ where
             .and_then(|name| name.to_str())
             .ok_or(PublishError::InvalidSegmentPath)?;
         let contents = tokio::fs::read(segment).await?;
+        if !owned() {
+            return Err(PublishError::OwnershipLost);
+        }
         storage
             .write(
                 output_bucket,
@@ -86,11 +90,11 @@ where
             .await?;
     }
 
+    let playlist = tokio::fs::read(&output.playlist).await?;
     if !owned() {
         return Err(PublishError::OwnershipLost);
     }
 
-    let playlist = tokio::fs::read(&output.playlist).await?;
     storage
         .write(
             output_bucket,
@@ -126,6 +130,23 @@ mod tests {
                 segments: vec![segment_zero, segment_one],
             },
         )
+    }
+
+    #[tokio::test]
+    async fn ownership_loss_before_publication_uploads_nothing() {
+        let (_directory, output) = output();
+        let mut storage = FakeStorage::new(CallLog::default());
+        let result = publish_hls_with_checkpoint(
+            &mut storage,
+            "video-output",
+            VIDEO_ID,
+            JOB_ID,
+            &output,
+            || false,
+        )
+        .await;
+        assert!(matches!(result, Err(PublishError::OwnershipLost)));
+        assert!(storage.log.calls().is_empty());
     }
 
     #[tokio::test]
