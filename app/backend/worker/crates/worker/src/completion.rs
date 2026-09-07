@@ -201,7 +201,11 @@ where
                                 outcome,
                                 ProcessingOutcome::OwnershipLost
                                     | ProcessingOutcome::InfrastructureFailure
+                                    | ProcessingOutcome::Panicked
                             ) {
+                                // An uncertain attempt must expire naturally;
+                                // do not shorten visibility using an earlier record's retry delay.
+                                retry_delay = None;
                                 break;
                             }
                         }
@@ -283,6 +287,7 @@ mod tests {
         delete_failure: bool,
         acquisition_delay: Duration,
         attempt: u32,
+        panic_next_encode: bool,
     }
     #[derive(Clone)]
     struct Jobs(Arc<StdMutex<State>>);
@@ -419,6 +424,11 @@ mod tests {
         async fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
             self.state.lock().unwrap().calls.push("encode".into());
             tokio::time::sleep(self.delay).await;
+            let should_panic = {
+                let mut state = self.state.lock().unwrap();
+                std::mem::take(&mut state.panic_next_encode)
+            };
+            assert!(!should_panic, "injected encoder panic");
             self.inner.execute(command).await
         }
     }
@@ -586,6 +596,68 @@ mod tests {
         let calls = f.state.lock().unwrap().calls.clone();
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(f.state.lock().unwrap().calls, calls);
+    }
+
+    #[tokio::test]
+    async fn encoder_panic_keeps_the_whole_message_and_stops_heartbeat() {
+        let f = Fixture::new(Duration::from_millis(60), false);
+        f.state.lock().unwrap().panic_next_encode = true;
+        f.run(&[FIRST, SECOND]).await;
+        let calls = f.state.lock().unwrap().calls.clone();
+        assert!(calls.contains(&format!("renew:{FIRST}")));
+        assert_eq!(calls.iter().filter(|c| *c == "encode").count(), 1);
+        assert!(!calls.iter().any(|c| c == "delete"
+            || c.starts_with("complete:")
+            || c.starts_with("fail:")
+            || c.starts_with("release:")));
+        assert!(
+            !f.log
+                .calls()
+                .iter()
+                .any(|c| matches!(c, crate::fakes::Call::Write { .. }))
+        );
+        assert!(std::fs::read_dir(f._root.path()).unwrap().next().is_none());
+        assert!(f.processor.heartbeat_jobs.try_lock().is_ok());
+        assert!(f.processor.queue.try_lock().is_ok());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(f.state.lock().unwrap().calls, calls);
+    }
+
+    #[tokio::test]
+    async fn encoder_panic_does_not_stop_receiving_and_processing_the_next_message() {
+        struct Receiver(std::collections::VecDeque<Message>);
+        impl queue::Receive for Receiver {
+            async fn receive(&mut self) -> Result<Option<Message>, QueueError> {
+                self.0
+                    .pop_front()
+                    .map(Some)
+                    .ok_or_else(|| QueueError("end of test".into()))
+            }
+        }
+        let f = Fixture::new(Duration::ZERO, false);
+        f.state.lock().unwrap().panic_next_encode = true;
+        let receiver = Receiver(std::collections::VecDeque::from([
+            Fixture::message(&[FIRST]),
+            Fixture::message(&[SECOND]),
+        ]));
+        let (_stop, shutdown) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            crate::runtime::run(receiver, f.processor.clone(), shutdown, 1),
+        )
+        .await
+        .unwrap();
+        // Both messages finished before the receive-level error still surfaces.
+        assert!(
+            matches!(result, Err(crate::runtime::RunError::Receive(QueueError(ref error)))
+            if error == "end of test")
+        );
+        let state = f.state.lock().unwrap();
+        assert_eq!(state.jobs.get(FIRST), Some(&"PROCESSING"));
+        assert_eq!(state.jobs.get(SECOND), Some(&"COMPLETED"));
+        assert_eq!(state.calls.iter().filter(|c| *c == "encode").count(), 2);
+        assert_eq!(state.calls.iter().filter(|c| *c == "delete").count(), 1);
+        assert!(!state.calls.contains(&format!("complete:{FIRST}")));
     }
     #[tokio::test]
     async fn finished_records_are_not_renewed_while_later_records_keep_running() {

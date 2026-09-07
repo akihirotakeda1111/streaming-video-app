@@ -2,6 +2,7 @@
 
 use std::{
     fmt,
+    panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{
         Arc,
@@ -11,6 +12,7 @@ use std::{
 };
 
 use encoding::{Execute, HlsError, encode_hls, runtime::JobDirectory};
+use futures_util::FutureExt;
 use persistence::{JobOperationOutcome, JobState, PersistenceError};
 use storage::{ObjectError, Read, Write};
 use tokio::sync::{Mutex, watch};
@@ -69,10 +71,14 @@ impl std::error::Error for RetrySettingsError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcessingOutcome {
     Completed,
-    RetryReleased { delay: Duration },
+    RetryReleased {
+        delay: Duration,
+    },
     FinalFailed,
     OwnershipLost,
     InfrastructureFailure,
+    /// The attempt unwound; its durable state is uncertain and must not be acknowledged.
+    Panicked,
 }
 
 #[derive(Debug)]
@@ -180,8 +186,19 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         S: Read + Write,
         E: Execute,
     {
-        self.process_with_cleanup(acquired, cancelled, JobDirectory::remove)
+        // Catch the whole owned attempt, including persistence calls. Never
+        // translate a panic into a retry release or a fabricated terminal state.
+        // The unwound future drops its locks, work directory, and child process.
+        match AssertUnwindSafe(self.process_with_cleanup(acquired, cancelled, JobDirectory::remove))
+            .catch_unwind()
             .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.retire();
+                Ok(ProcessingOutcome::Panicked)
+            }
+        }
     }
 
     async fn process_with_cleanup(
@@ -365,6 +382,7 @@ mod tests {
         calls: Vec<&'static str>,
         failure: Option<String>,
         outcome: Result<JobOperationOutcome, PersistenceError>,
+        panic_at: Option<&'static str>,
     }
 
     impl JobState for Jobs {
@@ -387,6 +405,7 @@ mod tests {
             worker: &str,
         ) -> Result<JobOperationOutcome, PersistenceError> {
             assert_eq!((job, video, worker), ("job", "video", "worker"));
+            assert_ne!(self.panic_at, Some("complete"), "injected completion panic");
             self.calls.push("complete");
             self.outcome.clone()
         }
@@ -398,6 +417,7 @@ mod tests {
             maximum: u32,
         ) -> Result<JobOperationOutcome, PersistenceError> {
             assert_eq!(maximum, 5);
+            assert_ne!(self.panic_at, Some("release"), "injected release panic");
             self.calls.push("release");
             self.outcome.clone()
         }
@@ -411,6 +431,7 @@ mod tests {
         ) -> Result<JobOperationOutcome, PersistenceError> {
             assert_eq!(maximum, 5);
             assert!(!reason.is_empty());
+            assert_ne!(self.panic_at, Some("fail"), "injected failure panic");
             self.calls.push("fail");
             self.failure = Some(reason.into());
             self.outcome.clone()
@@ -423,9 +444,11 @@ mod tests {
         cancel_after_write: Option<usize>,
         cancel_after_read: bool,
         writes: usize,
+        panic_at: Option<usize>,
     }
     impl Read for Storage {
         async fn read(&mut self, bucket: &str, key: &str) -> Result<Vec<u8>, ObjectError> {
+            assert_ne!(self.panic_at, Some(0), "injected download panic");
             let result = self.inner.read(bucket, key).await;
             if self.cancel_after_read {
                 self.cancel.send_replace(true);
@@ -441,6 +464,11 @@ mod tests {
             kind: &str,
             bytes: &[u8],
         ) -> Result<(), ObjectError> {
+            assert_ne!(
+                self.panic_at,
+                Some(self.writes + 1),
+                "injected upload panic"
+            );
             let result = self.inner.write(bucket, key, kind, bytes).await;
             self.writes += 1;
             if self.cancel_after_write == Some(self.writes) {
@@ -469,6 +497,7 @@ mod tests {
                     calls: vec![],
                     failure: None,
                     outcome: Ok(JobOperationOutcome::Applied),
+                    panic_at: None,
                 },
                 Storage {
                     inner: storage,
@@ -476,6 +505,7 @@ mod tests {
                     cancel_after_write: None,
                     cancel_after_read: false,
                     writes: 0,
+                    panic_at: None,
                 },
                 FakeProcessExecutor::stub_hls(log.clone()),
                 "output",
@@ -518,6 +548,48 @@ mod tests {
             }
         } else {
             ProcessingOutcome::FinalFailed
+        }
+    }
+
+    #[tokio::test]
+    async fn panics_at_download_and_each_upload_are_typed_without_state_updates() {
+        for stage in 0..=3 {
+            for attempt in [1, 5] {
+                let mut f = Fixture::new();
+                let active = Arc::new(AtomicBool::new(true));
+                f.processor = f.processor.with_activity(active.clone());
+                f.processor.storage.lock().await.panic_at = Some(stage);
+                assert_eq!(f.run(attempt).await, ProcessingOutcome::Panicked);
+                assert!(!active.load(Ordering::SeqCst));
+                assert!(f.processor.jobs.lock().await.calls.is_empty());
+                assert!(f.processor.jobs.lock().await.failure.is_none());
+                assert_eq!(
+                    f.processor.storage.lock().await.writes,
+                    stage.saturating_sub(1)
+                );
+                assert!(f.processor.executor.try_lock().is_ok());
+                assert_eq!(std::fs::read_dir(f.root.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_panics_do_not_manufacture_a_terminal_or_retry_result() {
+        for (operation, attempt) in [("complete", 1), ("release", 1), ("fail", 5)] {
+            let mut f = Fixture::new();
+            f.processor.jobs.lock().await.panic_at = Some(operation);
+            if operation != "complete" {
+                f.processor
+                    .storage
+                    .lock()
+                    .await
+                    .inner
+                    .fail_read("download failed");
+            }
+            assert_eq!(f.run(attempt).await, ProcessingOutcome::Panicked);
+            assert!(f.processor.jobs.lock().await.calls.is_empty());
+            assert!(f.processor.jobs.lock().await.failure.is_none());
+            assert_eq!(std::fs::read_dir(f.root.path()).unwrap().count(), 0);
         }
     }
 

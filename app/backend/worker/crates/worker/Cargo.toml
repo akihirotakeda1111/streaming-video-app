@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 encoding = { path = "../encoding" }
 persistence = { path = "../persistence" }
 queue = { path = "../queue" }

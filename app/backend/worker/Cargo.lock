@@ -2861,6 +2861,7 @@ name = "worker"
 version = "0.1.0"
 dependencies = [
  "encoding",
+ "futures-util",
  "persistence",
  "queue",
  "serde_json",
