@@ -137,24 +137,49 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         S: Read + Write,
         E: Execute,
     {
+        self.process_with_cleanup(acquired, cancelled, JobDirectory::remove)
+            .await
+    }
+
+    async fn process_with_cleanup(
+        &self,
+        acquired: &AcquiredJob,
+        cancelled: &mut watch::Receiver<bool>,
+        cleanup: impl FnOnce(JobDirectory) -> std::io::Result<()>,
+    ) -> Result<ProcessingOutcome, ProcessingError>
+    where
+        J: JobState,
+        S: Read + Write,
+        E: Execute,
+    {
         if !Self::owned(cancelled) {
             return Ok(ProcessingOutcome::OwnershipLost);
         }
-        let directory = JobDirectory::create(&self.temporary_directory, &acquired.item.job_id)
-            .map_err(|e| ProcessingError(format!("create work directory: {e}")))?;
+        let directory = match JobDirectory::create(&self.temporary_directory, &acquired.item.job_id)
+        {
+            Ok(directory) => directory,
+            Err(error) => {
+                return self
+                    .resolve_failure(
+                        acquired,
+                        cancelled,
+                        format!("create work directory: {error}"),
+                    )
+                    .await;
+            }
+        };
         let result = self.run_pipeline(acquired, cancelled, &directory).await;
-        let cleanup = directory
-            .remove()
-            .map_err(|e| ProcessingError(format!("remove work directory: {e}")));
-        if let Err(error) = cleanup {
-            return Err(error);
+        if let Err(error) = cleanup(directory) {
+            // Cleanup must not suppress the durable outcome of published work.
+            tracing::warn!(job_id = %acquired.item.job_id, error_kind = ?error.kind(), "remove work directory failed");
         }
         match result {
             Ok(()) => {
-                let outcome = match self
-                    .jobs
-                    .lock()
-                    .await
+                let mut jobs = self.jobs.lock().await;
+                if !Self::owned(cancelled) {
+                    return Ok(ProcessingOutcome::OwnershipLost);
+                }
+                let outcome = match jobs
                     .complete(
                         &acquired.item.job_id,
                         &acquired.item.video_id,
@@ -171,7 +196,7 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
                     ProcessingOutcome::OwnershipLost
                 })
             }
-            Err(failure) => self.resolve_failure(acquired, failure).await,
+            Err(failure) => self.resolve_failure(acquired, cancelled, failure).await,
         }
     }
 
@@ -233,15 +258,19 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
     async fn resolve_failure(
         &self,
         acquired: &AcquiredJob,
+        cancelled: &watch::Receiver<bool>,
         failure: String,
     ) -> Result<ProcessingOutcome, ProcessingError>
     where
         J: JobState,
     {
-        if failure == "ownership lost" {
+        if failure == "ownership lost" || !Self::owned(cancelled) {
             return Ok(ProcessingOutcome::OwnershipLost);
         }
         let mut jobs = self.jobs.lock().await;
+        if !Self::owned(cancelled) {
+            return Ok(ProcessingOutcome::OwnershipLost);
+        }
         let operation = if acquired.attempt < self.settings.maximum_attempts {
             jobs.release_for_retry(
                 &acquired.item.job_id,
