@@ -6,7 +6,10 @@ use encoding::Execute;
 use persistence::JobState;
 use queue::{ChangeVisibility, Delete, Message};
 use storage::{Read, Write};
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{
+    sync::{Mutex, watch},
+    time::Instant,
+};
 
 use crate::{
     acquisition::{
@@ -14,7 +17,7 @@ use crate::{
     },
     heartbeat::{HeartbeatDeadlines, HeartbeatSettings},
     retry::{OwnedAttemptProcessor, ProcessingOutcome, RetrySettings},
-    runtime::MessageProcessor,
+    runtime::{MessageProcessor, cancellation_requested},
 };
 
 /// Coordinates all records in one queue message. A message is acknowledged
@@ -99,6 +102,18 @@ where
     type Error = Infallible;
 
     async fn process(&self, message: Message) -> Result<(), Self::Error> {
+        let (_stop, shutdown) = watch::channel(false);
+        self.process_with_shutdown(message, shutdown).await
+    }
+
+    async fn process_with_shutdown(
+        &self,
+        message: Message,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), Self::Error> {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         let Some(mut visibility) = message.visibility_deadline else {
             tracing::warn!("message has no initial visibility budget");
             return Ok(());
@@ -110,12 +125,15 @@ where
         }
         // Acquisition cannot consume the initial budgets and then start work
         // under a freshly invented deadline. Unknown DB results stay undeleted.
-        let dispositions = match tokio::time::timeout_at(
-            deadline,
-            self.acquisition.acquire_notification(&message.body),
-        )
-        .await
-        {
+        let acquisition = tokio::select! {
+            biased;
+            _ = cancellation_requested(&mut shutdown) => return Ok(()),
+            result = tokio::time::timeout_at(
+                deadline,
+                self.acquisition.acquire_notification(&message.body),
+            ) => result,
+        };
+        let dispositions = match acquisition {
             Ok(dispositions) if Instant::now() < deadline => dispositions,
             _ => {
                 tracing::warn!("acquisition exceeded ownership budget");
@@ -142,6 +160,10 @@ where
         let mut retry_delay: Option<Duration> = None;
         let mut index = 0;
         for disposition in dispositions {
+            if *shutdown.borrow() {
+                acknowledge = false;
+                break;
+            }
             match disposition {
                 RecordAcquisitionDisposition::Acquired(job) => {
                     let handle = heartbeat.as_ref().expect("acquired record has a heartbeat");
@@ -158,6 +180,10 @@ where
                     let mut cancelled = lost.clone();
                     let outcome = tokio::select! {
                         biased;
+                        _ = cancellation_requested(&mut shutdown) => {
+                            acknowledge = false;
+                            break;
+                        }
                         _ = lost.changed() => { acknowledge = false; break; }
                         outcome = processing.process(&job, &mut cancelled) => outcome,
                     };
@@ -201,10 +227,10 @@ where
             }
             None => Instant::now() < visibility,
         };
-        if heartbeat_ok && Instant::now() < visibility {
+        if !*shutdown.borrow() && heartbeat_ok && Instant::now() < visibility {
             // The heartbeat must be joined before applying the final delay;
             // otherwise a later renewal can overwrite the retry schedule.
-            let result = tokio::time::timeout_at(
+            let update = tokio::time::timeout_at(
                 visibility.min(Instant::now() + self.heartbeat.interval),
                 async {
                     let mut queue = self.queue.lock().await;
@@ -218,8 +244,12 @@ where
                         Ok(())
                     }
                 },
-            )
-            .await;
+            );
+            let result = tokio::select! {
+                biased;
+                _ = cancellation_requested(&mut shutdown) => return Ok(()),
+                result = update => result,
+            };
             if !matches!(result, Ok(Ok(()))) {
                 tracing::warn!("message disposition queue update failed");
             }
@@ -465,6 +495,89 @@ mod tests {
             .unwrap();
         }
     }
+    #[tokio::test(start_paused = true)]
+    async fn runtime_shutdown_stops_processing_and_joins_heartbeat_without_ack() {
+        let f = Fixture::new(Duration::from_secs(3600), false);
+        let queue_log = CallLog::default();
+        let mut receiver = crate::fakes::FakeQueue::new(queue_log.clone());
+        receiver.push_message(Fixture::message(&[FIRST, SECOND]));
+        let (stop, shutdown) = watch::channel(false);
+        let task = tokio::spawn(crate::runtime::run(
+            receiver,
+            f.processor.clone(),
+            shutdown,
+            1,
+        ));
+        while !f.state.lock().unwrap().calls.contains(&"encode".into()) {
+            assert!(!task.is_finished());
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(20)).await;
+        while !f
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .contains(&"visibility:400".into())
+        {
+            assert!(!task.is_finished());
+            tokio::task::yield_now().await;
+        }
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let calls = f.state.lock().unwrap().calls.clone();
+        assert!(calls.contains(&format!("renew:{FIRST}")));
+        assert!(calls.contains(&format!("renew:{SECOND}")));
+        assert!(!calls.iter().any(|c| c == "delete"
+            || c.starts_with("complete:")
+            || c.starts_with("release:")
+            || c.starts_with("fail:")));
+        assert_eq!(calls.iter().filter(|c| *c == "encode").count(), 1);
+        assert!(
+            !f.log
+                .calls()
+                .iter()
+                .any(|c| matches!(c, crate::fakes::Call::Write { .. }))
+        );
+        assert_eq!(queue_log.calls().len(), 1);
+        assert!(std::fs::read_dir(f._root.path()).unwrap().next().is_none());
+        assert!(f.processor.heartbeat_jobs.try_lock().is_ok());
+        assert!(f.processor.queue.try_lock().is_ok());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(f.state.lock().unwrap().calls, calls);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_acquisition_never_starts_processing_or_heartbeat() {
+        let f = Fixture::new(Duration::ZERO, false);
+        f.state.lock().unwrap().acquisition_delay = Duration::from_secs(3600);
+        let (stop, shutdown) = watch::channel(false);
+        let processor = f.processor.clone();
+        let task = tokio::spawn(async move {
+            processor
+                .process_with_shutdown(Fixture::message(&[FIRST]), shutdown)
+                .await
+        });
+        while f.state.lock().unwrap().calls.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.state.lock().unwrap().calls, [format!("claim:{FIRST}")]);
+        assert!(f.log.calls().is_empty());
+        assert!(f.processor.heartbeat_jobs.try_lock().is_ok());
+    }
+
     #[tokio::test]
     async fn completion_stops_heartbeat_and_deletes_without_waiting_for_lease_loss() {
         let f = Fixture::new(Duration::ZERO, false);

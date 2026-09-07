@@ -1,6 +1,6 @@
 //! Bounded, cancellation-aware message dispatch for one Phase 1 worker.
 
-use std::{error::Error, fmt, future::Future};
+use std::{error::Error, fmt, future::Future, time::Duration};
 
 use queue::{Message, QueueError, Receive};
 use tokio::{sync::watch, task::JoinSet};
@@ -8,11 +8,36 @@ use tokio::{sync::watch, task::JoinSet};
 /// The maximum number of messages processed by one Phase 1 deployment.
 pub const PHASE1_MAX_CONCURRENCY: usize = 2;
 
+/// Time allowed for processors to cancel and join their owned tasks.
+pub const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+pub(crate) async fn cancellation_requested(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow_and_update() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Replaceable boundary between message receipt and the future job pipeline.
 pub trait MessageProcessor: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
     fn process(&self, message: Message) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn process_with_shutdown(
+        &self,
+        message: Message,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            tokio::select! {
+                biased;
+                _ = cancellation_requested(&mut shutdown) => Ok(()),
+                result = self.process(message) => result,
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -35,7 +60,7 @@ impl<E: fmt::Display> fmt::Display for RunError<E> {
 impl<E: Error + 'static> Error for RunError<E> {}
 
 /// Long-polls until cancellation or an error. Cancellation stops new receives,
-/// then waits for the explicitly bounded set of in-flight tasks to finish.
+/// then cancels in-flight work and bounds the time allowed for cleanup.
 /// Receipt never implies deletion; only the downstream processor receives the
 /// message (including its receipt handle).
 pub async fn run<R, P>(
@@ -51,6 +76,7 @@ where
     assert!(max_concurrency > 0, "worker concurrency must be nonzero");
     let mut tasks = JoinSet::new();
     let mut result = Ok(());
+    let (stop_processing, processing_shutdown) = watch::channel(false);
 
     'receiving: loop {
         if *shutdown.borrow() {
@@ -84,7 +110,10 @@ where
             received = receiver.receive() => match received {
                 Ok(Some(message)) => {
                     let message_processor = processor.clone();
-                    tasks.spawn(async move { message_processor.process(message).await });
+                    let shutdown = processing_shutdown.clone();
+                    tasks.spawn(async move {
+                        message_processor.process_with_shutdown(message, shutdown).await
+                    });
                 }
                 Ok(None) => tokio::task::yield_now().await,
                 Err(error) => {
@@ -95,8 +124,22 @@ where
         }
     }
 
-    while let Some(completed) = tasks.join_next().await {
-        record_completion(completed, &mut result);
+    stop_processing.send_replace(true);
+    let drained = tokio::time::timeout(SHUTDOWN_GRACE_PERIOD, async {
+        while let Some(completed) = tasks.join_next().await {
+            record_completion(completed, &mut result);
+        }
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!("worker shutdown grace period exceeded; aborting remaining messages");
+        tasks.abort_all();
+        while let Some(completed) = tasks.join_next().await {
+            if matches!(&completed, Err(error) if error.is_cancelled()) {
+                continue;
+            }
+            record_completion(completed, &mut result);
+        }
     }
     result
 }
@@ -224,6 +267,57 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_and_joins_a_processor_that_ignores_cancellation() {
+        #[derive(Clone)]
+        struct StuckProcessor(Arc<AtomicUsize>);
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        impl MessageProcessor for StuckProcessor {
+            type Error = Infallible;
+
+            async fn process(&self, _: Message) -> Result<(), Self::Error> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let _active = Active(self.0.clone());
+                std::future::pending().await
+            }
+
+            async fn process_with_shutdown(
+                &self,
+                message: Message,
+                _: watch::Receiver<bool>,
+            ) -> Result<(), Self::Error> {
+                self.process(message).await
+            }
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let receiver = ScriptedReceiver {
+            replies: VecDeque::from([Ok(Some(message("one")))]),
+            calls: calls.clone(),
+        };
+        let (stop, shutdown) = watch::channel(false);
+        let task = tokio::spawn(run(receiver, StuckProcessor(active.clone()), shutdown, 1));
+        while active.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        stop.send(true).unwrap();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(SHUTDOWN_GRACE_PERIOD + Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.elapsed(), SHUTDOWN_GRACE_PERIOD);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
