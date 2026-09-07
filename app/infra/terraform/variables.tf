@@ -93,8 +93,8 @@ variable "worker_lease_duration_seconds" {
   description = "Database lease duration used by the worker, in seconds."
   default     = 300
   validation {
-    condition     = var.worker_lease_duration_seconds > 0
-    error_message = "worker_lease_duration_seconds must be positive."
+    condition     = var.worker_lease_duration_seconds > 0 && var.worker_lease_duration_seconds <= 43200
+    error_message = "worker_lease_duration_seconds must be between 1 and 43200."
   }
 }
 

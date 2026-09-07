@@ -29,6 +29,7 @@ pub struct MessageCompletionProcessor<J, S, E, Q> {
     queue: Arc<Mutex<Q>>,
     heartbeat: HeartbeatSettings,
     lease_seconds: u64,
+    worker_id: WorkerIdentity,
 }
 
 impl<J, S, E, Q> Clone for MessageCompletionProcessor<J, S, E, Q> {
@@ -40,6 +41,7 @@ impl<J, S, E, Q> Clone for MessageCompletionProcessor<J, S, E, Q> {
             queue: self.queue.clone(),
             heartbeat: self.heartbeat,
             lease_seconds: self.lease_seconds,
+            worker_id: self.worker_id.clone(),
         }
     }
 }
@@ -68,6 +70,7 @@ impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q> {
         let input_bucket = input_bucket.into();
         let settings = RetrySettings::new(maximum_attempts, retry_delay_seconds)?;
         Ok(Self {
+            worker_id: worker_id.clone(),
             acquisition: LeaseAcquisitionProcessor::from_shared(
                 jobs.clone(),
                 worker_id,
@@ -89,6 +92,24 @@ impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q> {
             heartbeat,
             lease_seconds,
         })
+    }
+
+    // Only canonical IDs and fixed outcome labels enter this log. Never format
+    // event bodies, receipt handles, or adapter error payloads here.
+    fn log_record(
+        &self,
+        item: Option<&crate::event::WorkItem>,
+        attempt: Option<u32>,
+        outcome: &'static str,
+    ) {
+        tracing::info!(
+            worker_id = %self.worker_id.as_str(),
+            job_id = item.map(|item| item.job_id.as_str()),
+            video_id = item.map(|item| item.video_id.as_str()),
+            attempt,
+            outcome,
+            "record outcome"
+        );
     }
 }
 
@@ -115,7 +136,7 @@ where
             return Ok(());
         }
         let Some(mut visibility) = message.visibility_deadline else {
-            tracing::warn!("message has no initial visibility budget");
+            tracing::warn!(worker_id = %self.worker_id.as_str(), outcome = "missing_visibility_budget", "message has no initial visibility budget");
             return Ok(());
         };
         let lease = Instant::now() + Duration::from_secs(self.lease_seconds);
@@ -136,10 +157,31 @@ where
         let dispositions = match acquisition {
             Ok(dispositions) if Instant::now() < deadline => dispositions,
             _ => {
-                tracing::warn!("acquisition exceeded ownership budget");
+                tracing::warn!(worker_id = %self.worker_id.as_str(), outcome = "acquisition_timeout", "acquisition exceeded ownership budget");
                 return Ok(());
             }
         };
+        for disposition in &dispositions {
+            match disposition {
+                RecordAcquisitionDisposition::Acquired(job) => {
+                    self.log_record(Some(&job.item), Some(job.attempt), "acquired");
+                }
+                RecordAcquisitionDisposition::NotAcquired { item, reason } => {
+                    let outcome = match reason {
+                        NoWorkReason::Busy => "busy",
+                        NoWorkReason::Completed => "already_completed",
+                        NoWorkReason::Failed => "failed",
+                        NoWorkReason::UnknownOrMismatched => "unknown_or_mismatched",
+                        NoWorkReason::AttemptExhausted => "attempt_exhausted",
+                        NoWorkReason::PersistenceError(_) => "persistence_error",
+                    };
+                    self.log_record(Some(item), None, outcome);
+                }
+                RecordAcquisitionDisposition::InvalidEvent => {
+                    self.log_record(None, None, "invalid_event")
+                }
+            }
+        }
         let acquired: Vec<_> = dispositions
             .iter()
             .filter_map(|disposition| match disposition {
@@ -169,6 +211,7 @@ where
                     let handle = heartbeat.as_ref().expect("acquired record has a heartbeat");
                     let mut lost = handle.ownership_lost();
                     if *lost.borrow() {
+                        self.log_record(Some(&job.item), Some(job.attempt), "ownership_lost");
                         acknowledge = false;
                         break;
                     }
@@ -181,22 +224,39 @@ where
                     let outcome = tokio::select! {
                         biased;
                         _ = cancellation_requested(&mut shutdown) => {
+                            self.log_record(Some(&job.item), Some(job.attempt), "cancelled");
                             acknowledge = false;
                             break;
                         }
-                        _ = lost.changed() => { acknowledge = false; break; }
+                        _ = lost.changed() => {
+                            self.log_record(Some(&job.item), Some(job.attempt), "ownership_lost");
+                            acknowledge = false;
+                            break;
+                        }
                         outcome = processing.process(&job, &mut cancelled) => outcome,
                     };
                     match outcome {
-                        Ok(ProcessingOutcome::Completed) => {}
+                        Ok(ProcessingOutcome::Completed) => {
+                            self.log_record(Some(&job.item), Some(job.attempt), "completed");
+                        }
                         Ok(ProcessingOutcome::RetryReleased { delay }) => {
+                            self.log_record(Some(&job.item), Some(job.attempt), "retry_released");
                             acknowledge = false;
                             retry_delay =
                                 Some(retry_delay.map_or(delay, |current| current.max(delay)));
                         }
                         Ok(outcome) => {
                             acknowledge = false;
-                            tracing::warn!(job_id = %job.item.job_id, video_id = %job.item.video_id, attempt = job.attempt, outcome = ?outcome, "record left for redrive");
+                            let label = match outcome {
+                                ProcessingOutcome::FinalFailed => "final_failed",
+                                ProcessingOutcome::OwnershipLost => "ownership_lost",
+                                ProcessingOutcome::InfrastructureFailure => {
+                                    "infrastructure_failure"
+                                }
+                                ProcessingOutcome::Panicked => "panicked",
+                                _ => unreachable!("completed and retry outcomes handled above"),
+                            };
+                            self.log_record(Some(&job.item), Some(job.attempt), label);
                             if matches!(
                                 outcome,
                                 ProcessingOutcome::OwnershipLost
@@ -210,6 +270,7 @@ where
                             }
                         }
                         Err(_) => {
+                            self.log_record(Some(&job.item), Some(job.attempt), "processing_error");
                             acknowledge = false;
                             break;
                         }
@@ -255,7 +316,12 @@ where
                 result = update => result,
             };
             if !matches!(result, Ok(Ok(()))) {
-                tracing::warn!("message disposition queue update failed");
+                tracing::warn!(worker_id = %self.worker_id.as_str(), receive_count = message.receive_count,
+                    outcome = "queue_update_failed", "message disposition queue update failed");
+            } else {
+                tracing::info!(worker_id = %self.worker_id.as_str(), receive_count = message.receive_count,
+                    outcome = if retry_delay.is_some() { "retry_scheduled" } else if acknowledge { "deleted" } else { "retained" },
+                    "message outcome");
             }
         }
         Ok(())
@@ -274,6 +340,18 @@ mod tests {
     use queue::QueueError;
     use std::{collections::HashMap, sync::Mutex as StdMutex, time::SystemTime};
 
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<StdMutex<Vec<u8>>>);
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     const VIDEO: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910a";
     const FIRST: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd67";
     const SECOND: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd68";
@@ -288,6 +366,7 @@ mod tests {
         acquisition_delay: Duration,
         attempt: u32,
         panic_next_encode: bool,
+        acquisition_failure: bool,
     }
     #[derive(Clone)]
     struct Jobs(Arc<StdMutex<State>>);
@@ -317,11 +396,18 @@ mod tests {
             let delay = self.0.lock().unwrap().acquisition_delay;
             tokio::time::sleep(delay).await;
             let mut s = self.0.lock().unwrap();
+            if s.acquisition_failure {
+                return Err(PersistenceError(
+                    "postgres://user:secret-password@host/db?token=secret-token".into(),
+                ));
+            }
             let state = s.jobs.get(id).copied().unwrap_or("QUEUED");
             match state {
                 "COMPLETED" => Ok(LeaseAcquisitionOutcome::Completed),
                 "PROCESSING" => Ok(LeaseAcquisitionOutcome::Busy),
                 "FAILED" => Ok(LeaseAcquisitionOutcome::Failed),
+                "UNKNOWN" => Ok(LeaseAcquisitionOutcome::UnknownOrMismatched),
+                "EXHAUSTED" => Ok(LeaseAcquisitionOutcome::AttemptExhausted),
                 _ => {
                     s.jobs.insert(id.into(), "PROCESSING");
                     Ok(LeaseAcquisitionOutcome::Acquired {
@@ -596,6 +682,112 @@ mod tests {
         let calls = f.state.lock().unwrap().calls.clone();
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(f.state.lock().unwrap().calls, calls);
+    }
+
+    #[tokio::test]
+    async fn outcome_logs_include_available_context_and_exclude_sensitive_payloads() {
+        use tracing_subscriber::prelude::*;
+        let buffer = LogBuffer::default();
+        let writer = buffer.clone();
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .with_filter(tracing_subscriber::filter::dynamic_filter_fn(|_, _| true));
+        let subscriber = tracing_subscriber::registry().with(layer);
+        // Install one dispatcher for this test binary so concurrent tests
+        // cannot register these callsites against an empty dispatcher.
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+
+        for expected in [
+            "busy",
+            "already_completed",
+            "failed",
+            "unknown_or_mismatched",
+            "attempt_exhausted",
+            "persistence_error",
+            "invalid_event",
+            "retry_released",
+            "final_failed",
+            "completed",
+            "infrastructure_failure",
+        ] {
+            let mut f = Fixture::new(
+                Duration::ZERO,
+                matches!(expected, "retry_released" | "final_failed"),
+            );
+            let log_worker = format!("log-test-{expected}");
+            f.processor.worker_id = WorkerIdentity::from_value(&log_worker).unwrap();
+            {
+                let mut state = f.state.lock().unwrap();
+                let status = match expected {
+                    "busy" => "PROCESSING",
+                    "already_completed" => "COMPLETED",
+                    "failed" => "FAILED",
+                    "unknown_or_mismatched" => "UNKNOWN",
+                    "attempt_exhausted" => "EXHAUSTED",
+                    _ => "QUEUED",
+                };
+                state.jobs.insert(FIRST.into(), status);
+                state.acquisition_failure = expected == "persistence_error";
+                state.completion_failure = expected == "infrastructure_failure";
+                state.attempt = if expected == "final_failed" { 5 } else { 1 };
+            }
+            // The adapter error and raw input deliberately contain values that
+            // must not be copied into operator-facing logs.
+            let mut message = Fixture::message(&[FIRST]);
+            message.receipt_handle = "secret-receipt".into();
+            if expected == "invalid_event" {
+                message.body = "invalid secret-password secret-token".into();
+            } else {
+                let mut body: serde_json::Value = serde_json::from_str(&message.body).unwrap();
+                body["debug"] = "https://example.test/?token=secret-token".into();
+                message.body = body.to_string();
+            }
+            f.processor.process(message).await.unwrap();
+            let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+            for secret in [
+                "secret-receipt",
+                "secret-password",
+                "secret-token",
+                "postgres://",
+                "https://example.test",
+            ] {
+                assert!(!logs.contains(secret), "{expected} leaked {secret}: {logs}");
+            }
+            let events: Vec<serde_json::Value> = logs
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let event = events
+                .iter()
+                .find(|event| {
+                    event["fields"]["outcome"] == expected
+                        && event["fields"]["worker_id"] == log_worker
+                })
+                .unwrap_or_else(|| panic!("missing {expected} outcome: {logs}"));
+            let fields = &event["fields"];
+            assert_eq!(fields["worker_id"], log_worker);
+            if expected != "invalid_event" {
+                assert_eq!(fields["job_id"], FIRST);
+                assert_eq!(fields["video_id"], VIDEO);
+            }
+            if matches!(
+                expected,
+                "retry_released" | "final_failed" | "completed" | "infrastructure_failure"
+            ) {
+                assert_eq!(
+                    fields["attempt"],
+                    if expected == "final_failed" { 5 } else { 1 }
+                );
+            } else {
+                assert!(
+                    fields.get("attempt").is_none(),
+                    "unacquired attempt must not be fabricated"
+                );
+            }
+        }
     }
 
     #[tokio::test]

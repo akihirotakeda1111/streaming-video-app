@@ -19,6 +19,9 @@ use tokio::{
 
 use crate::acquisition::AcquiredJob;
 
+/// Renew long-running work periodically rather than holding a lease for days.
+pub const MAX_LEASE_DURATION_SECONDS: u64 = 43_200;
+
 /// Runtime timing values used by the heartbeat loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeartbeatSettings {
@@ -39,6 +42,9 @@ impl HeartbeatSettings {
         if visibility_extension > 43_200 {
             return Err(HeartbeatSettingsError::VisibilityTooLong);
         }
+        if lease_duration > MAX_LEASE_DURATION_SECONDS {
+            return Err(HeartbeatSettingsError::LeaseTooLong);
+        }
         if interval >= lease_duration || interval >= visibility_extension {
             return Err(HeartbeatSettingsError::IntervalTooLong);
         }
@@ -54,6 +60,7 @@ impl HeartbeatSettings {
 pub enum HeartbeatSettingsError {
     NonPositive,
     VisibilityTooLong,
+    LeaseTooLong,
     IntervalTooLong,
 }
 
@@ -62,6 +69,7 @@ impl fmt::Display for HeartbeatSettingsError {
         formatter.write_str(match self {
             Self::NonPositive => "heartbeat timing values must be positive",
             Self::VisibilityTooLong => "visibility extension must not exceed 43200 seconds",
+            Self::LeaseTooLong => "lease duration must not exceed 43200 seconds",
             Self::IntervalTooLong => {
                 "heartbeat interval must be shorter than lease and visibility durations"
             }
@@ -70,6 +78,21 @@ impl fmt::Display for HeartbeatSettingsError {
 }
 
 impl std::error::Error for HeartbeatSettingsError {}
+
+#[test]
+fn heartbeat_settings_reject_unbounded_lease_durations() {
+    for lease in [MAX_LEASE_DURATION_SECONDS + 1, u64::MAX] {
+        assert_eq!(
+            HeartbeatSettings::from_seconds(30, lease, 120),
+            Err(HeartbeatSettingsError::LeaseTooLong)
+        );
+    }
+    assert!(HeartbeatSettings::from_seconds(30, MAX_LEASE_DURATION_SECONDS, 120).is_ok());
+    assert_eq!(
+        HeartbeatSettings::from_seconds(30, 0, 120),
+        Err(HeartbeatSettingsError::NonPositive)
+    );
+}
 
 /// The first ownership failure observed by the heartbeat.
 #[derive(Debug, PartialEq, Eq)]

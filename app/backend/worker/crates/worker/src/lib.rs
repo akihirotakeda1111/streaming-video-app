@@ -85,6 +85,12 @@ impl Config {
                 "must not exceed 43200 seconds",
             ));
         }
+        if lease_duration_seconds > heartbeat::MAX_LEASE_DURATION_SECONDS {
+            return Err(ConfigError::invalid(
+                LEASE_DURATION_SECONDS,
+                "must not exceed 43200 seconds",
+            ));
+        }
         if heartbeat_interval_seconds >= visibility_extension_seconds
             || heartbeat_interval_seconds >= lease_duration_seconds
         {
@@ -369,6 +375,42 @@ mod tests {
     }
 
     #[test]
+    fn validates_heartbeat_configuration_without_exposing_values() {
+        for variable in [
+            HEARTBEAT_INTERVAL_SECONDS,
+            VISIBILITY_EXTENSION_SECONDS,
+            LEASE_DURATION_SECONDS,
+        ] {
+            for value in [
+                "",
+                "0",
+                "-1",
+                "1.5",
+                "18446744073709551615",
+                "18446744073709551616",
+                "secret-invalid-value",
+            ] {
+                let mut values = valid();
+                values.insert(variable, value.into());
+                let error = load(&values).unwrap_err();
+                assert_eq!(error.variable, variable);
+                assert!(!error.to_string().contains("secret-invalid-value"));
+                assert!(!format!("{error:?}").contains("password"));
+            }
+        }
+        for lease in ["31", "43200"] {
+            let mut values = valid();
+            values.insert(LEASE_DURATION_SECONDS, lease.into());
+            load(&values).unwrap();
+        }
+        for lease in ["30", "43201"] {
+            let mut values = valid();
+            values.insert(LEASE_DURATION_SECONDS, lease.into());
+            assert!(load(&values).is_err());
+        }
+    }
+
+    #[test]
     fn rejects_each_missing_required_value() {
         for variable in [
             DATABASE_URL,
@@ -378,6 +420,9 @@ mod tests {
             OUTPUT_BUCKET,
             FFMPEG_PATH,
             TEMPORARY_DIRECTORY,
+            HEARTBEAT_INTERVAL_SECONDS,
+            VISIBILITY_EXTENSION_SECONDS,
+            LEASE_DURATION_SECONDS,
             RETRY_DELAY_SECONDS,
             MAXIMUM_ATTEMPTS,
         ] {
