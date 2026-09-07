@@ -123,6 +123,26 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         }
     }
 
+    pub fn from_shared(
+        jobs: Arc<Mutex<J>>,
+        storage: Arc<Mutex<S>>,
+        executor: Arc<Mutex<E>>,
+        output_bucket: impl Into<String>,
+        ffmpeg_path: impl Into<PathBuf>,
+        temporary_directory: impl Into<PathBuf>,
+        settings: RetrySettings,
+    ) -> Self {
+        Self {
+            jobs,
+            storage,
+            executor,
+            output_bucket: output_bucket.into(),
+            ffmpeg_path: ffmpeg_path.into(),
+            temporary_directory: temporary_directory.into(),
+            settings,
+        }
+    }
+
     fn owned(cancelled: &watch::Receiver<bool>) -> bool {
         !*cancelled.borrow()
     }

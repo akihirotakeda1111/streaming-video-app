@@ -4,8 +4,10 @@ use queue::sqs::SqsQueue;
 use storage::s3::S3Storage;
 use tokio::sync::watch;
 use tracing::{error, info};
-use worker::runtime::PHASE1_MAX_CONCURRENCY;
-use worker::terminal::TerminalProcessor;
+use worker::{
+    acquisition::WorkerIdentityProvider, completion::MessageCompletionProcessor,
+    heartbeat::HeartbeatSettings, runtime::PHASE1_MAX_CONCURRENCY,
+};
 
 async fn shutdown_requested() -> std::io::Result<()> {
     #[cfg(unix)]
@@ -23,7 +25,7 @@ async fn shutdown_requested() -> std::io::Result<()> {
     }
 }
 
-/// Starts the single bounded Phase 1 worker process.
+/// Starts the single bounded worker process.
 #[tokio::main]
 async fn main() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -75,16 +77,38 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let processor = TerminalProcessor::new(
+    let heartbeat = match HeartbeatSettings::from_seconds(
+        config.heartbeat_interval_seconds,
+        config.lease_duration_seconds,
+        config.visibility_extension_seconds,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => {
+            error!(%error, "heartbeat configuration rejected");
+            std::process::exit(1);
+        }
+    };
+    let processor = match MessageCompletionProcessor::new(
         jobs,
         storage,
         ProcessExecutor,
         acknowledgements,
+        WorkerIdentityProvider::new().identity(),
         config.input_bucket.clone(),
         config.output_bucket.clone(),
         config.ffmpeg_path.clone(),
         config.temporary_directory.clone(),
-    );
+        config.lease_duration_seconds,
+        config.maximum_attempts,
+        config.retry_delay_seconds,
+        heartbeat,
+    ) {
+        Ok(processor) => processor,
+        Err(error) => {
+            error!(%error, "worker processing configuration rejected");
+            std::process::exit(1);
+        }
+    };
     let (stop, shutdown) = watch::channel(false);
     tokio::spawn(async move {
         if let Err(error) = shutdown_requested().await {
@@ -143,7 +167,7 @@ mod tests {
         assert!(production.contains("tracing_subscriber::fmt"));
         assert!(production.contains(".json()"));
         assert!(production.contains("PHASE1_MAX_CONCURRENCY"));
-        assert!(production.contains("TerminalProcessor::new"));
+        assert!(production.contains("MessageCompletionProcessor::new"));
         assert!(production.contains("ProcessExecutor"));
         assert!(production.contains("PostgresJobState::connect(&config.database_url).await"));
         assert!(!production.contains("block_on"));

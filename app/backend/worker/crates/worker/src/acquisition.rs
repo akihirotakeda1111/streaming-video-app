@@ -132,6 +132,22 @@ impl<J> LeaseAcquisitionProcessor<J> {
             max_attempts,
         }
     }
+
+    pub fn from_shared(
+        jobs: Arc<Mutex<J>>,
+        worker_id: WorkerIdentity,
+        input_bucket: impl Into<String>,
+        lease_seconds: u64,
+        max_attempts: u32,
+    ) -> Self {
+        Self {
+            jobs,
+            worker_id,
+            input_bucket: input_bucket.into(),
+            lease_seconds,
+            max_attempts,
+        }
+    }
 }
 
 impl<J: JobState> LeaseAcquisitionProcessor<J> {
