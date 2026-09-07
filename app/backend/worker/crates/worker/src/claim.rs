@@ -250,6 +250,7 @@ mod tests {
             receipt_handle: "receipt".into(),
             body: FIXTURE.into(),
             receive_count: 1,
+            visibility_deadline: None,
         }
     }
 

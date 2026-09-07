@@ -218,6 +218,7 @@ mod tests {
             receipt_handle: "receipt".into(),
             body: EVENT.into(),
             receive_count: 1,
+            visibility_deadline: None,
         }
     }
 
@@ -596,6 +597,7 @@ mod tests {
                 ("ObjectCreated:Put", INPUT, KEY_2),
             ]),
             receive_count: 1,
+            visibility_deadline: None,
         }
     }
 
@@ -793,6 +795,7 @@ mod tests {
                 ("ObjectCreated:Put", INPUT, KEY_2),
             ]),
             receive_count: 1,
+            visibility_deadline: None,
         };
 
         p.process(message).await.unwrap();

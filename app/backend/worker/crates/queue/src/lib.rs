@@ -7,6 +7,8 @@ pub struct Message {
     pub receipt_handle: String,
     pub body: String,
     pub receive_count: u32,
+    /// Conservative deadline captured before the receive request, not dispatch.
+    pub visibility_deadline: Option<tokio::time::Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
