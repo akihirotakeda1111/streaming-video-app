@@ -6,6 +6,7 @@ pub mod event;
 pub mod fakes;
 pub mod heartbeat;
 pub mod publish;
+pub mod retry;
 pub mod runtime;
 pub mod terminal;
 
@@ -31,6 +32,8 @@ const TEMPORARY_DIRECTORY: &str = "TMPDIR";
 const HEARTBEAT_INTERVAL_SECONDS: &str = "WORKER_HEARTBEAT_INTERVAL_SECONDS";
 const VISIBILITY_EXTENSION_SECONDS: &str = "WORKER_VISIBILITY_EXTENSION_SECONDS";
 const LEASE_DURATION_SECONDS: &str = "WORKER_LEASE_DURATION_SECONDS";
+const RETRY_DELAY_SECONDS: &str = "WORKER_RETRY_DELAY_SECONDS";
+const MAXIMUM_ATTEMPTS: &str = "WORKER_MAXIMUM_ATTEMPTS";
 
 /// All runtime settings required by the worker.
 #[derive(Clone, PartialEq, Eq)]
@@ -45,6 +48,8 @@ pub struct Config {
     pub heartbeat_interval_seconds: u64,
     pub visibility_extension_seconds: u64,
     pub lease_duration_seconds: u64,
+    pub retry_delay_seconds: u64,
+    pub maximum_attempts: u32,
 }
 
 impl Config {
@@ -67,6 +72,11 @@ impl Config {
         let heartbeat_interval_seconds = positive_seconds(&lookup, HEARTBEAT_INTERVAL_SECONDS)?;
         let visibility_extension_seconds = positive_seconds(&lookup, VISIBILITY_EXTENSION_SECONDS)?;
         let lease_duration_seconds = positive_seconds(&lookup, LEASE_DURATION_SECONDS)?;
+        let retry_delay_seconds = positive_seconds(&lookup, RETRY_DELAY_SECONDS)?;
+        let maximum_attempts = positive_u32(&lookup, MAXIMUM_ATTEMPTS)?;
+        if maximum_attempts > 10 {
+            return Err(ConfigError::invalid(MAXIMUM_ATTEMPTS, "must not exceed 10"));
+        }
 
         if visibility_extension_seconds > 43_200 {
             return Err(ConfigError::invalid(
@@ -80,6 +90,12 @@ impl Config {
             return Err(ConfigError::invalid(
                 HEARTBEAT_INTERVAL_SECONDS,
                 "must be shorter than lease duration and visibility extension",
+            ));
+        }
+        if retry_delay_seconds > 43_200 {
+            return Err(ConfigError::invalid(
+                RETRY_DELAY_SECONDS,
+                "must not exceed 43200 seconds",
             ));
         }
 
@@ -106,6 +122,8 @@ impl Config {
             heartbeat_interval_seconds,
             visibility_extension_seconds,
             lease_duration_seconds,
+            retry_delay_seconds,
+            maximum_attempts,
         })
     }
 }
@@ -130,6 +148,8 @@ impl fmt::Debug for Config {
                 &self.visibility_extension_seconds,
             )
             .field("lease_duration_seconds", &self.lease_duration_seconds)
+            .field("retry_delay_seconds", &self.retry_delay_seconds)
+            .field("maximum_attempts", &self.maximum_attempts)
             .finish()
     }
 }
@@ -181,6 +201,20 @@ where
         return Err(ConfigError::invalid(variable, "must be a positive integer"));
     }
     Ok(seconds)
+}
+
+fn positive_u32<F>(lookup: &F, variable: &'static str) -> Result<u32, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = required(lookup, variable)?;
+    let attempts = value
+        .parse::<u32>()
+        .map_err(|_| ConfigError::invalid(variable, "must be a positive integer"))?;
+    if attempts == 0 {
+        return Err(ConfigError::invalid(variable, "must be a positive integer"));
+    }
+    Ok(attempts)
 }
 
 fn validate_postgres_url(value: &str) -> Result<(), ConfigError> {
@@ -295,6 +329,8 @@ mod tests {
             (HEARTBEAT_INTERVAL_SECONDS, "30".into()),
             (VISIBILITY_EXTENSION_SECONDS, "120".into()),
             (LEASE_DURATION_SECONDS, "300".into()),
+            (RETRY_DELAY_SECONDS, "900".into()),
+            (MAXIMUM_ATTEMPTS, "5".into()),
         ])
     }
 
@@ -307,6 +343,31 @@ mod tests {
     }
 
     #[test]
+    fn validates_retry_configuration_bounds() {
+        for (variable, values) in [
+            (
+                MAXIMUM_ATTEMPTS,
+                vec!["0", "11", "4294967295", "4294967296", "-1", "1.5"],
+            ),
+            (RETRY_DELAY_SECONDS, vec!["0", "43201", "-1"]),
+        ] {
+            for value in values {
+                let mut config = valid();
+                config.insert(variable, value.into());
+                assert_eq!(load(&config).unwrap_err().variable, variable);
+            }
+        }
+        for attempts in ["1", "10"] {
+            for delay in ["1", "43200"] {
+                let mut config = valid();
+                config.insert(MAXIMUM_ATTEMPTS, attempts.into());
+                config.insert(RETRY_DELAY_SECONDS, delay.into());
+                load(&config).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn rejects_each_missing_required_value() {
         for variable in [
             DATABASE_URL,
@@ -316,6 +377,8 @@ mod tests {
             OUTPUT_BUCKET,
             FFMPEG_PATH,
             TEMPORARY_DIRECTORY,
+            RETRY_DELAY_SECONDS,
+            MAXIMUM_ATTEMPTS,
         ] {
             let mut values = valid();
             values.remove(variable);
