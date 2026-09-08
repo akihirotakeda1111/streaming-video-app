@@ -136,3 +136,103 @@ export function createEvidence(runId: string, fields: Partial<EvidenceRecord> & 
 export function safeEvidence(value: SafeDiagnostic): SafeDiagnostic {
   return safeDiagnostic(value)
 }
+
+export interface WorkerTiming {
+  visibilityTimeoutMs: number
+  leaseTimeoutMs: number
+  heartbeatIntervalMs: number
+  retryDelayMs?: number
+}
+
+export interface ExpiryBounds {
+  acquiredAtMs: number
+  visibilityExpiresAtMs: number
+  leaseExpiresAtMs: number
+  recoveryEligibleAtMs: number
+  deadlineAtMs: number
+}
+
+/** Derives recovery bounds from observed acquisition time and verified worker settings. */
+export function expiryBounds(
+  acquiredAtMs: number,
+  timing: WorkerTiming,
+  marginMs = timing.heartbeatIntervalMs,
+): ExpiryBounds {
+  const values = [acquiredAtMs, timing.visibilityTimeoutMs, timing.leaseTimeoutMs,
+    timing.heartbeatIntervalMs, timing.retryDelayMs ?? 0, marginMs]
+  if (!values.every(Number.isFinite) || !Number.isInteger(acquiredAtMs) || acquiredAtMs < 0
+    || timing.visibilityTimeoutMs <= 0 || timing.leaseTimeoutMs <= 0
+    || timing.heartbeatIntervalMs <= 0 || marginMs < 0) {
+    throw new Error('worker expiry settings must be finite positive values')
+  }
+  const visibilityExpiresAtMs = acquiredAtMs + timing.visibilityTimeoutMs
+  const leaseExpiresAtMs = acquiredAtMs + timing.leaseTimeoutMs
+  const recoveryEligibleAtMs = Math.max(visibilityExpiresAtMs, leaseExpiresAtMs)
+  return {
+    acquiredAtMs,
+    visibilityExpiresAtMs,
+    leaseExpiresAtMs,
+    recoveryEligibleAtMs,
+    deadlineAtMs: recoveryEligibleAtMs + (timing.retryDelayMs ?? 0) + marginMs,
+  }
+}
+
+export interface CrashRecoveryEvidence {
+  acquiredAtMs: number
+  crashAtMs: number
+  recoveryAtMs: number
+  visibilityExpiredAtMs: number
+  leaseExpiredAtMs: number
+  attempts: readonly number[]
+  owners: readonly string[]
+  states: readonly string[]
+  sourceKey: string
+  manifestPublishedLast: boolean
+}
+
+/** Checks the invariants that make crash evidence meaningful, rather than timing-only evidence. */
+export function assertCrashRecoveryEvidence(
+  evidence: CrashRecoveryEvidence,
+  timing: WorkerTiming,
+): void {
+  const bounds = expiryBounds(evidence.acquiredAtMs, timing)
+  if (evidence.crashAtMs <= evidence.acquiredAtMs) throw new Error('crash must follow acquisition')
+  if (evidence.recoveryAtMs < bounds.recoveryEligibleAtMs) throw new Error('recovery preceded expiry gates')
+  if (evidence.visibilityExpiredAtMs < bounds.visibilityExpiresAtMs
+    || evidence.leaseExpiredAtMs < bounds.leaseExpiresAtMs) throw new Error('expiry evidence is not correlated')
+  if (evidence.states.includes('COMPLETED') && !evidence.manifestPublishedLast) {
+    throw new Error('completion requires manifest-last publication')
+  }
+  if (evidence.attempts.length !== 2 || evidence.attempts[1] !== evidence.attempts[0] + 1) {
+    throw new Error('recovery must increment the attempt exactly once')
+  }
+  if (new Set(evidence.owners).size !== 2 || evidence.owners.some((owner) => !owner.trim())) {
+    throw new Error('recovery must identify exactly one replacement owner')
+  }
+  if (!evidence.sourceKey.trim()) throw new Error('recovery must restart from the canonical source')
+}
+
+export interface HeartbeatEvidence {
+  durationMs: number
+  heartbeatIntervalMs: number
+  visibilityExtensions: readonly string[]
+  leaseRenewals: readonly string[]
+  attempts: readonly number[]
+  owners: readonly string[]
+}
+
+/** Checks that a long workload actually crossed multiple heartbeat cycles without reacquisition. */
+export function assertLongHeartbeatEvidence(evidence: HeartbeatEvidence): void {
+  if (!Number.isFinite(evidence.durationMs) || evidence.durationMs <= evidence.heartbeatIntervalMs * 2) {
+    throw new Error('workload was too short to prove multiple heartbeat cycles')
+  }
+  if (evidence.visibilityExtensions.length < 2 || evidence.leaseRenewals.length < 2) {
+    throw new Error('repeated visibility extensions and lease renewals are required')
+  }
+  if (evidence.attempts.length === 0 || new Set(evidence.attempts).size !== 1) {
+    throw new Error('heartbeat renewals must not increment the attempt')
+  }
+  if (new Set(evidence.owners).size !== 1 || !evidence.owners[0]?.trim()) {
+    throw new Error('heartbeat workload must have one owner')
+  }
+}

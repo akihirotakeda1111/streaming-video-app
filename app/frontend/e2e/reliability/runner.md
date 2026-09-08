@@ -134,13 +134,27 @@ shared verification boundary before dispatch or scenario work.
 The standalone Phase 1 `@preflight` browser readiness test retains its existing scope.
 
 `--list` shows the implemented selectors: `preflight` (local/browser/API readiness),
-`runtime-authorization` (reliability authorization), and `duplicate-delivery`
+`runtime-authorization` (reliability authorization), `duplicate-delivery`,
+`crash-recovery`, and `long-heartbeat`
 (a fail-closed duplicate-delivery entry point). Select it with:
 
 `python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery`
 
 The runner dispatches this selector only to Playwright's `reliability` project
 with the exact `@duplicate-delivery` tag. Unknown selectors fail.
+
+The crash-recovery and long-heartbeat selectors are also dispatched only to the
+`reliability` project, with exact `@crash-recovery` and `@long-heartbeat` tags:
+
+`python app/scripts/run_reliability_e2e.py --scenario crash-recovery`
+
+`python app/scripts/run_reliability_e2e.py --scenario long-heartbeat`
+
+Their current entry points authorize the disposable boundary and then fail
+closed because the scoped worker-control, queue/database observation, and
+cleanup adapters required for safe live mutation are not present. They must not
+be treated as live evidence until those adapters are implemented and a human
+has reviewed redacted evidence from the commands above.
 
 The duplicate-delivery entry point calls shared live authorization, then fails
 with `status: unverified` and `scenarioStarted: false` in its diagnostic attachment.

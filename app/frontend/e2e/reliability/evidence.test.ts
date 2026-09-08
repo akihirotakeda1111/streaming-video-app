@@ -1,7 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { attachSafeText, redactText } from '../diagnostics.js'
 import type { TestInfo } from '@playwright/test'
-import { createEvidence, ObservationTimeout, observeUntil, RunResources, safeEvidence } from './evidence.js'
+import {
+  assertCrashRecoveryEvidence,
+  assertLongHeartbeatEvidence,
+  createEvidence,
+  expiryBounds,
+  ObservationTimeout,
+  observeUntil,
+  RunResources,
+  safeEvidence,
+} from './evidence.js'
 
 describe('reliability evidence helpers', () => {
   afterEach(() => vi.useRealTimers())
@@ -10,6 +19,43 @@ describe('reliability evidence helpers', () => {
     const evidence = createEvidence(new RunResources().runId, { videoId: 'video-1', jobId: 'job-1', workerId: 'worker-1', attempt: 2 })
     expect(evidence).toMatchObject({ videoId: 'video-1', jobId: 'job-1', workerId: 'worker-1', attempt: 2 })
     expect(evidence.timestamps).toHaveLength(1)
+  })
+
+  it('derives recovery eligibility only after both independent expiry gates', () => {
+    expect(expiryBounds(1_000, {
+      visibilityTimeoutMs: 2_000,
+      leaseTimeoutMs: 5_000,
+      heartbeatIntervalMs: 500,
+      retryDelayMs: 1_000,
+    })).toMatchObject({
+      visibilityExpiresAtMs: 3_000,
+      leaseExpiresAtMs: 6_000,
+      recoveryEligibleAtMs: 6_000,
+      deadlineAtMs: 7_500,
+    })
+  })
+
+  it('rejects uncorrelated crash recovery evidence', () => {
+    const timing = { visibilityTimeoutMs: 2_000, leaseTimeoutMs: 5_000, heartbeatIntervalMs: 500 }
+    expect(() => assertCrashRecoveryEvidence({
+      acquiredAtMs: 1_000, crashAtMs: 1_500, recoveryAtMs: 5_000,
+      visibilityExpiredAtMs: 3_000, leaseExpiredAtMs: 6_000,
+      attempts: [1, 1], owners: ['old', 'new'], states: ['PROCESSING'],
+      sourceKey: 'run/source.mp4', manifestPublishedLast: false,
+    }, timing)).toThrow(/expiry|increment/)
+  })
+
+  it('rejects short or overlapping heartbeat evidence', () => {
+    expect(() => assertLongHeartbeatEvidence({
+      durationMs: 1_000, heartbeatIntervalMs: 500,
+      visibilityExtensions: ['one', 'two'], leaseRenewals: ['one', 'two'],
+      attempts: [1], owners: ['worker'],
+    })).toThrow('too short')
+    expect(() => assertLongHeartbeatEvidence({
+      durationMs: 2_000, heartbeatIntervalMs: 500,
+      visibilityExtensions: ['one', 'two'], leaseRenewals: ['one', 'two'],
+      attempts: [1, 2], owners: ['worker'],
+    })).toThrow('increment')
   })
 
   it('redacts credentials, receipt handles, database URLs, and URL queries', () => {
