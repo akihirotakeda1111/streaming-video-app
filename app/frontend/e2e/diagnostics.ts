@@ -3,7 +3,7 @@ import type { TestInfo } from '@playwright/test'
 
 const REDACTED = '[REDACTED]'
 const PRESERVED_KEYS = new Set(['origin', 'path', 'status', 'videoId', 'jobId'])
-const CREDENTIAL_KEY = /authorization|token|password|secret|credential|api[_-]?key|cookie/i
+const CREDENTIAL_KEY = /authorization|token|password|secret|credential|api[_-]?key|cookie|receipt(?:[_-]?handle)?|database(?:[_-]?url)?/i
 const URL_KEY = /url/i
 const SECRET_FIELDS =
   /("?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|x-amz-[a-z-]+)"?\s*[:=]\s*)(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s,"'}]+))/gi
@@ -15,6 +15,7 @@ const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi
 export function redactUrl(value: string): string {
   try {
     const url = new URL(value)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return REDACTED
     return `${url.origin}${url.pathname}`
   } catch {
     const stripped = value.replace(/[?#][\s\S]*/, '')
@@ -59,7 +60,7 @@ function sanitizePath(value: string): string {
 
 /** Redacts URL query strings and common credential-shaped values while retaining IDs. */
 export function redactText(value: string): string {
-  let redacted = value.replace(/https?:\/\/[^\s"']+/gi, (url) => redactUrl(url))
+  let redacted = value.replace(/(?:https?|postgres(?:ql)?|mysql):\/\/[^\s"']+/gi, (url) => redactUrl(url))
   redacted = redacted.replace(AUTH_HEADERS, `$1: ${REDACTED}`)
   redacted = redacted.replace(COOKIE_HEADERS, `$1: ${REDACTED}`)
   redacted = redacted.replace(BEARER, `Bearer ${REDACTED}`)
