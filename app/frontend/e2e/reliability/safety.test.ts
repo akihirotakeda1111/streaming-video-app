@@ -2,7 +2,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
-import { assertLiveBoundary, checkSettings, IDENTITY_NAMES, SCOPE_NAMES, TIMING_NAMES, URL_NAMES, validateSettings } from './safety.mjs'
+import { checkSettings, IDENTITY_NAMES, SCOPE_NAMES, TIMING_NAMES, URL_NAMES, validateSettings, verifyLiveBoundary } from './safety.mjs'
 
 function completeSettings(): Record<string, string> {
   return {
@@ -20,7 +20,7 @@ describe('shared reliability safety policy', () => {
   it('distinguishes complete settings from actual live authorization', () => {
     expect(checkSettings({})).toEqual({ configured: false })
     expect(checkSettings(completeSettings())).toEqual({ configured: true })
-    expect(() => assertLiveBoundary()).toThrow('adapters are unavailable')
+    expect(verifyLiveBoundary({ env: completeSettings(), adapter: () => ({ status: 'verified' }) })).toEqual({ status: 'verified' })
   })
 
   it.each(Object.keys(completeSettings()))('requires %s live while allowing absence offline', (name) => {

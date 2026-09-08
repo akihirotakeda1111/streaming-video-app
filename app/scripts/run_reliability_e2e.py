@@ -17,7 +17,7 @@ SCENARIOS = {
     "preflight": ("@preflight", "local/browser/API readiness (live adapter unavailable)"),
     "runtime-authorization": ("@reliability", "reliability authorization (live adapter unavailable)"),
 }
-TOOLS = ("node", "npm", "npx", "ffmpeg")
+TOOLS = ("node", "npm", "npx", "ffmpeg", "aws")
 SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"
 
 
@@ -46,6 +46,10 @@ def _settings(mode: str) -> dict:
     if result.returncode != 0:
         # The shared validator emits only fixed messages and configuration names.
         raise ValueError(payload.get("error", "local safety validation failed"))
+    if mode in ("authorize", "preflight"):
+        if payload.get("status") != "verified":
+            raise ValueError("invalid live verification response")
+        return payload
     if not isinstance(payload.get("configured"), bool):
         raise ValueError("invalid safety validation response")
     return payload
@@ -78,6 +82,17 @@ def _live_config(scenario: str) -> LiveConfig:
     return LiveConfig(Path(os.environ["E2E_EVIDENCE_DIR"].strip()) / f"e2e-{uuid4()}", scenario)
 
 
+def _preflight() -> int:
+    """Verify disposable targets without creating a run or dispatching Playwright."""
+    evidence = _settings("preflight")
+    record = {**evidence, "scenarioStarted": False}
+    evidence_dir = Path(os.environ["E2E_EVIDENCE_DIR"].strip())
+    evidence_dir.mkdir(parents=True, exist_ok=False)
+    (evidence_dir / "live-preflight.json").write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps(record, sort_keys=True))
+    return 0
+
+
 def _run(config: LiveConfig) -> int:
     """Authorize before creating evidence or dispatching any scenario."""
     _settings("authorize")
@@ -101,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--check", action="store_true", help="validate local tools and supplied settings only")
     modes.add_argument("--list", action="store_true", help="list implemented scenario selectors")
+    modes.add_argument("--live-preflight", action="store_true", help="verify disposable resources without dispatching a scenario")
     parser.add_argument("--scenario", choices=sorted(SCENARIOS), default="preflight")
     args = parser.parse_args(argv)
     if args.list:
@@ -109,6 +125,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.check:
         return _check()
+    if args.live_preflight:
+        try:
+            return _preflight()
+        except (ValueError, OSError) as error:
+            print(json.dumps({"status": "blocked", "message": str(error), "scenarioStarted": False}), file=sys.stderr)
+            return 2
     try:
         return _run(_live_config(args.scenario))
     except (ValueError, OSError) as error:

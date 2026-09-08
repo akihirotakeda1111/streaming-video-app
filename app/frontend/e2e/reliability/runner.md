@@ -1,7 +1,7 @@
 # Reliability E2E runner
 
 `python app/scripts/run_reliability_e2e.py --check` is offline only. It checks
-for `node`, `npm`, `npx`, and `ffmpeg`, then invokes the local Node validator
+for `node`, `npm`, `npx`, `ffmpeg`, and `aws`, then invokes the local Node validator
 with a 10-second deadline. It does not contact AWS, databases, queues,
 browsers, containers, or services, create evidence directories, or run scenarios.
 Missing live settings are reported as `not configured` and return zero when
@@ -35,23 +35,40 @@ Live configuration requires all of the following:
   or `production` are rejected even offline. A name alone does not prove ownership.
 - An absolute `E2E_EVIDENCE_DIR` without parent traversal.
 
-## Current live limitation
+## Live preflight and supported adapter
 
-No supported read-only adapter currently verifies the actual source-to-DLQ
-relationship or worker/database observation and process-control capabilities.
-Both live entry points therefore fail closed, including with otherwise complete
-settings and a `verified` declaration. The Python runner returns 2 with fixed,
-non-secret JSON evidence on stderr before creating a run directory or invoking
-Playwright. Direct reliability execution fails and attaches redacted diagnostic
-evidence through the existing Playwright helper. Neither is a successful live run.
+The supported disposable adapter uses the AWS CLI for bounded read-only STS,
+S3, SQS, and CloudWatch observations. It compares the source queue's actual
+redrive target ARN with the actual DLQ ARN. It also supports exact local process
+boundaries written as `process:<executable>` for worker and database observation
+and control; the named process must be present, and control names must match the
+observed names. No process is stopped or restarted during preflight.
+
+Required additional target settings are `AWS_REGION` and the expected
+12-digit `E2E_AWS_ACCOUNT_ID`; AWS credentials are supplied through the normal
+AWS CLI credential provider and are never printed. The CLI must have permission
+for `sts:GetCallerIdentity`, `s3:HeadBucket`, `s3:GetBucketLocation`,
+`sqs:GetQueueUrl`, `sqs:GetQueueAttributes`, and
+`cloudwatch:DescribeAlarms`. Missing permissions, unavailable tools, identity
+mismatches, unsupported process boundaries, and bounded observation failures
+block before any scenario operation.
+
+Run the standalone verification with:
+
+`python app/scripts/run_reliability_e2e.py --live-preflight`
+
+On success it prints redacted verification evidence and writes
+`<E2E_EVIDENCE_DIR>/live-preflight.json`. This command creates no jobs, queue
+messages, objects, database records, worker changes, or failure injections.
+The Python runner and direct Playwright reliability execution call this same
+shared verification boundary before dispatch or scenario work.
 The standalone Phase 1 `@preflight` browser readiness test retains its existing scope.
 
 `--list` shows the implemented selectors: `preflight` (local/browser/API readiness)
-and `runtime-authorization` (reliability authorization). Both Python live selectors
-are blocked by the missing adapters. Unknown selectors fail. Failure scenarios
-remain outside this task; their successor specs provide their selectors and adapters.
-Before live execution can be enabled, bounded read-only target verification must
-be wired into the common authorization path. Every future reliability scenario
+and `runtime-authorization` (reliability authorization). Unknown selectors fail.
+Failure scenarios remain outside this task; their successor specs provide their
+selectors and adapters.
+Every future reliability scenario
 must call that authorization before any operation, even when selected directly;
 a separate authorization test does not establish ordering for other tests.
 
@@ -72,5 +89,6 @@ boundary allowing only the local validator; no live adapter or scenario is calle
 They cover missing settings, malformed scopes, completeness, redaction, validator
 timeouts, and refusal to dispatch without supported adapters.
 
-Human verification of an actual disposable environment remains outstanding.
-Offline tests and type checks do not replace that evidence.
+Human verification against the intended disposable environment remains
+outstanding until the command above succeeds and its redacted evidence is
+retained. Offline tests and type checks do not replace that evidence.

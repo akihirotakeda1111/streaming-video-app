@@ -80,7 +80,7 @@ class RunnerChecks(unittest.TestCase):
             evidence = json.loads(output)
             self.assertFalse(evidence["scenarioStarted"])
             self.assertFalse(evidence["liveResourcesVerified"])
-            self.assertIn("adapters are unavailable", evidence["message"])
+            self.assertIn("AWS_REGION", evidence["message"])
             self.assertEqual(calls, ["validate", "authorize"])
 
     def test_list_has_no_validation_or_live_calls(self):

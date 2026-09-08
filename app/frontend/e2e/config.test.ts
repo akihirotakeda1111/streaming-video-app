@@ -92,7 +92,7 @@ describe('reliability E2E runtime configuration', () => {
     expect(() => loadReliabilityConfig()).toThrow('E2E_LEASE_TIMEOUT_MS must be a positive integer')
   })
 
-  it.each([undefined, 'true'])('parses complete inputs but blocks unsupported live boundaries with discovery=%s', async (discovery) => {
+  it.each([undefined, 'true'])('parses complete inputs but blocks incomplete live target settings with discovery=%s', async (discovery) => {
     const { loadReliabilityConfig, assertReliabilityAuthorization } = await import('./config.js')
     vi.stubEnv('E2E_DISCOVERY', discovery)
     vi.stubEnv('E2E_RELIABILITY_DISPOSABLE', 'true')
@@ -101,6 +101,6 @@ describe('reliability E2E runtime configuration', () => {
     expect(config.sourceQueue).toBe(liveInputs.E2E_SOURCE_QUEUE)
     expect(config.alarmIdentifiers).toEqual(['test-alarm-1', 'test-alarm-2'])
     expect(config.timeouts.lease).toBe(900000)
-    expect(() => assertReliabilityAuthorization()).toThrow('adapters are unavailable')
+    expect(() => assertReliabilityAuthorization()).toThrow('AWS_REGION and E2E_AWS_ACCOUNT_ID')
   })
 })
