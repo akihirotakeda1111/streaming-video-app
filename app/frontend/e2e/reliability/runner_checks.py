@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import unittest
+import tempfile
 from unittest.mock import patch
 
 SETTINGS = json.load(sys.stdin)
@@ -26,7 +27,7 @@ class RunnerChecks(unittest.TestCase):
         def local_only(command, **kwargs):
             self.assertEqual(command[:2], [NODE, str(MODULE["SAFETY_CLI"])])
             self.assertIn(command[2], ("check", "validate", "authorize"))
-            self.assertEqual(kwargs["timeout"], 10)
+            self.assertEqual(kwargs["timeout"], 130 if command[2] == "authorize" else 10)
             calls.append(command[2])
             return RUN(command, **kwargs)
 
@@ -80,7 +81,7 @@ class RunnerChecks(unittest.TestCase):
             evidence = json.loads(output)
             self.assertFalse(evidence["scenarioStarted"])
             self.assertFalse(evidence["liveResourcesVerified"])
-            self.assertIn("AWS_REGION", evidence["message"])
+            self.assertIn("full Docker container ID", evidence["message"])
             self.assertEqual(calls, ["validate", "authorize"])
 
     def test_list_has_no_validation_or_live_calls(self):
@@ -100,6 +101,48 @@ class RunnerChecks(unittest.TestCase):
         with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("private-value", 10)):
             with self.assertRaisesRegex(ValueError, "^local safety validation could not complete$"):
                 MODULE["_settings"]("check")
+
+    def test_preflight_reuses_root_without_overwriting_or_dispatch(self):
+        with tempfile.TemporaryDirectory() as root, \
+                patch.dict(os.environ, {"E2E_EVIDENCE_DIR": root}), \
+                patch.dict(GLOBALS, {"_settings": lambda mode: {"status": "verified", "verifiedAt": "test"}}), \
+                patch("subprocess.run", side_effect=AssertionError("must not dispatch")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(2):
+                self.assertEqual(MODULE["main"](["--live-preflight"]), 0)
+            records = list(Path(root).glob("preflight-*/live-preflight.json"))
+            self.assertEqual(len(records), 2)
+            self.assertTrue(all(not json.loads(p.read_text())["scenarioStarted"] for p in records))
+
+    def test_failed_authorization_cannot_write_or_dispatch(self):
+        for args in (["--live-preflight"], ["--scenario", "runtime-authorization"]):
+            def settings(mode):
+                if mode == "validate":
+                    return {"configured": True}
+                raise ValueError("worker attempts do not match queue and E2E settings")
+            with patch.dict(os.environ, SETTINGS), patch.dict(GLOBALS, {"_settings": settings}), \
+                    patch.object(Path, "mkdir", side_effect=AssertionError("must not write")), \
+                    patch("subprocess.run", side_effect=AssertionError("must not dispatch")), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(MODULE["main"](args), 2)
+
+    def test_preflight_filesystem_errors_are_redacted(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, SETTINGS), \
+                patch.dict(GLOBALS, {"_settings": lambda mode: {"status": "verified"}}), \
+                patch.object(Path, "mkdir", side_effect=OSError("private-value")), \
+                contextlib.redirect_stderr(output):
+            self.assertEqual(MODULE["main"](["--live-preflight"]), 2)
+        self.assertNotIn("private-value", output.getvalue())
+
+    def test_live_modes_allow_the_shared_deadline_and_require_verified(self):
+        for mode in ("preflight", "authorize"):
+            with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, '{"status":"verified"}')) as run:
+                self.assertEqual(MODULE["_settings"](mode)["status"], "verified")
+                self.assertEqual(run.call_args.kwargs["timeout"], 130)
+            with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, '{"status":"blocked"}')):
+                with self.assertRaisesRegex(ValueError, "invalid live verification response"):
+                    MODULE["_settings"](mode)
 
 
 if __name__ == "__main__":

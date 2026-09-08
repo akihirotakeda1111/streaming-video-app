@@ -14,10 +14,10 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 SCENARIOS = {
-    "preflight": ("@preflight", "local/browser/API readiness (live adapter unavailable)"),
-    "runtime-authorization": ("@reliability", "reliability authorization (live adapter unavailable)"),
+    "preflight": ("@preflight", "local/browser/API readiness"),
+    "runtime-authorization": ("@reliability", "reliability authorization"),
 }
-TOOLS = ("node", "npm", "npx", "ffmpeg", "aws")
+TOOLS = ("node", "npm", "npx", "ffmpeg", "aws", "docker")
 SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"
 
 
@@ -36,7 +36,7 @@ def _settings(mode: str) -> dict:
     try:
         result = subprocess.run(
             [node, str(SAFETY_CLI), mode], capture_output=True, text=True,
-            check=False, timeout=10,
+            check=False, timeout=130 if mode in ("authorize", "preflight") else 10,
         )
         payload = json.loads(result.stdout)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
@@ -86,7 +86,7 @@ def _preflight() -> int:
     """Verify disposable targets without creating a run or dispatching Playwright."""
     evidence = _settings("preflight")
     record = {**evidence, "scenarioStarted": False}
-    evidence_dir = Path(os.environ["E2E_EVIDENCE_DIR"].strip())
+    evidence_dir = Path(os.environ["E2E_EVIDENCE_DIR"].strip()) / f"preflight-{uuid4()}"
     evidence_dir.mkdir(parents=True, exist_ok=False)
     (evidence_dir / "live-preflight.json").write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(record, sort_keys=True))
@@ -129,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return _preflight()
         except (ValueError, OSError) as error:
-            print(json.dumps({"status": "blocked", "message": str(error), "scenarioStarted": False}), file=sys.stderr)
+            print(json.dumps({"status": "blocked", "message": str(error) if isinstance(error, ValueError) else "local preflight evidence could not be written", "scenarioStarted": False}), file=sys.stderr)
             return 2
     try:
         return _run(_live_config(args.scenario))
