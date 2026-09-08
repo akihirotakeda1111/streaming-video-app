@@ -30,7 +30,7 @@ review_attempt_limit: 3
 
 # Objective
 
-Provide one safe runner and documented environment checks before any live reliability scenario can start.
+Complete the existing safe runner with working read-only live preflight adapters before Spec 43 begins. Preserve the offline checks and fail-closed behavior for unsupported environments, but provide a verified success path for the documented disposable environment.
 
 # Non-Goals
 
@@ -56,6 +56,8 @@ Provide one safe runner and documented environment checks before any live reliab
 - Automated Validation and Final Verification commands below do not execute live failure scenarios. Human pre-merge verification owns the configured live run; missing live evidence must be reported as outstanding.
 - The Python runner and direct Playwright entry points enforce the same live safety conditions.
 - `--check` is an offline validation mode, not proof that live resources exist or that live verification passed.
+- The previously merged configuration validator and unconditional `assertLiveBoundary()` rejection are an incomplete foundation, not completion of this Spec. This work unit owns the missing common live verification adapters; do not defer them to duplicate delivery or other successor scenarios.
+- Spec 43 may begin only after this functional completion is merged into `dev/phase2` and a human has retained successful read-only preflight evidence for the intended disposable environment. Prior merge history and passing offline tests alone do not satisfy that prerequisite.
 
 # Tasks
 
@@ -65,7 +67,7 @@ depends_on: []
 
 ### Requirement
 
-Implement `run_reliability_e2e.py` with a side-effect-free `--check` mode and an explicitly gated live mode. Document its configuration, scenario selection, evidence locations, and process/service control boundaries within the E2E tree. Reuse the typed configuration and evidence helpers; add fake-boundary tests through the existing helper test command.
+Extend the existing `run_reliability_e2e.py` and shared E2E authorization boundary with bounded, read-only adapters for the documented disposable environment. Replace the unconditional live rejection with actual resource and capability verification, keeping rejection for unavailable or unsafe targets. Add an independently selectable live-preflight command that returns after verification without dispatching a failure or playback scenario. Document actual configuration, commands, required tools and existing permissions, evidence locations, and process/service control boundaries within the E2E tree. Reuse the typed configuration and evidence helpers; add fake-boundary tests through the existing helper test command.
 
 ### Acceptance Criteria
 
@@ -73,10 +75,17 @@ Implement `run_reliability_e2e.py` with a side-effect-free `--check` mode and an
 - With required local tools present, absent live configuration is reported as not configured and is not an offline-check failure; malformed supplied settings or missing tools fail with redacted diagnostics. The live path always rejects incomplete configuration.
 - Live preflight verifies disposable opt-in and non-secret resource identities, source-to-DLQ relationship, timing/attempt settings, alarm targets, and configured worker/database observation and process-control capabilities before any mutation.
 - Checks use bounded read-only observations and never print credential values. A configured flag alone does not replace target identity validation.
+- Verify actual account/region and configured bucket, source queue, DLQ, and alarm identities through supported service boundaries. Read the source queue redrive policy and compare its target with the actual DLQ identity; `E2E_SOURCE_DLQ_RELATIONSHIP=verified` is only a declaration and cannot authorize execution.
+- Inspect actual worker/database identities and the availability of the observation/control boundaries. Compare effective worker and queue settings with the contract timing and attempt constraints. Never infer capability or ownership solely from an environment variable, process name, or opaque identifier.
+- The standalone live-preflight command performs no job creation, queue send/receive/delete, media upload, database update, worker termination/restart, or failure injection. It may write only local redacted evidence; success records observed identities, capability results, and timestamps.
+- Both the Python runner and each directly selected Playwright reliability scenario await the same verification result before any scenario operation. A separate authorization test does not establish ordering or permission for another test.
+- Offline tests exercise successful verification with fake adapters, resource mismatches, unavailable/unsupported adapters, permission errors, timeouts, and redaction. Assert that failed verification prevents scenario dispatch and mutation; replace tests that require unconditional rejection for every complete configuration.
 - The runner supports selecting implemented scenarios and lists available selectors. An unknown/unimplemented selector fails; the final full sequence is assembled by Spec 46.
 - Worker termination/restart controls are limited to an explicitly identified disposable worker process/service, exclude unrelated processes, and restore the prior test-owned runtime state after failure when safe.
 - Unsupported injection/observation boundaries stop with evidence before injection. The runner does not edit source, Compose, IAM, network, or Terraform to make a scenario possible.
+- Implement at least one documented supported adapter path rather than an always-failing placeholder. Missing deployment permissions or unsupported observation/control capabilities are reported as blockers; do not mark this Spec complete or move that work into Spec 43.
 - Offline tests prove both runner and direct Playwright execution reject missing opt-in/identifiers and that `--check` does not invoke live adapters or mutation commands.
+- Update `app/frontend/e2e/reliability/runner.md` with the actual successful live-preflight command and supported adapter requirements. Human pre-merge verification must run that command against the intended disposable environment and retain its redacted success evidence. If unavailable, explicitly leave live acceptance outstanding.
 
 ### Validation
 
