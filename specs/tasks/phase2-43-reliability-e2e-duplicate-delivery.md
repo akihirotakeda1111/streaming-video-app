@@ -8,6 +8,7 @@ target_branch: feature/phase2-reliability-e2e-duplicate-delivery
 
 allowed_paths:
   - app/frontend/e2e/**
+  - app/scripts/run_reliability_e2e.py
 
 forbidden_paths:
   - specs/**
@@ -20,7 +21,8 @@ forbidden_paths:
   - app/frontend/src/**
   - app/compose.yaml
   - app/docs/**
-  - app/scripts/**
+  - app/scripts/validate_contracts.py
+  - app/scripts/validate_terraform_contracts.py
 
 repair_attempt_limit: 5
 review_attempt_limit: 3
@@ -33,6 +35,7 @@ Prove live duplicate delivery is idempotent during active ownership and after du
 # Non-Goals
 
 - Do not add crash/restart, heartbeat-duration, FFmpeg exhaustion, or DLQ scenarios.
+- Do not implement missing common live-preflight adapters here; completing them is owned by Spec 42.
 - Do not repair application, contracts, infrastructure, Compose, or production frontend code.
 - Do not add CloudFront/OAC, ECS/Fargate, autoscaling, Step Functions, AWS Batch, ABR, distributed encoding, dashboards, or performance/load targets.
 - Do not require external-failure execution in ordinary unit-test CI.
@@ -48,6 +51,7 @@ Prove live duplicate delivery is idempotent during active ownership and after du
 # Architecture Invariants
 
 - `phase2-reliability-e2e-preflight` is a prerequisite and must already be merged into `dev/phase2` (or included through a merged ancestor). A merge to `dev` alone is insufficient unless present in this base branch.
+- The prerequisite includes Spec 42's working read-only live verification adapters and retained human preflight success evidence for the intended environment. A prior merge containing only configuration validation and unconditional live rejection is insufficient; stop and report that incomplete prerequisite before implementing this scenario.
 - The Phase 2 implementation prerequisites and Phase 1 browser playback baseline from Spec 40 remain required transitively. Phase 2 Terraform must be human-verified before live verification.
 - `app/contracts/domain/reliability-conventions.md` is authoritative; Phase 1 upload, manifest-last publication, API completion, HLS checks, and browser playback remain the regression baseline.
 - Live scenarios require explicit disposable opt-in, unique run IDs, validated resource identities, bounded waits, redacted evidence, and run-scoped cleanup. Controls use documented worker/process/service boundaries only.
@@ -63,10 +67,12 @@ depends_on: []
 
 ### Requirement
 
-Implement an individually selectable, gated duplicate-delivery scenario using documented queue/service boundaries. Observe the same canonical job while its lease is active and again after completion, correlating database and worker evidence.
+Implement an individually selectable, gated duplicate-delivery scenario using documented queue/service boundaries. Register its dedicated selector in `run_reliability_e2e.py`, route it to the reliability project and an exact scenario tag, and document the command in the E2E runner guide and matrix. Reuse Spec 42's common live authorization before any scenario operation. Observe the same canonical job while its lease is active and again after completion, correlating database and worker evidence.
 
 ### Acceptance Criteria
 
+- The runner lists and accepts the dedicated duplicate-delivery selector and dispatches only that scenario in the reliability project. Do not use the broad `@reliability` tag as the scenario selector; existing selectors remain compatible and unknown selectors still fail.
+- Offline fake-dispatch tests cover selector registration, exact tag/project selection, and refusal to dispatch when live authorization fails. Direct Playwright selection also performs common live authorization before injection.
 - A valid run-owned upload reaches active processing; injected duplicate delivery during the active lease causes no second download, encode, publication, or attempt increment.
 - The job reaches one durable COMPLETED result with manifest-last publication and one effective encode/publication for this successful, non-crashing scenario.
 - Redelivery after durable COMPLETED only acknowledges: no download, FFmpeg, upload, lease/state overwrite, or attempt increment.
