@@ -133,10 +133,20 @@ The Python runner and direct Playwright reliability execution call this same
 shared verification boundary before dispatch or scenario work.
 The standalone Phase 1 `@preflight` browser readiness test retains its existing scope.
 
-`--list` shows the implemented selectors: `preflight` (local/browser/API readiness)
-and `runtime-authorization` (reliability authorization). Unknown selectors fail.
-Failure scenarios remain outside this task; their successor specs provide their
-selectors and adapters.
+`--list` shows the implemented selectors: `preflight` (local/browser/API readiness),
+`runtime-authorization` (reliability authorization), and `duplicate-delivery`
+(the duplicate-delivery scenario). Run the scenario with:
+
+`python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery`
+
+The runner dispatches this selector only to Playwright's `reliability` project
+with the exact `@duplicate-delivery` tag. Unknown selectors fail.
+
+The duplicate-delivery test calls the shared live authorization immediately
+before creating its run-owned upload or injecting a message. It observes the
+same canonical job during its active lease and after durable completion, and
+records only correlated, redacted evidence. A missing busy-lease observation
+is reported as unverified rather than treated as a pass.
 Every future reliability scenario
 must call that authorization before any operation, even when selected directly;
 a separate authorization test does not establish ordering for other tests.
