@@ -1,239 +1,106 @@
 #!/usr/bin/env python3
-"""Safe entry point for the Phase 2 reliability browser checks.
-
-This module deliberately keeps the preflight independent of AWS, Docker, and
-the application.  A live run is an explicit, disposable opt-in followed by
-the same validation against the exact targets that the scenario will use.
-"""
+"""Offline configuration checks and fail-closed reliability scenario dispatch."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import re
 import shutil
 import subprocess
 import sys
-from uuid import uuid4
-from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
-
+from dataclasses import dataclass
+from uuid import uuid4
 
 SCENARIOS = {
-    "preflight": ("@preflight", "local/browser/API readiness"),
-    "runtime-authorization": ("@reliability", "reliability runtime authorization"),
+    "preflight": ("@preflight", "local/browser/API readiness (live adapter unavailable)"),
+    "runtime-authorization": ("@reliability", "reliability authorization (live adapter unavailable)"),
 }
 TOOLS = ("node", "npm", "npx", "ffmpeg")
-URL_NAMES = ("E2E_FRONTEND_URL", "E2E_API_URL")
-IDENTITY_NAMES = (
-    "E2E_SOURCE_QUEUE",
-    "E2E_DLQ",
-    "E2E_SOURCE_BUCKET",
-    "E2E_OUTPUT_BUCKET",
-    "E2E_WORKER_OBSERVATION",
-    "E2E_DATABASE_OBSERVATION",
-    "E2E_WORKER_PROCESS_CONTROL",
-    "E2E_DATABASE_PROCESS_CONTROL",
-)
-TIMING_NAMES = (
-    "E2E_NAVIGATION_TIMEOUT_MS",
-    "E2E_UPLOAD_TIMEOUT_MS",
-    "E2E_PROCESSING_TIMEOUT_MS",
-    "E2E_LEASE_TIMEOUT_MS",
-    "E2E_VISIBILITY_TIMEOUT_MS",
-    "E2E_DLQ_TIMEOUT_MS",
-    "E2E_PLAYBACK_TIMEOUT_MS",
-)
+SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"
 
 
 @dataclass(frozen=True)
 class LiveConfig:
+    """The unique evidence destination and selected scenario for one run."""
     evidence_dir: Path
     scenario: str
 
 
-def _value(name: str, *, required: bool = False) -> str | None:
-    value = os.environ.get(name)
-    if value is None or not value.strip():
-        if required:
-            raise ValueError(f"{name} is required")
-        return None
-    return value.strip()
-
-
-def _validate_url(name: str, value: str) -> None:
-    parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError(f"{name} must be a valid http or https URL")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError(f"{name} must not contain credentials or a query")
-
-
-def _validate_identity(name: str, value: str) -> None:
-    # Resource names/ARNs are identifiers, not connection strings.  This also
-    # prevents accidental logging or acceptance of a secret as a target.
-    if len(value) > 512 or any(char.isspace() for char in value):
-        raise ValueError(f"{name} must be a non-secret resource identifier")
-    if "://" in value or "?" in value or "&" in value or "=" in value:
-        raise ValueError(f"{name} must be a non-secret resource identifier")
-    if re.search(r"(password|passwd|secret|token|credential|receipt)", value, re.I):
-        raise ValueError(f"{name} must be a non-secret resource identifier")
-
-
-def _validate_timeout(name: str, value: str) -> None:
+def _settings(mode: str) -> dict:
+    """Run the same pure validator as Playwright, without exposing child diagnostics."""
+    node = shutil.which("node")
+    if node is None:
+        raise ValueError("required local tool missing: node")
     try:
-        milliseconds = int(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive integer in milliseconds") from exc
-    if milliseconds <= 0 or milliseconds > 900_000:
-        raise ValueError(f"{name} must be a positive integer in milliseconds")
-
-
-def _validate_common_inputs(*, live: bool) -> None:
-    environment = _value("E2E_ENVIRONMENT")
-    if environment is not None and environment != "disposable":
-        raise ValueError("E2E_ENVIRONMENT must be disposable")
-    disposable = _value("E2E_RELIABILITY_DISPOSABLE")
-    if disposable is not None and disposable != "true":
-        raise ValueError("E2E_RELIABILITY_DISPOSABLE must be true")
-
-    for name in URL_NAMES:
-        value = _value(name)
-        if value is None:
-            if live:
-                raise ValueError(f"{name} is required")
-            continue
-        _validate_url(name, value)
-
-    for name in IDENTITY_NAMES:
-        value = _value(name)
-        if value is None:
-            if live:
-                raise ValueError(f"{name} is required")
-            continue
-        _validate_identity(name, value)
-
-    for name in TIMING_NAMES:
-        value = _value(name)
-        if value is not None:
-            _validate_timeout(name, value)
-
-    attempts = _value("E2E_MAX_ATTEMPTS")
-    if attempts is not None:
-        try:
-            parsed = int(attempts)
-        except ValueError as exc:
-            raise ValueError("E2E_MAX_ATTEMPTS must be a positive integer") from exc
-        if not 1 <= parsed <= 10:
-            raise ValueError("E2E_MAX_ATTEMPTS must be between 1 and 10")
-    elif live:
-        raise ValueError("E2E_MAX_ATTEMPTS is required")
-
-    alarms = _value("E2E_ALARM_IDENTIFIERS")
-    if alarms is not None:
-        alarm_values = [item.strip() for item in alarms.split(",") if item.strip()]
-        if not alarm_values:
-            raise ValueError("E2E_ALARM_IDENTIFIERS must contain at least one identifier")
-        for item in alarm_values:
-            _validate_identity("E2E_ALARM_IDENTIFIERS", item)
-    elif live:
-        raise ValueError("E2E_ALARM_IDENTIFIERS is required")
-
-    source_dlq = _value("E2E_SOURCE_DLQ")
-    declared_dlq = _value("E2E_DLQ")
-    if source_dlq is not None:
-        _validate_identity("E2E_SOURCE_DLQ", source_dlq)
-        if declared_dlq is not None and source_dlq != declared_dlq:
-            raise ValueError("E2E_SOURCE_DLQ must match E2E_DLQ")
-    elif live:
-        raise ValueError("E2E_SOURCE_DLQ is required to verify the source-to-DLQ relationship")
-
-    relationship = _value("E2E_SOURCE_DLQ_RELATIONSHIP")
-    if relationship is not None and relationship.lower() not in {"configured", "verified"}:
-        raise ValueError("E2E_SOURCE_DLQ_RELATIONSHIP must be configured or verified")
-    if live and relationship != "verified":
-        raise ValueError("E2E_SOURCE_DLQ_RELATIONSHIP=verified is required")
-
-    for name in ("E2E_WORKER_CONTROL_SCOPE", "E2E_DATABASE_CONTROL_SCOPE"):
-        value = _value(name)
-        if value is not None:
-            _validate_identity(name, value)
-
-    evidence = _value("E2E_EVIDENCE_DIR")
-    if evidence is not None:
-        path = Path(evidence)
-        if not path.is_absolute() or ".." in path.parts:
-            raise ValueError("E2E_EVIDENCE_DIR must be an absolute run-owned path")
+        result = subprocess.run(
+            [node, str(SAFETY_CLI), mode], capture_output=True, text=True,
+            check=False, timeout=10,
+        )
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+        raise ValueError("local safety validation could not complete") from error
+    if not isinstance(payload, dict):
+        raise ValueError("invalid safety validation response")
+    if result.returncode != 0:
+        # The shared validator emits only fixed messages and configuration names.
+        raise ValueError(payload.get("error", "local safety validation failed"))
+    if not isinstance(payload.get("configured"), bool):
+        raise ValueError("invalid safety validation response")
+    return payload
 
 
 def _check_tools() -> list[str]:
+    """Check local executable availability without starting live dependencies."""
     return [tool for tool in TOOLS if shutil.which(tool) is None]
 
 
 def _check() -> int:
+    """Allow absent live settings, but reject malformed values and missing tools."""
     missing = _check_tools()
-    try:
-        _validate_common_inputs(live=False)
-    except ValueError as error:
-        print(f"offline check failed: {error}", file=sys.stderr)
-        return 2
     if missing:
         print(f"offline check failed: required local tool(s) missing: {', '.join(missing)}", file=sys.stderr)
         return 2
-    configured = all(_value(name) is not None for name in (
-        *URL_NAMES,
-        *IDENTITY_NAMES,
-        "E2E_SOURCE_DLQ",
-        "E2E_SOURCE_DLQ_RELATIONSHIP",
-        "E2E_MAX_ATTEMPTS",
-        "E2E_WORKER_CONTROL_SCOPE",
-        "E2E_DATABASE_CONTROL_SCOPE",
-        "E2E_EVIDENCE_DIR",
-    )) and _value("E2E_ENVIRONMENT") == "disposable" and _value("E2E_RELIABILITY_DISPOSABLE") == "true"
-    print("offline check passed" + (" (live configuration not configured)" if not configured else ""))
+    try:
+        configured = _settings("check")["configured"]
+    except ValueError as error:
+        print(f"offline check failed: {error}", file=sys.stderr)
+        return 2
+    status = "configured; live resources not verified" if configured else "not configured"
+    print(f"offline check passed (live configuration {status})")
     return 0
 
 
 def _live_config(scenario: str) -> LiveConfig:
-    if _value("E2E_ENVIRONMENT") != "disposable":
-        raise ValueError("E2E_ENVIRONMENT=disposable is required")
-    if _value("E2E_RELIABILITY_DISPOSABLE") != "true":
-        raise ValueError("E2E_RELIABILITY_DISPOSABLE=true is required")
-    _validate_common_inputs(live=True)
-    for name in ("E2E_WORKER_CONTROL_SCOPE", "E2E_DATABASE_CONTROL_SCOPE"):
-        value = _value(name, required=True)
-        assert value is not None
-        _validate_identity(name, value)
-        if value.lower() in {"all", "host", "shared", "production"}:
-            raise ValueError(f"{name} must identify only the disposable test-owned boundary")
-    evidence_root = Path(_value("E2E_EVIDENCE_DIR", required=True) or "")
-    run_id = f"e2e-{uuid4()}"
-    return LiveConfig(evidence_root / run_id, scenario)
+    """Validate settings without observing targets or creating directories."""
+    _settings("validate")
+    return LiveConfig(Path(os.environ["E2E_EVIDENCE_DIR"].strip()) / f"e2e-{uuid4()}", scenario)
 
 
 def _run(config: LiveConfig) -> int:
-    config.evidence_dir.mkdir(parents=True, exist_ok=True)
+    """Authorize before creating evidence or dispatching any scenario."""
+    _settings("authorize")
+    config.evidence_dir.mkdir(parents=True, exist_ok=False)
     grep, _ = SCENARIOS[config.scenario]
-    args = ["npm", "run", "test:e2e", "--", "--grep", grep]
+    npm = shutil.which("npm")
+    if npm is None:
+        raise ValueError("required local tool missing: npm")
+    args = [npm, "run", "test:e2e", "--", "--grep", grep]
     if config.scenario == "runtime-authorization":
         args.extend(["--project", "reliability"])
     child_environment = os.environ.copy()
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
-    result = subprocess.run(
-        args,
-        cwd=Path(__file__).parents[1] / "frontend",
-        env=child_environment,
-        check=False,
-    )
-    return result.returncode
+    return subprocess.run(args, cwd=SAFETY_CLI.parents[2], env=child_environment, check=False).returncode
 
 
 def main(argv: list[str] | None = None) -> int:
+    """List selectors, inspect local configuration, or request live authorization."""
     parser = argparse.ArgumentParser(description="Safe Phase 2 reliability E2E runner")
-    parser.add_argument("--check", action="store_true", help="validate local tools and supplied settings only")
-    parser.add_argument("--list", action="store_true", help="list implemented scenario selectors")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--check", action="store_true", help="validate local tools and supplied settings only")
+    modes.add_argument("--list", action="store_true", help="list implemented scenario selectors")
     parser.add_argument("--scenario", choices=sorted(SCENARIOS), default="preflight")
     args = parser.parse_args(argv)
     if args.list:
@@ -244,8 +111,11 @@ def main(argv: list[str] | None = None) -> int:
         return _check()
     try:
         return _run(_live_config(args.scenario))
-    except (OSError, ValueError) as error:
-        print(f"live preflight failed: {error}", file=sys.stderr)
+    except (ValueError, OSError) as error:
+        # No environment values or unredacted service errors enter this evidence.
+        print(json.dumps({"status": "blocked", "scenario": args.scenario,
+                          "message": str(error) if isinstance(error, ValueError) else "local scenario dispatch failed", "liveResourcesVerified": False,
+                          "scenarioStarted": False}), file=sys.stderr)
         return 2
 
 
