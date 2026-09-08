@@ -539,7 +539,7 @@ test.describe('@phase1-pipeline', () => {
                 const failed = observations.findLast((item) => item.status === 'FAILED')
                 throw new Error(
                   `pipeline reached FAILED: ${JSON.stringify(
-                    safeDiagnostic({ videoId, jobId, status: 'FAILED', failure: failed?.failure }),
+                    safeDiagnostic({ videoId, jobId, jobStatus: 'FAILED', failure: failed?.failure }),
                   )}`,
                 )
               }
@@ -635,14 +635,14 @@ test.describe('@phase1-pipeline', () => {
       await attachSafeDiagnostic(testInfo, 'pipeline-status', {
         videoId,
         jobId,
-        status: latestStatus,
+        jobStatus: latestStatus,
         observedStatuses,
       })
       const mediaPrefix = mediaPathPrefix(videoId, jobId)
       await attachSafeDiagnostic(testInfo, 'browser-playback', {
         videoId,
         jobId,
-        status: latestStatus,
+        jobStatus: latestStatus,
         manifestOrigin: playbackManifest?.origin,
         segmentCount: playbackEvidence?.segmentCount,
         readyState: playbackEvidence?.readyState,
