@@ -88,6 +88,8 @@ class RunnerChecks(unittest.TestCase):
         code, output, calls = self.invoke(["--list"], {})
         self.assertEqual(code, 0)
         self.assertIn("runtime-authorization", output)
+        self.assertIn("duplicate-delivery", output)
+        self.assertIn("unverified", output)
         self.assertEqual(calls, [])
         with self.assertRaises(SystemExit) as error:
             self.invoke(["--scenario", "unimplemented"], {})
@@ -115,7 +117,8 @@ class RunnerChecks(unittest.TestCase):
             self.assertTrue(all(not json.loads(p.read_text())["scenarioStarted"] for p in records))
 
     def test_failed_authorization_cannot_write_or_dispatch(self):
-        for args in (["--live-preflight"], ["--scenario", "runtime-authorization"]):
+        for args in (["--live-preflight"], ["--scenario", "runtime-authorization"],
+                     ["--scenario", "duplicate-delivery"]):
             def settings(mode):
                 if mode == "validate":
                     return {"configured": True}
@@ -125,6 +128,35 @@ class RunnerChecks(unittest.TestCase):
                     patch("subprocess.run", side_effect=AssertionError("must not dispatch")), \
                     contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(MODULE["main"](args), 2)
+
+    def test_duplicate_dispatch_and_failure_propagation(self):
+        """Dispatch only the dedicated tag/project and preserve an unverified exit."""
+        for returncode in (0, 1):
+            with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as root:
+                destination = Path(root) / "e2e-test"
+                config = MODULE["LiveConfig"](destination, "duplicate-delivery")
+                modes = []
+
+                def authorize(mode):
+                    self.assertFalse(destination.exists())
+                    modes.append(mode)
+                    return {"status": "verified"}
+
+                def dispatch(command, **kwargs):
+                    self.assertEqual(modes, ["authorize"])
+                    self.assertTrue(destination.is_dir())
+                    self.assertEqual(command, ["npm-test", "run", "test:e2e", "--",
+                                               "--grep", "@duplicate-delivery", "--project", "reliability"])
+                    self.assertEqual(kwargs["cwd"], MODULE["SAFETY_CLI"].parents[2])
+                    self.assertEqual(kwargs["env"]["E2E_RUN_ID"], destination.name)
+                    self.assertEqual(kwargs["env"]["E2E_EVIDENCE_DIR"], str(destination))
+                    return subprocess.CompletedProcess(command, returncode)
+
+                with patch.dict(GLOBALS, {"_settings": authorize}), \
+                        patch("shutil.which", return_value="npm-test"), \
+                        patch("subprocess.run", side_effect=dispatch) as run:
+                    self.assertEqual(MODULE["_run"](config), returncode)
+                    run.assert_called_once()
 
     def test_preflight_filesystem_errors_are_redacted(self):
         output = io.StringIO()
