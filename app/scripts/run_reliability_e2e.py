@@ -16,7 +16,7 @@ from uuid import uuid4
 SCENARIOS = {
     "preflight": ("@preflight", "local/browser/API readiness"),
     "runtime-authorization": ("@reliability", "reliability authorization"),
-    "duplicate-delivery": ("@duplicate-delivery", "duplicate delivery during and after completion"),
+    "duplicate-delivery": ("@duplicate-delivery", "unverified: duplicate observation and cleanup adapters pending"),
 }
 TOOLS = ("node", "npm", "npx", "ffmpeg", "aws", "docker")
 SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"

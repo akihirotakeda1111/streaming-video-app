@@ -135,18 +135,38 @@ The standalone Phase 1 `@preflight` browser readiness test retains its existing 
 
 `--list` shows the implemented selectors: `preflight` (local/browser/API readiness),
 `runtime-authorization` (reliability authorization), and `duplicate-delivery`
-(the duplicate-delivery scenario). Run the scenario with:
+(a fail-closed duplicate-delivery entry point). Select it with:
 
 `python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery`
 
 The runner dispatches this selector only to Playwright's `reliability` project
 with the exact `@duplicate-delivery` tag. Unknown selectors fail.
 
-The duplicate-delivery test calls the shared live authorization immediately
-before creating its run-owned upload or injecting a message. It observes the
-same canonical job during its active lease and after durable completion, and
-records only correlated, redacted evidence. A missing busy-lease observation
-is reported as unverified rather than treated as a pass.
+The duplicate-delivery entry point calls shared live authorization, then fails
+with `status: unverified` and `scenarioStarted: false` in its diagnostic attachment.
+It does not upload, inject messages, or create remote resources. This is a failed
+test (nonzero exit), not a passing or skipped live scenario, even when preflight
+succeeds. The previous status-only checks could pass without handling duplicates
+and have been removed.
+
+Live implementation is blocked on correlated observation and scoped cleanup:
+
+- The existing `busy` and `already_completed` record logs contain canonical IDs,
+  but `deleted` message logs do not. Worker identity and adjacent timestamps cannot
+  establish which message was acknowledged under concurrency.
+- Active delivery must prove `busy` while the original DB lease is active, with
+  unchanged owner and attempt. The worker receiving the duplicate need not be the
+  owner. Completion clears ownership; post-completion delivery must retain that
+  unowned state and attempt, acknowledge the duplicate, and add no processing.
+- Worker/process evidence must establish one effective encode/publication;
+  final status and deterministic output keys alone are insufficient.
+- `RunResources` only invokes registered callbacks. Safe remote cleanup adapters
+  must handle exact run-owned IDs, pending deliveries and in-flight work on both
+  success and timeout before resource-creating execution can be restored.
+
+These prerequisites must be implemented and validated through an appropriately
+scoped task before enabling live duplicate delivery. Do not bypass this block
+with a configuration flag, fixed sleep, queue-wide counts or status-only polling.
 Every future reliability scenario
 must call that authorization before any operation, even when selected directly;
 a separate authorization test does not establish ordering for other tests.
@@ -166,7 +186,10 @@ entry-point tests. Python must be on PATH, or `PYTHON` may name its executable.
 Tests use disposable dummy identities and fake external command responses while
 executing the real authorization policy. No external services are contacted.
 They cover missing settings, malformed scopes, completeness, redaction, validator
-timeouts, and refusal to dispatch without supported adapters.
+timeouts, refusal to dispatch without supported adapters, dedicated duplicate
+selector/tag/project dispatch, and nonzero exit propagation. The duplicate entry
+point is also checked to fail after authorization without requesting browser/API
+fixtures and to retain unverified evidence.
 
 Human verification against the intended disposable environment remains
 outstanding until the command above succeeds and its redacted evidence is
