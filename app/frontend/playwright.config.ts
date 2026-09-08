@@ -1,6 +1,6 @@
 import process from 'node:process'
 import { defineConfig, devices } from '@playwright/test'
-import { e2eConfig } from './e2e/config'
+import { e2eConfig, reliabilityDiscoveryConfig } from './e2e/config.js'
 
 /**
  * Read environment variables from file.
@@ -54,20 +54,33 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
+      testIgnore: ['**/*.test.ts', '**/reliability/**/*.spec.ts'],
       use: {
         ...devices['Desktop Chrome'],
       },
     },
     {
       name: 'firefox',
+      testIgnore: ['**/*.test.ts', '**/reliability/**/*.spec.ts'],
       use: {
         ...devices['Desktop Firefox'],
       },
     },
     {
       name: 'webkit',
+      testIgnore: ['**/*.test.ts', '**/reliability/**/*.spec.ts'],
       use: {
         ...devices['Desktop Safari'],
+      },
+    },
+    {
+      name: 'reliability',
+      testMatch: '**/reliability/**/*.spec.ts',
+      retries: 0,
+      workers: 1,
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: reliabilityDiscoveryConfig().frontendUrl,
       },
     },
 
@@ -98,7 +111,12 @@ export default defineConfig({
     //     channel: 'chrome',
     //   },
     // },
-  ].filter(({ name }) => name === e2eConfig.project),
+  ].filter(
+    ({ name }) =>
+      name === e2eConfig.project ||
+      (name === 'reliability' &&
+        (process.env.E2E_DISCOVERY === 'true' || process.env.E2E_INCLUDE_RELIABILITY === 'true')),
+  ),
 
   /* Folder for test artifacts such as screenshots, videos, traces, etc. */
   // outputDir: 'test-results/',
