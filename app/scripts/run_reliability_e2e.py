@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Offline configuration checks and fail-closed reliability scenario dispatch."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from dataclasses import dataclass
+from uuid import uuid4
+
+SCENARIOS = {
+    "preflight": ("@preflight", "local/browser/API readiness (live adapter unavailable)"),
+    "runtime-authorization": ("@reliability", "reliability authorization (live adapter unavailable)"),
+}
+TOOLS = ("node", "npm", "npx", "ffmpeg")
+SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"
+
+
+@dataclass(frozen=True)
+class LiveConfig:
+    """The unique evidence destination and selected scenario for one run."""
+    evidence_dir: Path
+    scenario: str
+
+
+def _settings(mode: str) -> dict:
+    """Run the same pure validator as Playwright, without exposing child diagnostics."""
+    node = shutil.which("node")
+    if node is None:
+        raise ValueError("required local tool missing: node")
+    try:
+        result = subprocess.run(
+            [node, str(SAFETY_CLI), mode], capture_output=True, text=True,
+            check=False, timeout=10,
+        )
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+        raise ValueError("local safety validation could not complete") from error
+    if not isinstance(payload, dict):
+        raise ValueError("invalid safety validation response")
+    if result.returncode != 0:
+        # The shared validator emits only fixed messages and configuration names.
+        raise ValueError(payload.get("error", "local safety validation failed"))
+    if not isinstance(payload.get("configured"), bool):
+        raise ValueError("invalid safety validation response")
+    return payload
+
+
+def _check_tools() -> list[str]:
+    """Check local executable availability without starting live dependencies."""
+    return [tool for tool in TOOLS if shutil.which(tool) is None]
+
+
+def _check() -> int:
+    """Allow absent live settings, but reject malformed values and missing tools."""
+    missing = _check_tools()
+    if missing:
+        print(f"offline check failed: required local tool(s) missing: {', '.join(missing)}", file=sys.stderr)
+        return 2
+    try:
+        configured = _settings("check")["configured"]
+    except ValueError as error:
+        print(f"offline check failed: {error}", file=sys.stderr)
+        return 2
+    status = "configured; live resources not verified" if configured else "not configured"
+    print(f"offline check passed (live configuration {status})")
+    return 0
+
+
+def _live_config(scenario: str) -> LiveConfig:
+    """Validate settings without observing targets or creating directories."""
+    _settings("validate")
+    return LiveConfig(Path(os.environ["E2E_EVIDENCE_DIR"].strip()) / f"e2e-{uuid4()}", scenario)
+
+
+def _run(config: LiveConfig) -> int:
+    """Authorize before creating evidence or dispatching any scenario."""
+    _settings("authorize")
+    config.evidence_dir.mkdir(parents=True, exist_ok=False)
+    grep, _ = SCENARIOS[config.scenario]
+    npm = shutil.which("npm")
+    if npm is None:
+        raise ValueError("required local tool missing: npm")
+    args = [npm, "run", "test:e2e", "--", "--grep", grep]
+    if config.scenario == "runtime-authorization":
+        args.extend(["--project", "reliability"])
+    child_environment = os.environ.copy()
+    child_environment["E2E_RUN_ID"] = config.evidence_dir.name
+    child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
+    return subprocess.run(args, cwd=SAFETY_CLI.parents[2], env=child_environment, check=False).returncode
+
+
+def main(argv: list[str] | None = None) -> int:
+    """List selectors, inspect local configuration, or request live authorization."""
+    parser = argparse.ArgumentParser(description="Safe Phase 2 reliability E2E runner")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--check", action="store_true", help="validate local tools and supplied settings only")
+    modes.add_argument("--list", action="store_true", help="list implemented scenario selectors")
+    parser.add_argument("--scenario", choices=sorted(SCENARIOS), default="preflight")
+    args = parser.parse_args(argv)
+    if args.list:
+        for selector, (_, description) in SCENARIOS.items():
+            print(f"{selector}\t{description}")
+        return 0
+    if args.check:
+        return _check()
+    try:
+        return _run(_live_config(args.scenario))
+    except (ValueError, OSError) as error:
+        # No environment values or unredacted service errors enter this evidence.
+        print(json.dumps({"status": "blocked", "scenario": args.scenario,
+                          "message": str(error) if isinstance(error, ValueError) else "local scenario dispatch failed", "liveResourcesVerified": False,
+                          "scenarioStarted": False}), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

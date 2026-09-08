@@ -1,4 +1,5 @@
 import process from 'node:process'
+import { assertLiveBoundary, validateSettings } from './reliability/safety.mjs'
 
 export const e2eProjects = ['chromium', 'firefox', 'webkit'] as const
 export type E2EProject = (typeof e2eProjects)[number]
@@ -23,6 +24,11 @@ export interface E2EConfig {
 }
 
 export interface ReliabilityConfig {
+  sourceDeadLetterQueue: string
+  maxAttempts: number
+  workerControlScope: string
+  databaseControlScope: string
+  evidenceDir: string
   frontendUrl: string
   apiUrl: string
   sourceQueue: string
@@ -96,6 +102,11 @@ function reliabilityTimeouts(): E2ETimeouts {
 /** Returns safe values for Playwright discovery; it never authorizes a live run. */
 export function reliabilityDiscoveryConfig(): ReliabilityConfig {
   return Object.freeze({
+    sourceDeadLetterQueue: 'discovery-dead-letter-queue',
+    maxAttempts: 1,
+    workerControlScope: 'discovery-worker',
+    databaseControlScope: 'discovery-database',
+    evidenceDir: '',
     frontendUrl: process.env.E2E_FRONTEND_URL?.trim() || 'http://127.0.0.1:5173',
     apiUrl: process.env.E2E_API_URL?.trim() || 'http://127.0.0.1:8000',
     sourceQueue: 'discovery-source-queue',
@@ -113,13 +124,13 @@ export function reliabilityDiscoveryConfig(): ReliabilityConfig {
 
 /** Validates live inputs and disposable opt-ins, even during discovery. */
 export function loadReliabilityConfig(): ReliabilityConfig {
-  if (process.env.E2E_ENVIRONMENT !== 'disposable') {
-    throw new Error('E2E_ENVIRONMENT=disposable is required for reliability E2E tests')
-  }
-  if (process.env.E2E_RELIABILITY_DISPOSABLE !== 'true') {
-    throw new Error('E2E_RELIABILITY_DISPOSABLE=true is required for reliability E2E tests')
-  }
+  validateSettings(process.env, true)
   return Object.freeze({
+    sourceDeadLetterQueue: requiredValue('E2E_SOURCE_DLQ'),
+    maxAttempts: Number(requiredValue('E2E_MAX_ATTEMPTS')),
+    workerControlScope: requiredValue('E2E_WORKER_CONTROL_SCOPE'),
+    databaseControlScope: requiredValue('E2E_DATABASE_CONTROL_SCOPE'),
+    evidenceDir: requiredValue('E2E_EVIDENCE_DIR'),
     frontendUrl: requiredUrl('E2E_FRONTEND_URL'),
     apiUrl: requiredUrl('E2E_API_URL'),
     sourceQueue: requiredValue('E2E_SOURCE_QUEUE'),
@@ -137,7 +148,9 @@ export function loadReliabilityConfig(): ReliabilityConfig {
 
 /** Requires live authorization; discovery placeholders cannot satisfy this check. */
 export function assertReliabilityAuthorization(): ReliabilityConfig {
-  return loadReliabilityConfig()
+  const config = loadReliabilityConfig()
+  assertLiveBoundary()
+  return config
 }
 
 function project(): E2EProject {
