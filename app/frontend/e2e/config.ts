@@ -111,8 +111,8 @@ export function reliabilityDiscoveryConfig(): ReliabilityConfig {
   })
 }
 
+/** Validates live inputs and disposable opt-ins, even during discovery. */
 export function loadReliabilityConfig(): ReliabilityConfig {
-  if (process.env.E2E_DISCOVERY === 'true') return reliabilityDiscoveryConfig()
   if (process.env.E2E_ENVIRONMENT !== 'disposable') {
     throw new Error('E2E_ENVIRONMENT=disposable is required for reliability E2E tests')
   }
@@ -135,6 +135,7 @@ export function loadReliabilityConfig(): ReliabilityConfig {
   })
 }
 
+/** Requires live authorization; discovery placeholders cannot satisfy this check. */
 export function assertReliabilityAuthorization(): ReliabilityConfig {
   return loadReliabilityConfig()
 }

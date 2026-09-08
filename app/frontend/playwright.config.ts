@@ -54,18 +54,21 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
+      testIgnore: ['**/*.test.ts', '**/reliability/**/*.spec.ts'],
       use: {
         ...devices['Desktop Chrome'],
       },
     },
     {
       name: 'firefox',
+      testIgnore: ['**/*.test.ts', '**/reliability/**/*.spec.ts'],
       use: {
         ...devices['Desktop Firefox'],
       },
     },
     {
       name: 'webkit',
+      testIgnore: ['**/*.test.ts', '**/reliability/**/*.spec.ts'],
       use: {
         ...devices['Desktop Safari'],
       },
