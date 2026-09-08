@@ -2,7 +2,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
-import { assertLiveBoundary, checkSettings, IDENTITY_NAMES, SCOPE_NAMES, TIMING_NAMES, URL_NAMES, validateSettings } from './safety.mjs'
+import { checkSettings, IDENTITY_NAMES, SCOPE_NAMES, TIMING_NAMES, URL_NAMES, validateSettings, verifyLiveBoundary } from './safety.mjs'
 
 function completeSettings(): Record<string, string> {
   return {
@@ -13,6 +13,7 @@ function completeSettings(): Record<string, string> {
     E2E_ENVIRONMENT: 'disposable', E2E_RELIABILITY_DISPOSABLE: 'true',
     E2E_SOURCE_DLQ_RELATIONSHIP: 'verified', E2E_MAX_ATTEMPTS: '3',
     E2E_ALARM_IDENTIFIERS: 'test-alarm', E2E_EVIDENCE_DIR: resolve('unused-test-evidence'),
+    AWS_REGION: 'us-east-1', E2E_AWS_ACCOUNT_ID: '123456789012', E2E_DOCKER_HOST: 'unix:///var/run/docker.sock',
   }
 }
 
@@ -20,7 +21,7 @@ describe('shared reliability safety policy', () => {
   it('distinguishes complete settings from actual live authorization', () => {
     expect(checkSettings({})).toEqual({ configured: false })
     expect(checkSettings(completeSettings())).toEqual({ configured: true })
-    expect(() => assertLiveBoundary()).toThrow('adapters are unavailable')
+    expect(() => verifyLiveBoundary({ env: completeSettings() })).toThrow('full Docker container ID')
   })
 
   it.each(Object.keys(completeSettings()))('requires %s live while allowing absence offline', (name) => {
@@ -56,6 +57,9 @@ describe('shared reliability safety policy', () => {
     ['E2E_ALARM_IDENTIFIERS', ' , , '],
     ['E2E_EVIDENCE_DIR', '../private-value'],
     ['E2E_MAX_ATTEMPTS', '11'],
+    ['E2E_AWS_ACCOUNT_ID', 'private-value'],
+    ['AWS_REGION', 'private-value'],
+    ['E2E_DOCKER_HOST', 'https://private-value'],
   ])('rejects and redacts malformed %s', (name, value) => {
     const env = { ...completeSettings(), [name!]: value! }
     for (const live of [false, true]) {

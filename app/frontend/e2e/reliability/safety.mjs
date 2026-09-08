@@ -1,5 +1,6 @@
 // @ts-check
 import path from 'node:path'
+import { observeLiveBoundary, validateTargetSettings } from './live.mjs'
 
 export const URL_NAMES = ['E2E_FRONTEND_URL', 'E2E_API_URL']
 export const IDENTITY_NAMES = [
@@ -16,7 +17,14 @@ export const SCOPE_NAMES = ['E2E_WORKER_CONTROL_SCOPE', 'E2E_DATABASE_CONTROL_SC
 
 /** @param {string} name @param {string} value */
 function identity(name, value) {
-  if (value.length > 512 || /\s|:\/\/|[?&=*]|password|passwd|secret|token|credential|receipt/i.test(value)) {
+  let resourceUrl
+  if (value.includes('://')) {
+    try { resourceUrl = new URL(value) } catch { resourceUrl = undefined }
+    if (!resourceUrl || resourceUrl.protocol !== 'https:' || resourceUrl.username || resourceUrl.password || resourceUrl.search || resourceUrl.hash) {
+      throw new Error(`${name} must be a non-secret resource identifier`)
+    }
+  }
+  if (value.length > 512 || /\s|[?&=*]|password|passwd|secret|token|credential|receipt/i.test(value)) {
     throw new Error(`${name} must be a non-secret resource identifier`)
   }
 }
@@ -90,6 +98,7 @@ export function validateSettings(env, live) {
   if (evidence && (!path.isAbsolute(evidence) || evidence.split(/[\\/]/).includes('..'))) {
     throw new Error('E2E_EVIDENCE_DIR must be an absolute run-owned path')
   }
+  validateTargetSettings(env, live)
 }
 
 /** Reports completeness without observing resources or creating run directories.
@@ -105,7 +114,12 @@ export function checkSettings(env) {
   }
 }
 
-/** No supported read-only target/control adapter exists yet; flags cannot replace it. */
+/** @param {Parameters<typeof observeLiveBoundary>[0]} [options] */
+export function verifyLiveBoundary(options = {}) {
+  validateSettings(options.env || process.env, true)
+  return observeLiveBoundary(options)
+}
+
 export function assertLiveBoundary() {
-  throw new Error('live preflight blocked: read-only source-DLQ and worker/database capability adapters are unavailable; no live resources verified and no scenario started')
+  return verifyLiveBoundary()
 }

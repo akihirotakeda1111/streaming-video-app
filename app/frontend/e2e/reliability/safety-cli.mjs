@@ -6,10 +6,12 @@ try {
   const mode = process.argv[2]
   if (mode === 'check') {
     console.log(JSON.stringify(checkSettings(process.env)))
-  } else if (mode === 'validate' || mode === 'authorize') {
+  } else if (mode === 'validate') {
     validateSettings(process.env, true)
-    if (mode === 'authorize') assertLiveBoundary()
     console.log(JSON.stringify({ configured: true }))
+  } else if (mode === 'authorize' || mode === 'preflight') {
+    const evidence = assertLiveBoundary()
+    console.log(JSON.stringify(evidence))
   } else {
     throw new Error('unknown safety validation mode')
   }

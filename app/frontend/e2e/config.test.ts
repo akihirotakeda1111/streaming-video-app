@@ -27,6 +27,7 @@ const liveInputs = {
   E2E_VISIBILITY_TIMEOUT_MS: '180000',
   E2E_DLQ_TIMEOUT_MS: '300000',
   E2E_PLAYBACK_TIMEOUT_MS: '120000',
+  AWS_REGION: 'us-east-1', E2E_AWS_ACCOUNT_ID: '123456789012', E2E_DOCKER_HOST: 'unix:///var/run/docker.sock',
 }
 
 beforeEach(() => {
@@ -92,7 +93,7 @@ describe('reliability E2E runtime configuration', () => {
     expect(() => loadReliabilityConfig()).toThrow('E2E_LEASE_TIMEOUT_MS must be a positive integer')
   })
 
-  it.each([undefined, 'true'])('parses complete inputs but blocks unsupported live boundaries with discovery=%s', async (discovery) => {
+  it.each([undefined, 'true'])('parses complete inputs but blocks incomplete live target settings with discovery=%s', async (discovery) => {
     const { loadReliabilityConfig, assertReliabilityAuthorization } = await import('./config.js')
     vi.stubEnv('E2E_DISCOVERY', discovery)
     vi.stubEnv('E2E_RELIABILITY_DISPOSABLE', 'true')
@@ -101,6 +102,7 @@ describe('reliability E2E runtime configuration', () => {
     expect(config.sourceQueue).toBe(liveInputs.E2E_SOURCE_QUEUE)
     expect(config.alarmIdentifiers).toEqual(['test-alarm-1', 'test-alarm-2'])
     expect(config.timeouts.lease).toBe(900000)
-    expect(() => assertReliabilityAuthorization()).toThrow('adapters are unavailable')
+    vi.stubEnv('E2E_AWS_ACCOUNT_ID', undefined)
+    expect(() => assertReliabilityAuthorization()).toThrow('E2E_AWS_ACCOUNT_ID is required')
   })
 })
