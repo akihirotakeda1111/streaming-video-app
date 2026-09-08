@@ -3,10 +3,10 @@ import type { TestInfo } from '@playwright/test'
 
 const REDACTED = '[REDACTED]'
 const PRESERVED_KEYS = new Set(['origin', 'path', 'status', 'videoId', 'jobId'])
-const CREDENTIAL_KEY = /authorization|token|password|secret|credential|api[_-]?key|cookie/i
+const CREDENTIAL_KEY = /authorization|token|password|secret|credential|api[_-]?key|cookie|receipt(?:[_-]?handle)?|database(?:[_-]?url)?/i
 const URL_KEY = /url/i
 const SECRET_FIELDS =
-  /("?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|x-amz-[a-z-]+)"?\s*[:=]\s*)(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s,"'}]+))/gi
+  /("?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|receipt(?:[_-]?handle)?|database(?:[_-]?url)?|x-amz-[a-z-]+)"?\s*[:=]\s*)(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s,"'}]+))/gi
 const AUTH_HEADERS = /((?:Proxy-)?Authorization)\s*:\s*[^\r\n]*/gi
 const COOKIE_HEADERS = /((?:Set-)?Cookie)\s*:\s*[^\r\n]*/gi
 const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi
@@ -15,6 +15,7 @@ const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi
 export function redactUrl(value: string): string {
   try {
     const url = new URL(value)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return REDACTED
     return `${url.origin}${url.pathname}`
   } catch {
     const stripped = value.replace(/[?#][\s\S]*/, '')
@@ -59,7 +60,11 @@ function sanitizePath(value: string): string {
 
 /** Redacts URL query strings and common credential-shaped values while retaining IDs. */
 export function redactText(value: string): string {
-  let redacted = value.replace(/https?:\/\/[^\s"']+/gi, (url) => redactUrl(url))
+  let redacted = value.replace(/[a-z][a-z\d+.-]*:\/\/[^\s"']+/gi, (url) => redactUrl(url))
+  // Relative request targets can carry the same secrets as absolute URLs.
+  redacted = redacted.replace(/(^|[\s"'=(:])([^\s"'<>?#]*[?#][^\s"'<>]*)/g,
+    (_match, prefix: string, target: string) => `${prefix}${sanitizeInvalidUrl(target)}`)
+  redacted = redacted.replace(/\/\/[^\s/"']*@[^\s"']*/g, REDACTED)
   redacted = redacted.replace(AUTH_HEADERS, `$1: ${REDACTED}`)
   redacted = redacted.replace(COOKIE_HEADERS, `$1: ${REDACTED}`)
   redacted = redacted.replace(BEARER, `Bearer ${REDACTED}`)
@@ -102,7 +107,7 @@ function sanitizeRecord(input: Record<string, unknown>): SafeDiagnostic {
       } else if (key === 'path' && typeof value === 'string') {
         output[key] = sanitizePath(value)
       } else {
-        output[key] = value
+        output[key] = sanitizeUnknown(value)
       }
       continue
     }
