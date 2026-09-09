@@ -17,8 +17,8 @@ SCENARIOS = {
     "preflight": ("@preflight", "local/browser/API readiness"),
     "runtime-authorization": ("@reliability", "reliability authorization"),
     "duplicate-delivery": ("@duplicate-delivery", "unverified: duplicate observation and cleanup adapters pending"),
-    "crash-recovery": ("@crash-recovery", "worker crash recovery with lease and visibility correlation"),
-    "long-heartbeat": ("@long-heartbeat", "multi-cycle worker heartbeat and ownership observation"),
+    "crash-recovery": ("@crash-recovery", "blocked: scoped worker control and recovery observation adapters pending"),
+    "long-heartbeat": ("@long-heartbeat", "blocked: heartbeat observation and cleanup adapters pending"),
 }
 TOOLS = ("node", "npm", "npx", "ffmpeg", "aws", "docker")
 SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"

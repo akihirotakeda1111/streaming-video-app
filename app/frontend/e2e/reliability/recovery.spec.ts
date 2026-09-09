@@ -16,12 +16,13 @@ async function blockedScenario(
     status: 'blocked',
     scenarioStarted: false,
     liveResourcesVerified: false,
-    reason: 'Scoped worker-control, queue-observation, database-observation, and cleanup adapters are not implemented.',
+    reason: 'Live authorization did not complete.',
     timestamps: [new Date().toISOString()],
   }
   try {
     assertReliabilityAuthorization()
     evidence.liveResourcesVerified = true
+    evidence.reason = 'Scoped worker-control, queue-observation, database-observation, and cleanup adapters are not implemented.'
     throw new Error(String(evidence.reason))
   } finally {
     await attachSafeDiagnostic(testInfo, `${scenario}-evidence`, evidence)

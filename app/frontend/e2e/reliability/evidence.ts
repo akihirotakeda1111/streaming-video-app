@@ -162,18 +162,24 @@ export function expiryBounds(
     timing.heartbeatIntervalMs, timing.retryDelayMs ?? 0, marginMs]
   if (!values.every(Number.isFinite) || !Number.isInteger(acquiredAtMs) || acquiredAtMs < 0
     || timing.visibilityTimeoutMs <= 0 || timing.leaseTimeoutMs <= 0
-    || timing.heartbeatIntervalMs <= 0 || marginMs < 0) {
+    || timing.heartbeatIntervalMs <= 0
+    || timing.heartbeatIntervalMs >= Math.min(timing.visibilityTimeoutMs, timing.leaseTimeoutMs)
+    || (timing.retryDelayMs !== undefined && timing.retryDelayMs <= 0) || marginMs < 0) {
     throw new Error('worker expiry settings must be finite positive values')
   }
   const visibilityExpiresAtMs = acquiredAtMs + timing.visibilityTimeoutMs
   const leaseExpiresAtMs = acquiredAtMs + timing.leaseTimeoutMs
   const recoveryEligibleAtMs = Math.max(visibilityExpiresAtMs, leaseExpiresAtMs)
+  const deadlineAtMs = recoveryEligibleAtMs + (timing.retryDelayMs ?? 0) + marginMs
+  if (![visibilityExpiresAtMs, leaseExpiresAtMs, deadlineAtMs].every(Number.isFinite)) {
+    throw new Error('worker expiry bounds must be finite')
+  }
   return {
     acquiredAtMs,
     visibilityExpiresAtMs,
     leaseExpiresAtMs,
     recoveryEligibleAtMs,
-    deadlineAtMs: recoveryEligibleAtMs + (timing.retryDelayMs ?? 0) + marginMs,
+    deadlineAtMs,
   }
 }
 
@@ -194,22 +200,37 @@ export interface CrashRecoveryEvidence {
 export function assertCrashRecoveryEvidence(
   evidence: CrashRecoveryEvidence,
   timing: WorkerTiming,
+  expectedSourceKey: string,
 ): void {
   const bounds = expiryBounds(evidence.acquiredAtMs, timing)
+  if (![evidence.crashAtMs, evidence.recoveryAtMs, evidence.visibilityExpiredAtMs,
+    evidence.leaseExpiredAtMs].every((value) => Number.isFinite(value) && value >= 0)) {
+    throw new Error('recovery timestamps must be finite and non-negative')
+  }
   if (evidence.crashAtMs <= evidence.acquiredAtMs) throw new Error('crash must follow acquisition')
+  if (evidence.crashAtMs >= evidence.recoveryAtMs) throw new Error('recovery must follow crash')
   if (evidence.recoveryAtMs < bounds.recoveryEligibleAtMs) throw new Error('recovery preceded expiry gates')
   if (evidence.visibilityExpiredAtMs < bounds.visibilityExpiresAtMs
-    || evidence.leaseExpiredAtMs < bounds.leaseExpiresAtMs) throw new Error('expiry evidence is not correlated')
-  if (evidence.states.includes('COMPLETED') && !evidence.manifestPublishedLast) {
+    || evidence.leaseExpiredAtMs < bounds.leaseExpiresAtMs
+    || evidence.recoveryAtMs < Math.max(evidence.visibilityExpiredAtMs, evidence.leaseExpiredAtMs)) {
+    throw new Error('expiry evidence is not correlated')
+  }
+  if (evidence.states[0] !== 'PROCESSING' || evidence.states.at(-1) !== 'COMPLETED'
+    || evidence.states.slice(0, -1).some((state) => state !== 'PROCESSING')
+    || !evidence.manifestPublishedLast) {
     throw new Error('completion requires manifest-last publication')
   }
-  if (evidence.attempts.length !== 2 || evidence.attempts[1] !== evidence.attempts[0] + 1) {
+  if (evidence.attempts.length !== 2
+    || !evidence.attempts.every((attempt) => Number.isSafeInteger(attempt) && attempt > 0)
+    || evidence.attempts[1] !== evidence.attempts[0] + 1) {
     throw new Error('recovery must increment the attempt exactly once')
   }
   if (new Set(evidence.owners).size !== 2 || evidence.owners.some((owner) => !owner.trim())) {
     throw new Error('recovery must identify exactly one replacement owner')
   }
-  if (!evidence.sourceKey.trim()) throw new Error('recovery must restart from the canonical source')
+  if (!expectedSourceKey.trim() || evidence.sourceKey !== expectedSourceKey) {
+    throw new Error('recovery must restart from the canonical source')
+  }
 }
 
 export interface HeartbeatEvidence {
@@ -222,14 +243,20 @@ export interface HeartbeatEvidence {
 }
 
 /** Checks that a long workload actually crossed multiple heartbeat cycles without reacquisition. */
-export function assertLongHeartbeatEvidence(evidence: HeartbeatEvidence): void {
-  if (!Number.isFinite(evidence.durationMs) || evidence.durationMs <= evidence.heartbeatIntervalMs * 2) {
+export function assertLongHeartbeatEvidence(evidence: HeartbeatEvidence, timing: WorkerTiming): void {
+  expiryBounds(0, timing)
+  if (!Number.isFinite(evidence.heartbeatIntervalMs) || evidence.heartbeatIntervalMs <= 0
+    || evidence.heartbeatIntervalMs !== timing.heartbeatIntervalMs) {
+    throw new Error('heartbeat interval must match verified worker timing')
+  }
+  if (!Number.isFinite(evidence.durationMs) || evidence.durationMs <= timing.heartbeatIntervalMs * 2) {
     throw new Error('workload was too short to prove multiple heartbeat cycles')
   }
   if (evidence.visibilityExtensions.length < 2 || evidence.leaseRenewals.length < 2) {
     throw new Error('repeated visibility extensions and lease renewals are required')
   }
-  if (evidence.attempts.length === 0 || new Set(evidence.attempts).size !== 1) {
+  if (evidence.attempts.length === 0 || new Set(evidence.attempts).size !== 1
+    || !evidence.attempts.every((attempt) => Number.isSafeInteger(attempt) && attempt > 0)) {
     throw new Error('heartbeat renewals must not increment the attempt')
   }
   if (new Set(evidence.owners).size !== 1 || !evidence.owners[0]?.trim()) {

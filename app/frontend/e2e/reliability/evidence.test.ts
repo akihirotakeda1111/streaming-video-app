@@ -42,7 +42,7 @@ describe('reliability evidence helpers', () => {
       visibilityExpiredAtMs: 3_000, leaseExpiredAtMs: 6_000,
       attempts: [1, 1], owners: ['old', 'new'], states: ['PROCESSING'],
       sourceKey: 'run/source.mp4', manifestPublishedLast: false,
-    }, timing)).toThrow(/expiry|increment/)
+    }, timing, 'run/source.mp4')).toThrow(/expiry|increment/)
   })
 
   it('rejects short or overlapping heartbeat evidence', () => {
@@ -50,12 +50,12 @@ describe('reliability evidence helpers', () => {
       durationMs: 1_000, heartbeatIntervalMs: 500,
       visibilityExtensions: ['one', 'two'], leaseRenewals: ['one', 'two'],
       attempts: [1], owners: ['worker'],
-    })).toThrow('too short')
+    }, { visibilityTimeoutMs: 2_000, leaseTimeoutMs: 5_000, heartbeatIntervalMs: 500 })).toThrow('too short')
     expect(() => assertLongHeartbeatEvidence({
       durationMs: 2_000, heartbeatIntervalMs: 500,
       visibilityExtensions: ['one', 'two'], leaseRenewals: ['one', 'two'],
       attempts: [1, 2], owners: ['worker'],
-    })).toThrow('increment')
+    }, { visibilityTimeoutMs: 2_000, leaseTimeoutMs: 5_000, heartbeatIntervalMs: 500 })).toThrow('increment')
   })
 
   it('redacts credentials, receipt handles, database URLs, and URL queries', () => {

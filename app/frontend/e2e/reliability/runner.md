@@ -134,9 +134,9 @@ shared verification boundary before dispatch or scenario work.
 The standalone Phase 1 `@preflight` browser readiness test retains its existing scope.
 
 `--list` shows the implemented selectors: `preflight` (local/browser/API readiness),
-`runtime-authorization` (reliability authorization), `duplicate-delivery`,
-`crash-recovery`, and `long-heartbeat`
-(a fail-closed duplicate-delivery entry point). Select it with:
+`runtime-authorization` (reliability authorization), `duplicate-delivery`
+(a fail-closed duplicate-delivery entry point), `crash-recovery`, and `long-heartbeat`
+(blocked entry points). Select duplicate delivery with:
 
 `python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery`
 
