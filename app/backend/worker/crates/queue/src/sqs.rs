@@ -61,6 +61,39 @@ fn normalize_received_message(message: AwsMessage) -> Result<Message, String> {
     })
 }
 
+fn observe_received_message(message: &AwsMessage, visibility_timeout: i32) {
+    // Observe only canonical source IDs, never bodies or receipt handles.
+    if let (Some(id), Ok(body)) = (
+        message.message_id.as_deref(),
+        serde_json::from_str::<serde_json::Value>(message.body.as_deref().unwrap_or("")),
+    ) {
+        if id.len() <= 128 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            for record in body["Records"].as_array().into_iter().flatten() {
+                if let Some(key) = record["s3"]["object"]["key"].as_str() {
+                    let parts: Vec<_> = key.split('/').collect();
+                    if parts.len() == 5
+                        && parts[0] == "videos"
+                        && parts[2] == "jobs"
+                        && parts[4] == "source.mp4"
+                        && [parts[1], parts[3]].iter().all(|v| {
+                            v.len() == 36 && v.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+                        })
+                    {
+                        tracing::info!(
+                            message_id = id,
+                            video_id = parts[1],
+                            job_id = parts[3],
+                            visibility_seconds = visibility_timeout,
+                            outcome = "queue_received",
+                            "SQS delivery observed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl SqsApi for AwsSqsApi {
     async fn visibility_timeout(&mut self, queue_url: &str) -> Result<u64, String> {
         let attributes = self
@@ -96,6 +129,9 @@ impl SqsApi for AwsSqsApi {
             .send()
             .await
             .map_err(|_| "receive request failed".to_string())?;
+        for message in response.messages.iter().flatten() {
+            observe_received_message(message, visibility_timeout);
+        }
         response
             .messages
             .and_then(|messages| messages.into_iter().next())
@@ -214,6 +250,50 @@ impl<A: SqsApi + Send> ChangeVisibility for SqsQueue<A> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn delivery_observation_logs_only_canonical_identity() {
+        #[derive(Clone)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Buffer(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let video = "018f47a2-45c2-7a84-b84f-5f6dd7b5910a";
+        let job = "018f47a2-4699-7892-9fc0-fbe46d3bbd67";
+        let body = serde_json::json!({"secret":"private-body", "Records":[
+            {"s3":{"object":{"key":format!("videos/{video}/jobs/{job}/source.mp4")}}},
+            {"s3":{"object":{"key":"private-invalid-key"}}}
+        ]});
+        let message = AwsMessage::builder()
+            .message_id("original-message")
+            .receipt_handle("private-receipt")
+            .body(body.to_string())
+            .build();
+        tracing::subscriber::with_default(subscriber, || observe_received_message(&message, 120));
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains("private"));
+        let events: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["fields"]["message_id"], "original-message");
+        assert_eq!(events[0]["fields"]["job_id"], job);
+        assert_eq!(events[0]["fields"]["visibility_seconds"], 120);
+    }
 
     fn aws_message(receipt_handle: Option<&str>, receive_count: Option<&str>) -> AwsMessage {
         let mut builder = AwsMessage::builder()

@@ -382,6 +382,13 @@ where
                 settings.lease_duration.as_secs(),
             )
             .await
+            .inspect(|outcome| {
+                if *outcome == JobOperationOutcome::Applied {
+                    tracing::info!(worker_id = %job.worker_id.as_str(), job_id = %job.item.job_id,
+                        video_id = %job.item.video_id, attempt = job.attempt, outcome = "lease_renewed",
+                        "successful lease renewal");
+                }
+            })
             .map_err(HeartbeatLoss::Database)
         })
         .await?;
@@ -407,6 +414,12 @@ where
             .map_err(HeartbeatLoss::Visibility)
     })
     .await?;
+    for job in acquired {
+        tracing::info!(worker_id = %job.worker_id.as_str(), job_id = %job.item.job_id,
+            video_id = %job.item.video_id, attempt = job.attempt,
+            visibility_seconds = settings.visibility_extension.as_secs(), outcome = "visibility_extended",
+            "successful visibility extension");
+    }
     deadlines.visibility = started
         .checked_add(settings.visibility_extension)
         .unwrap_or(deadlines.visibility);

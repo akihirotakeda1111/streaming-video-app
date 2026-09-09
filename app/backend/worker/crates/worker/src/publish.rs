@@ -88,6 +88,7 @@ where
                 &contents,
             )
             .await?;
+        tracing::info!(video_id, job_id, object_key = %format!("{prefix}/{filename}"), outcome = "segment_published", "segment uploaded");
     }
 
     let playlist = tokio::fs::read(&output.playlist).await?;
@@ -103,6 +104,7 @@ where
             &playlist,
         )
         .await?;
+    tracing::info!(video_id, job_id, object_key = %format!("{prefix}/index.m3u8"), outcome = "manifest_published", "manifest uploaded last");
     Ok(())
 }
 

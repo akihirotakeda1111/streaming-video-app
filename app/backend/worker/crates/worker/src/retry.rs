@@ -16,6 +16,7 @@ use futures_util::FutureExt;
 use persistence::{JobOperationOutcome, JobState, PersistenceError};
 use storage::{ObjectError, Read, Write};
 use tokio::sync::{Mutex, watch};
+use tracing::Instrument;
 
 use crate::{
     acquisition::AcquiredJob,
@@ -283,6 +284,9 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
             .read(&acquired.item.bucket, &acquired.item.key)
             .await
             .map_err(|e: ObjectError| format!("download source: {}", e.0))?;
+        tracing::info!(worker_id = %acquired.worker_id.as_str(), job_id = %acquired.item.job_id,
+            video_id = %acquired.item.video_id, attempt = acquired.attempt,
+            source_key = %acquired.item.key, outcome = "source_downloaded", "canonical source downloaded");
         drop(storage);
         if !Self::owned(cancelled) {
             return Err("ownership lost".into());
@@ -294,9 +298,13 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         if !Self::owned(cancelled) {
             return Err("ownership lost".into());
         }
+        tracing::info!(worker_id = %acquired.worker_id.as_str(), job_id = %acquired.item.job_id,
+            video_id = %acquired.item.video_id, attempt = acquired.attempt, outcome = "encode_started", "encode started");
         let output = encode_hls(&mut *executor, self.ffmpeg_path.clone(), directory.path())
             .await
             .map_err(|e: HlsError| format!("encode HLS: {e}"))?;
+        tracing::info!(worker_id = %acquired.worker_id.as_str(), job_id = %acquired.item.job_id,
+            video_id = %acquired.item.video_id, attempt = acquired.attempt, outcome = "encode_finished", "encode finished");
         drop(executor);
         if !Self::owned(cancelled) {
             return Err("ownership lost".into());
@@ -309,6 +317,7 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
             &output,
             || Self::owned(cancelled),
         )
+        .instrument(tracing::info_span!("publication", worker_id = %acquired.worker_id.as_str(), attempt = acquired.attempt))
         .await
         .map_err(|e: PublishError| match e {
             PublishError::OwnershipLost => "ownership lost".into(),

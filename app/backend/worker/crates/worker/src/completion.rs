@@ -165,6 +165,10 @@ where
             match disposition {
                 RecordAcquisitionDisposition::Acquired(job) => {
                     self.log_record(Some(&job.item), Some(job.attempt), "acquired");
+                    tracing::info!(worker_id = %job.worker_id.as_str(), job_id = %job.item.job_id,
+                        video_id = %job.item.video_id, attempt = job.attempt,
+                        lease_expires_at_ms = job.lease_expires_at.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64),
+                        receive_count = message.receive_count, outcome = "acquisition_observed", "lease acquisition evidence");
                 }
                 RecordAcquisitionDisposition::NotAcquired { item, reason } => {
                     let outcome = match reason {
@@ -198,6 +202,7 @@ where
             HeartbeatDeadlines { lease, visibility },
         );
 
+        let observed_records = dispositions.clone();
         let mut acknowledge = true;
         let mut retry_delay: Option<Duration> = None;
         let mut index = 0;
@@ -319,6 +324,21 @@ where
                 tracing::warn!(worker_id = %self.worker_id.as_str(), receive_count = message.receive_count,
                     outcome = "queue_update_failed", "message disposition queue update failed");
             } else {
+                if retry_delay.is_none() && acknowledge {
+                    for disposition in &observed_records {
+                        match disposition {
+                            RecordAcquisitionDisposition::Acquired(job) => self.log_record(
+                                Some(&job.item),
+                                Some(job.attempt),
+                                "record_acknowledged",
+                            ),
+                            RecordAcquisitionDisposition::NotAcquired { item, .. } => {
+                                self.log_record(Some(item), None, "record_acknowledged")
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 tracing::info!(worker_id = %self.worker_id.as_str(), receive_count = message.receive_count,
                     outcome = if retry_delay.is_some() { "retry_scheduled" } else if acknowledge { "deleted" } else { "retained" },
                     "message outcome");

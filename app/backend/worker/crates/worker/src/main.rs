@@ -118,7 +118,7 @@ async fn main() {
         let _ = stop.send(true);
     });
 
-    info!(region = %config.aws_region, queue_url = %config.queue_url, max_concurrency = PHASE1_MAX_CONCURRENCY, "worker started");
+    info!(observation_schema = 1, region = %config.aws_region, queue_url = %config.queue_url, max_concurrency = PHASE1_MAX_CONCURRENCY, "worker started");
     if let Err(error) =
         worker::runtime::run(queue, processor, shutdown, PHASE1_MAX_CONCURRENCY).await
     {
@@ -143,9 +143,7 @@ mod tests {
         ));
         assert!(DOCKERFILE.contains("ENV FFMPEG_PATH=/usr/local/bin/ffmpeg"));
         assert!(DOCKERFILE.contains("TMPDIR=/tmp/video-worker"));
-        assert!(DOCKERFILE.contains(
-            "apt-get install -y --no-install-recommends ca-certificates"
-        ));
+        assert!(DOCKERFILE.contains("apt-get install -y --no-install-recommends ca-certificates"));
         assert!(DOCKERFILE.contains("/usr/local/bin/ffmpeg -version"));
         assert!(DOCKERFILE.contains("/usr/local/bin/ffprobe -version"));
         assert!(DOCKERFILE.contains("USER worker"));
