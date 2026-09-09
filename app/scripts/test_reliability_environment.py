@@ -47,6 +47,27 @@ class EnvironmentTests(unittest.TestCase):
         self.assertTrue(api_env["OUTPUT_S3_ENDPOINT"].startswith("https://s3."))
         self.assertIn("FRONTEND_ORIGIN", api_env)
 
+    def test_terraform_recreates_missing_inputs_and_passes_explicit_file(self):
+        (self.state / "terraform").mkdir()
+        e = r.Environment(self.c)
+        inputs = self.state / "terraform/terraform.tfvars.json"
+        for command in ("plan", "destroy"):
+            inputs.unlink(missing_ok=True)
+            with patch.object(r, "execute", return_value="") as execute:
+                e.tf(command, "-input=false")
+            self.assertEqual(json.loads(inputs.read_text()), {
+                key: self.c[key] for key in ("scope", "account", "region")})
+            self.assertIn(f"-var-file={inputs}", execute.call_args.args[0])
+
+    def test_terraform_replaces_stale_inputs_with_current_config(self):
+        (self.state / "terraform").mkdir()
+        inputs = self.state / "terraform/terraform.tfvars.json"
+        r.write_json(inputs, {"account": "999999999999", "unexpected": "stale"})
+        with patch.object(r, "execute", return_value=""):
+            r.Environment(self.c).tf("plan", "-input=false")
+        self.assertEqual(json.loads(inputs.read_text()), {
+            key: self.c[key] for key in ("scope", "account", "region")})
+
     @unittest.skipUnless(shutil.which("docker"), "Docker CLI unavailable")
     def test_real_compose_parser_accepts_secret_placeholders(self):
         # Config parsing does not connect to the Docker daemon or AWS.

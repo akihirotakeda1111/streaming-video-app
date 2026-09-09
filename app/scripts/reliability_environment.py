@@ -88,6 +88,12 @@ class Environment:
         self.tfdir = STATE / "terraform"
 
     def tf(self, *args):
+        if args and args[0] in ("plan", "destroy"):
+            # Recover missing/old generated inputs from the validated local config.
+            # Credentials never belong in Terraform input variables.
+            inputs = self.tfdir / "terraform.tfvars.json"
+            write_json(inputs, {key: self.c[key] for key in ("scope", "account", "region")})
+            args = (*args, f"-var-file={inputs}")
         return execute(["terraform", f"-chdir={self.tfdir}", *args], env=self.env)
 
     def docker(self, *args):
