@@ -1,5 +1,9 @@
 # Reliability E2E runner
 
+環境変数を既存AWS/Docker設定から生成する場合は
+[環境変数設定コマンドの生成](environment-generator.md) を参照。
+生成スクリプトはこの共通事前確認の要件を変更せず、非機密の設定コマンドだけを出力する。
+
 `python app/scripts/run_reliability_e2e.py --check` is offline only. It checks
 for `node`, `npm`, `npx`, `ffmpeg`, `aws`, and `docker`, then invokes the local Node validator
 with a 10-second deadline. It does not contact AWS, databases, queues,
