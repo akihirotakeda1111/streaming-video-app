@@ -7,6 +7,8 @@ DBのホスト公開ポートは削除する。Worker/DB間は専用プロジェ
 
 ## 準備
 
+専用AWSリソースが未作成の場合は [E2E用Terraform](../../../infra/terraform-e2e/README.md) で手動準備できる。
+
 - Docker Composeの `!reset` タグに対応したバージョンを使用する。構成確認はCompose v2.35.1で実施。
 - `streaming-video-e2e` をこのE2Eだけのプロジェクト名として使用する。
 - 既存のE2E専用AWSキュー・バケット、Worker認証情報を手動設定する。
