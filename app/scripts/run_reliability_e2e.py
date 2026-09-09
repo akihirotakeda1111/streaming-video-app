@@ -16,7 +16,7 @@ from uuid import uuid4
 SCENARIOS = {
     "preflight": ("@preflight", "local/browser/API readiness"),
     "runtime-authorization": ("@reliability", "reliability authorization"),
-    "duplicate-delivery": ("@duplicate-delivery", "unverified: duplicate observation and cleanup adapters pending"),
+    "duplicate-delivery": ("@duplicate-delivery", "active and completed redelivery with correlated media and acknowledgement evidence"),
 }
 TOOLS = ("node", "npm", "npx", "ffmpeg", "aws", "docker")
 SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"
@@ -99,15 +99,19 @@ def _run(config: LiveConfig) -> int:
     _settings("authorize")
     config.evidence_dir.mkdir(parents=True, exist_ok=False)
     grep, _ = SCENARIOS[config.scenario]
-    npm = shutil.which("npm")
-    if npm is None:
-        raise ValueError("required local tool missing: npm")
-    args = [npm, "run", "test:e2e", "--", "--grep", grep]
+    node = shutil.which("node")
+    if node is None:
+        raise ValueError("required local tool missing: node")
+    cli = SAFETY_CLI.parents[2] / "node_modules/@playwright/test/cli.js"
+    args = [node, str(cli), "test", "--grep", grep]
     if config.scenario in ("runtime-authorization", "duplicate-delivery"):
         args.extend(["--project", "reliability"])
     child_environment = os.environ.copy()
+    if config.scenario in ("runtime-authorization", "duplicate-delivery"):
+        child_environment["E2E_INCLUDE_RELIABILITY"] = "true"
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
+    print(json.dumps({"scenario": config.scenario, "evidenceDirectory": str(config.evidence_dir)}), flush=True)
     return subprocess.run(args, cwd=SAFETY_CLI.parents[2], env=child_environment, check=False).returncode
 
 

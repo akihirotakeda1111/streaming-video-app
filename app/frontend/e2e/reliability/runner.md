@@ -135,38 +135,24 @@ The standalone Phase 1 `@preflight` browser readiness test retains its existing 
 
 `--list` shows the implemented selectors: `preflight` (local/browser/API readiness),
 `runtime-authorization` (reliability authorization), and `duplicate-delivery`
-(a fail-closed duplicate-delivery entry point). Select it with:
+(active and completed redelivery). Select it with:
 
 `python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery`
 
 The runner dispatches this selector only to Playwright's `reliability` project
-with the exact `@duplicate-delivery` tag. Unknown selectors fail.
+with the exact `@duplicate-delivery` tag through the installed Node/Playwright CLI.
+Unknown selectors fail. The Python entry point does not require a POSIX shell.
 
-The duplicate-delivery entry point calls shared live authorization, then fails
-with `status: unverified` and `scenarioStarted: false` in its diagnostic attachment.
-It does not upload, inject messages, or create remote resources. This is a failed
-test (nonzero exit), not a passing or skipped live scenario, even when preflight
-succeeds. The previous status-only checks could pass without handling duplicates
-and have been removed.
+The duplicate scenario verifies the Worker observation capability before creating
+canonical test rows and uploading an MP4. It injects an active duplicate and a
+post-completion duplicate, correlates each message's outcomes through delivery
+spans, and proves one effective encode/publication plus immutable completion.
+The supported adapter and [duplicate execution guide](duplicate-runbook.md) define
+fixture requirements, existing permissions, exact run cleanup and retained-resource
+failure handling. Missing observations, too-short workloads and unsafe cleanup
+remain unverified failures, never skipped/passed checks. Human live evidence is
+still required for acceptance.
 
-Live implementation is blocked on correlated observation and scoped cleanup:
-
-- The existing `busy` and `already_completed` record logs contain canonical IDs,
-  but `deleted` message logs do not. Worker identity and adjacent timestamps cannot
-  establish which message was acknowledged under concurrency.
-- Active delivery must prove `busy` while the original DB lease is active, with
-  unchanged owner and attempt. The worker receiving the duplicate need not be the
-  owner. Completion clears ownership; post-completion delivery must retain that
-  unowned state and attempt, acknowledge the duplicate, and add no processing.
-- Worker/process evidence must establish one effective encode/publication;
-  final status and deterministic output keys alone are insufficient.
-- `RunResources` only invokes registered callbacks. Safe remote cleanup adapters
-  must handle exact run-owned IDs, pending deliveries and in-flight work on both
-  success and timeout before resource-creating execution can be restored.
-
-These prerequisites must be implemented and validated through an appropriately
-scoped task before enabling live duplicate delivery. Do not bypass this block
-with a configuration flag, fixed sleep, queue-wide counts or status-only polling.
 Every future reliability scenario
 must call that authorization before any operation, even when selected directly;
 a separate authorization test does not establish ordering for other tests.
@@ -176,7 +162,7 @@ under `E2E_EVIDENCE_DIR` and passes its name as `E2E_RUN_ID`. Diagnostics must u
 existing redaction helpers and exclude credentials, receipt handles, database URLs,
 and full presigned URLs. Worker/database controls must exclude unrelated processes
 and restore the prior test-owned state when safe. Cleanup is limited to canonical
-resources registered by the current run through `RunResources`. The runner does
+resources registered by the current run. The runner does
 not edit source, Compose, IAM, networking, Terraform, or queues to enable a run.
 
 ## Offline regression checks
@@ -188,8 +174,10 @@ executing the real authorization policy. No external services are contacted.
 They cover missing settings, malformed scopes, completeness, redaction, validator
 timeouts, refusal to dispatch without supported adapters, dedicated duplicate
 selector/tag/project dispatch, and nonzero exit propagation. The duplicate entry
-point is also checked to fail after authorization without requesting browser/API
-fixtures and to retain unverified evidence.
+point is checked for authorization failure, successful scenario dispatch and
+retained-resource failures. Driver/adapter tests exercise duplicate side effects,
+wrong acknowledgements, completion overwrites, pending messages and ambiguous
+transport outcomes without invoking live services.
 
 Human verification against the intended disposable environment remains
 outstanding until the command above succeeds and its redacted evidence is
