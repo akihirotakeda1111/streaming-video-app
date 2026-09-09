@@ -291,6 +291,38 @@ def runtime_settings(c, outputs):
     return env
 
 
+def positive_seconds(value):
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("duration must be a positive integer in seconds") from None
+    if seconds < 1:
+        raise argparse.ArgumentTypeError("duration must be a positive integer in seconds")
+    return seconds
+
+
+def generate_fixture(config, replace=False, duration_seconds=600):
+    target = Path(config["fixture"])
+    if target.exists() and not replace:
+        raise ValueError("Fixture already exists; use fixture --replace-fixture to regenerate it")
+    temporary = target.with_name(f".recovery-{uuid4().hex}.mp4")
+    try:
+        print(f"Generating a {duration_seconds}-second encode fixture with bounded bitrate...", flush=True)
+        execute(["ffmpeg", "-nostdin", "-n", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30",
+                 "-t", str(duration_seconds), "-c:v", "libx264", "-preset", "ultrafast",
+                 "-b:v", "6M", "-maxrate", "8M", "-bufsize", "16M",
+                 "-pix_fmt", "yuv420p", str(temporary)])
+        if not temporary.is_file() or not 0 < temporary.stat().st_size <= 1024 ** 3:
+            raise ValueError("Generated fixture is outside the 1 byte–1 GiB bound; original file retained")
+        size = temporary.stat().st_size
+        if not replace and target.exists():
+            raise ValueError("Fixture appeared during generation; original file retained")
+        temporary.replace(target)
+        print(f"Fixture ready: {size} bytes (size check passed)")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("command", choices=["init", "fixture", "plan", "up", "check", "run", "down"])
@@ -298,6 +330,9 @@ def main(argv=None):
     p.add_argument("--region")
     p.add_argument("--docker-host", default="unix:///var/run/docker.sock" if os.name != "nt" else "npipe:////./pipe/docker_engine")
     p.add_argument("--fixture", type=Path)
+    p.add_argument("--replace-fixture", action="store_true", help="Replace the configured fixture only after successful generation and size validation")
+    p.add_argument("--duration-seconds", type=positive_seconds, default=600,
+                   help="Fixture video duration in whole seconds (default: 600; fixture command only)")
     p.add_argument("--confirm-scope", help="Explicitly authorize creation or deletion of this scope")
     args = p.parse_args(argv)
     try:
@@ -328,9 +363,7 @@ def main(argv=None):
             if args.command in ("up", "down") and args.confirm_scope != c["scope"]:
                 raise ValueError("Pass --confirm-scope " + c["scope"] + " to authorize this operation")
             if args.command == "fixture":
-                print("Generating a 10-minute encode fixture...", flush=True)
-                execute(["ffmpeg", "-nostdin", "-n", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30",
-                         "-t", "600", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", c["fixture"]])
+                generate_fixture(c, replace=args.replace_fixture, duration_seconds=args.duration_seconds)
             elif args.command == "check":
                 environment.identity()
                 environment.runner("--check")

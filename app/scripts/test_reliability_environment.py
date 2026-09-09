@@ -47,6 +47,59 @@ class EnvironmentTests(unittest.TestCase):
         self.assertTrue(api_env["OUTPUT_S3_ENDPOINT"].startswith("https://s3."))
         self.assertIn("FRONTEND_ORIGIN", api_env)
 
+    def test_fixture_replacement_requires_explicit_option(self):
+        target = Path(self.c["fixture"])
+        target.write_bytes(b"original")
+        with patch.object(r, "execute") as execute:
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                r.generate_fixture(self.c)
+        execute.assert_not_called()
+        self.assertEqual(target.read_bytes(), b"original")
+
+    def test_fixture_cli_passes_requested_duration_to_ffmpeg(self):
+        r.write_json(self.state / "config.json", self.c)
+        def encode(args):
+            self.assertEqual(args[args.index("-t") + 1], "300")
+            Path(args[-1]).write_bytes(b"mp4")
+        with patch.object(r, "execute", side_effect=encode) as execute:
+            self.assertEqual(r.main(["fixture", "--duration-seconds", "300"]), 0)
+        execute.assert_called_once()
+
+    def test_fixture_default_duration_remains_600_seconds(self):
+        r.write_json(self.state / "config.json", self.c)
+        with patch.object(r, "generate_fixture") as generate:
+            self.assertEqual(r.main(["fixture"]), 0)
+        generate.assert_called_once_with(self.c, replace=False, duration_seconds=600)
+
+    def test_invalid_duration_is_rejected_before_generation(self):
+        for value in ("0", "-1", "1.5", "abc"):
+            with self.subTest(value=value), patch.object(r, "execute") as execute, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    r.main(["fixture", "--duration-seconds", value])
+                self.assertEqual(error.exception.code, 2)
+                execute.assert_not_called()
+
+    def test_fixture_validated_before_replacing_original(self):
+        target = Path(self.c["fixture"])
+        target.write_bytes(b"original")
+        def encode(args):
+            self.assertEqual(target.read_bytes(), b"original")
+            self.assertEqual(args[args.index("-maxrate") + 1], "8M")
+            Path(args[-1]).write_bytes(b"new-mp4")
+        with patch.object(r, "execute", side_effect=encode):
+            r.generate_fixture(self.c, replace=True)
+        self.assertEqual(target.read_bytes(), b"new-mp4")
+        self.assertEqual(list(self.state.glob(".recovery-*.mp4")), [])
+
+    def test_invalid_generated_fixture_preserves_original(self):
+        target = Path(self.c["fixture"])
+        target.write_bytes(b"original")
+        with patch.object(r, "execute", side_effect=lambda args: Path(args[-1]).write_bytes(b"")):
+            with self.assertRaisesRegex(ValueError, "outside"):
+                r.generate_fixture(self.c, replace=True)
+        self.assertEqual(target.read_bytes(), b"original")
+        self.assertEqual(list(self.state.glob(".recovery-*.mp4")), [])
+
     def test_terraform_recreates_missing_inputs_and_passes_explicit_file(self):
         (self.state / "terraform").mkdir()
         e = r.Environment(self.c)

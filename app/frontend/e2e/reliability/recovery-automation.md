@@ -72,7 +72,20 @@ python3 app/scripts/reliability_environment.py fixture
 `--fixture /mnt/c/e2e/fixtures/long.mp4` を付け、`fixture` を省略します。
 動画は1GiB以下で、実エンコードが60秒を超える必要があります。
 生成する10分・1080p動画でも端末性能によっては条件を満たさず、テストが失敗する場合があります。
-`fixture` は既存ファイルを上書きしません。
+`fixture` は平均6Mbps・最大8Mbpsで生成し、生成後に1GiB以下であることを確認します。
+既存ファイルは通常上書きしません。旧版で生成した動画が1GiBを超えている場合は、
+`python3 app/scripts/reliability_environment.py fixture --replace-fixture` で作り直してください。
+生成・サイズ検査が成功してから置き換えるため、失敗時は既存動画を保持します。
+
+動画の長さは `--duration-seconds` で正の整数（秒）を指定できます。省略時は600秒です。
+例えば、サイズ超過時に300秒（5分）へ短縮して作り直す場合:
+
+```bash
+python3 app/scripts/reliability_environment.py fixture --duration-seconds 300 --replace-fixture
+```
+
+指定する長さは動画の再生時間です。短縮後もE2Eの条件である実エンコード60秒超を
+満たす必要があります。生成後のサイズ検査は引き続き行います。
 
 ## 3. 作成内容を確認して起動
 
