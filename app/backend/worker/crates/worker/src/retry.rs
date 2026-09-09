@@ -279,10 +279,12 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         if !Self::owned(cancelled) {
             return Err("ownership lost".into());
         }
+        tracing::info!(operation = "download", outcome = "start", "media operation");
         let source = storage
             .read(&acquired.item.bucket, &acquired.item.key)
             .await
             .map_err(|e: ObjectError| format!("download source: {}", e.0))?;
+        tracing::info!(operation = "download", outcome = "success", "media operation");
         drop(storage);
         if !Self::owned(cancelled) {
             return Err("ownership lost".into());
@@ -294,9 +296,11 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         if !Self::owned(cancelled) {
             return Err("ownership lost".into());
         }
+        tracing::info!(operation = "encode", outcome = "start", "media operation");
         let output = encode_hls(&mut *executor, self.ffmpeg_path.clone(), directory.path())
             .await
             .map_err(|e: HlsError| format!("encode HLS: {e}"))?;
+        tracing::info!(operation = "encode", outcome = "success", "media operation");
         drop(executor);
         if !Self::owned(cancelled) {
             return Err("ownership lost".into());

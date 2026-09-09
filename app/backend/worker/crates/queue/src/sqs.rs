@@ -54,6 +54,10 @@ fn normalize_received_message(message: AwsMessage) -> Result<Message, String> {
         .filter(|count| *count > 0)
         .ok_or_else(|| "received message has invalid delivery count".to_string())?;
     Ok(Message {
+        message_id: message
+            .message_id
+            .filter(|id| !id.is_empty() && id.len() <= 128 && id.is_ascii()),
+        delivery_id: String::new(),
         receipt_handle,
         body: message.body.unwrap_or_default(),
         receive_count,
@@ -233,6 +237,8 @@ mod tests {
         assert_eq!(
             normalize_received_message(aws_message(Some("receipt"), Some("2"))).unwrap(),
             Message {
+                message_id: None,
+                delivery_id: String::new(),
                 receipt_handle: "receipt".into(),
                 body: "body".into(),
                 receive_count: 2,
@@ -293,6 +299,8 @@ mod tests {
             ]);
             tokio::time::sleep(self.receive_delay).await;
             Ok(Some(Message {
+                message_id: None,
+                delivery_id: String::new(),
                 receipt_handle: "receipt".into(),
                 body: "body".into(),
                 receive_count: 1,

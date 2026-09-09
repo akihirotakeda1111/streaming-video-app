@@ -34,6 +34,7 @@ async fn main() {
         .with_env_filter(filter)
         .json()
         .init();
+    info!(duplicate_observation_schema = 1, "worker observation capability");
 
     let config = match worker::Config::from_env() {
         Ok(config) => config,
