@@ -4,6 +4,10 @@ use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
+    /// SQS identity used only to correlate repeated deliveries.
+    pub message_id: Option<String>,
+    /// Fresh identifier for this receive, never used for queue operations.
+    pub delivery_id: String,
     pub receipt_handle: String,
     pub body: String,
     pub receive_count: u32,

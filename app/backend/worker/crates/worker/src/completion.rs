@@ -10,6 +10,7 @@ use tokio::{
     sync::{Mutex, watch},
     time::Instant,
 };
+use tracing::Instrument;
 
 use crate::{
     acquisition::{
@@ -130,8 +131,29 @@ where
     async fn process_with_shutdown(
         &self,
         message: Message,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
     ) -> Result<(), Self::Error> {
+        let delivery = tracing::info_span!(
+            "worker_delivery",
+            message_id = message.message_id.as_deref().unwrap_or("unknown"),
+            delivery_id = %message.delivery_id,
+        );
+        self.process_delivery(message, shutdown).instrument(delivery).await
+    }
+}
+
+impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q>
+where
+    J: JobState + Send + 'static,
+    S: Read + Write + Send + 'static,
+    E: Execute + Send + 'static,
+    Q: ChangeVisibility + Delete + Send + 'static,
+{
+    async fn process_delivery(
+        &self,
+        message: Message,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), Infallible> {
         if *shutdown.borrow() {
             return Ok(());
         }
@@ -219,6 +241,13 @@ where
                         .processing
                         .clone()
                         .with_activity(handle.activity(index));
+                    let attempt_span = tracing::info_span!(
+                        "worker_attempt",
+                        job_id = %job.item.job_id,
+                        video_id = %job.item.video_id,
+                        worker_id = %job.worker_id.as_str(),
+                        attempt = job.attempt,
+                    );
                     index += 1;
                     let mut cancelled = lost.clone();
                     let outcome = tokio::select! {
@@ -233,7 +262,7 @@ where
                             acknowledge = false;
                             break;
                         }
-                        outcome = processing.process(&job, &mut cancelled) => outcome,
+                        outcome = processing.process(&job, &mut cancelled).instrument(attempt_span) => outcome,
                     };
                     match outcome {
                         Ok(ProcessingOutcome::Completed) => {
@@ -582,6 +611,8 @@ mod tests {
         fn message(ids: &[&str]) -> Message {
             let keys: Vec<_> = ids.iter().map(|id| source_key(VIDEO, id)).collect();
             Message {
+                message_id: Some("message-test".into()),
+                delivery_id: "delivery-test".into(),
                 receipt_handle: "receipt".into(),
                 receive_count: 1,
                 visibility_deadline: Some(Instant::now() + Duration::from_secs(2)),

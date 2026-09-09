@@ -54,6 +54,15 @@ fn normalize_received_message(message: AwsMessage) -> Result<Message, String> {
         .filter(|count| *count > 0)
         .ok_or_else(|| "received message has invalid delivery count".to_string())?;
     Ok(Message {
+        // Only expose bounded SQS identifier characters to delivery spans.
+        message_id: message.message_id.filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        }),
+        delivery_id: String::new(),
         receipt_handle,
         body: message.body.unwrap_or_default(),
         receive_count,
@@ -233,12 +242,55 @@ mod tests {
         assert_eq!(
             normalize_received_message(aws_message(Some("receipt"), Some("2"))).unwrap(),
             Message {
+                message_id: None,
+                delivery_id: String::new(),
                 receipt_handle: "receipt".into(),
                 body: "body".into(),
                 receive_count: 2,
                 visibility_deadline: None,
             }
         );
+    }
+
+    #[test]
+    fn normalization_preserves_allowlisted_message_ids() {
+        for id in [
+            "12345678-1234-1234-1234-123456789abc".to_string(),
+            "ABCxyz012-".to_string(),
+            "a".repeat(128),
+        ] {
+            let mut message = aws_message(Some("receipt"), Some("2"));
+            message.message_id = Some(id.clone());
+            let normalized = normalize_received_message(message).unwrap();
+            assert_eq!(normalized.message_id.as_deref(), Some(id.as_str()));
+        }
+    }
+
+    #[test]
+    fn normalization_omits_unsafe_message_ids_without_changing_delivery() {
+        for id in [
+            "".to_string(),
+            "a".repeat(129),
+            "https://example.test/video?token=secret".to_string(),
+            "postgres://user:password@example.test/db".to_string(),
+            "token=secret".to_string(),
+            "Bearer secret".to_string(),
+            "message\nsecret".to_string(),
+            "message\rsecret".to_string(),
+            "message\tsecret".to_string(),
+            "message\0secret".to_string(),
+            "message\u{7f}".to_string(),
+            "message_1".to_string(),
+            "message.1".to_string(),
+            "メッセージ".to_string(),
+        ] {
+            let mut message = aws_message(Some("receipt"), Some("2"));
+            message.message_id = Some(id);
+            assert_eq!(
+                normalize_received_message(message).unwrap(),
+                normalize_received_message(aws_message(Some("receipt"), Some("2"))).unwrap(),
+            );
+        }
     }
 
     #[test]
@@ -293,6 +345,8 @@ mod tests {
             ]);
             tokio::time::sleep(self.receive_delay).await;
             Ok(Some(Message {
+                message_id: None,
+                delivery_id: String::new(),
                 receipt_handle: "receipt".into(),
                 body: "body".into(),
                 receive_count: 1,

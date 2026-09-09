@@ -4,6 +4,7 @@ use std::{error::Error, fmt, future::Future, time::Duration};
 
 use queue::{Message, QueueError, Receive};
 use tokio::{sync::watch, task::JoinSet};
+use uuid::Uuid;
 
 /// The maximum number of messages processed by one Phase 1 deployment.
 pub const PHASE1_MAX_CONCURRENCY: usize = 2;
@@ -109,6 +110,8 @@ where
             }
             received = receiver.receive() => match received {
                 Ok(Some(message)) => {
+                    let mut message = message;
+                    message.delivery_id = Uuid::new_v4().to_string();
                     let message_processor = processor.clone();
                     let shutdown = processing_shutdown.clone();
                     tasks.spawn(async move {
@@ -201,6 +204,8 @@ mod tests {
 
     fn message(body: &str) -> Message {
         Message {
+            message_id: None,
+            delivery_id: "delivery-test".into(),
             receipt_handle: format!("receipt-{body}"),
             body: body.into(),
             receive_count: 1,
