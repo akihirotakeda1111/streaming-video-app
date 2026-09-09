@@ -19,9 +19,14 @@ lease/visibility成功ログがあり、attempt=1・所有者が一定である�
 
 ## 1. 専用環境を用意する
 
+専用環境の作成・設定取得・起動を自動化する場合は、先に
+[recovery-automation.md](recovery-automation.md) の手順を実行してください。
+以下は既存の専用環境を手動で設定する場合の説明です。
+
 既存の [runner.md](runner.md#live-preflight-and-supported-adapter) の全条件を満たす、
 disposable AWS資源と直接接続のローカルDocker Engineが必要です。
-Terraform、IAM、Compose、コンテナ作成はこのrunnerでは変更・実行しません。
+テストrunner自体はTerraform、IAM、Compose、コンテナ作成を実行しません。
+別の `reliability_environment.py` が専用Terraform/Composeの作成・起動を担当します（IAMは手動設定）。
 共有環境をテスト用と宣言し直して使用しないでください。
 
 追加条件:
@@ -67,6 +72,8 @@ ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1920x1080:rate=30
 回線に対して大きすぎる場合は解像度・圧縮率を調整してください。
 
 ## 3. 環境変数を設定する（PowerShell）
+
+各値の取得元・確認コマンドは[環境変数の値の確認方法](recovery-environment.md)を参照してください。
 
 `<...>` を実際の専用環境の値で置き換えます。credentialsは通常のAWS profile等を使用し、
 設定ファイルや証跡に書き込まないでください。以下の秒数は例です。実worker設定に応じて調整します。
