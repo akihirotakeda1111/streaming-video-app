@@ -17,8 +17,8 @@ SCENARIOS = {
     "preflight": ("@preflight", "local/browser/API readiness"),
     "runtime-authorization": ("@reliability", "reliability authorization"),
     "duplicate-delivery": ("@duplicate-delivery", "unverified: duplicate observation and cleanup adapters pending"),
-    "crash-recovery": ("@crash-recovery", "blocked: scoped worker control and recovery observation adapters pending"),
-    "long-heartbeat": ("@long-heartbeat", "blocked: heartbeat observation and cleanup adapters pending"),
+    "crash-recovery": ("@crash-recovery", "gated live worker crash recovery and original-message redelivery"),
+    "long-heartbeat": ("@long-heartbeat", "gated live multi-cycle heartbeat and ownership observation"),
 }
 TOOLS = ("node", "npm", "npx", "ffmpeg", "aws", "docker")
 SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"
@@ -101,13 +101,16 @@ def _run(config: LiveConfig) -> int:
     _settings("authorize")
     config.evidence_dir.mkdir(parents=True, exist_ok=False)
     grep, _ = SCENARIOS[config.scenario]
-    npm = shutil.which("npm")
-    if npm is None:
-        raise ValueError("required local tool missing: npm")
-    args = [npm, "run", "test:e2e", "--", "--grep", grep]
+    node = shutil.which("node")
+    if node is None:
+        raise ValueError("required local tool missing: node")
+    cli = SAFETY_CLI.parents[2] / "node_modules/@playwright/test/cli.js"
+    args = [node, str(cli), "test", "--grep", grep]
     if config.scenario != "preflight":
         args.extend(["--project", "reliability"])
     child_environment = os.environ.copy()
+    if config.scenario != "preflight":
+        child_environment["E2E_INCLUDE_RELIABILITY"] = "true"
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
     return subprocess.run(args, cwd=SAFETY_CLI.parents[2], env=child_environment, check=False).returncode

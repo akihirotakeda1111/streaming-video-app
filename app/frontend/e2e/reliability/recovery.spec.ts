@@ -1,42 +1,52 @@
+import { randomUUID } from 'node:crypto'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { test } from '@playwright/test'
-import { assertReliabilityAuthorization } from '../config.js'
-import { attachSafeDiagnostic } from '../diagnostics.js'
+import { attachSafeDiagnostic, safeDiagnostic } from '../diagnostics.js'
+import { verifyLiveBoundary } from './safety.mjs'
+import { DockerRecoveryAdapter } from './recovery-adapter.js'
+import { runRecovery, targetForRun, type RecoveryReport, type Scenario } from './recovery-driver.js'
 
-/**
- * The selectors are intentionally gated until the task-owned adapters are present.
- * Keeping the entry points explicit prevents discovery, type-checking, and helper
- * runs from ever stopping a worker or submitting a live encode.
- */
-async function blockedScenario(
-  scenario: 'crash-recovery' | 'long-heartbeat',
-  testInfo: Parameters<typeof attachSafeDiagnostic>[0],
-): Promise<never> {
-  const evidence: Record<string, unknown> = {
-    scenario,
-    status: 'blocked',
-    scenarioStarted: false,
-    liveResourcesVerified: false,
-    reason: 'Live authorization did not complete.',
-    timestamps: [new Date().toISOString()],
-  }
+async function scenario(name: Scenario, info: Parameters<typeof attachSafeDiagnostic>[0]): Promise<void> {
+  test.setTimeout(150000)
+  let report: RecoveryReport | undefined, evidencePath: string | undefined
   try {
-    assertReliabilityAuthorization()
-    evidence.liveResourcesVerified = true
-    evidence.reason = 'Scoped worker-control, queue-observation, database-observation, and cleanup adapters are not implemented.'
-    throw new Error(String(evidence.reason))
+    const boundary = verifyLiveBoundary()
+    const runId = process.env.E2E_RUN_ID || `e2e-${randomUUID()}`
+    const target = targetForRun(runId)
+    report = { runId, scenario: name, target, status: 'running', scenarioStarted: false,
+      cleanup: 'pending', restored: false, events: [], observations: [], verification: boundary }
+    const directory = process.env.E2E_RUN_ID ? process.env.E2E_EVIDENCE_DIR! : join(process.env.E2E_EVIDENCE_DIR!, runId)
+    await mkdir(directory, { recursive: true })
+    const destination = join(directory, `${name}-evidence.json`)
+    await writeFile(destination, JSON.stringify(report), { flag: 'wx' })
+    evidencePath = destination
+    const adapter = new DockerRecoveryAdapter(boundary)
+    // Include preflight, both processing attempts, bounded cleanup, expiry observation and command overhead.
+    test.setTimeout(4 * adapter.processingTimeoutMs + adapter.recoveryTimeoutMs + 360000)
+    await runRecovery(name, adapter, report)
+  } catch (error) {
+    if (report?.status === 'running') {
+      report.status = 'failed'
+      report.reason = 'Recovery setup or evidence creation failed before scenario completion.'
+    }
+    throw error
   } finally {
-    await attachSafeDiagnostic(testInfo, `${scenario}-evidence`, evidence)
+    const record: Record<string, unknown> = report ? { ...report } : { scenario: name, status: 'blocked', scenarioStarted: false,
+      reason: 'Live authorization did not complete.' }
+    const evidence = safeDiagnostic(record)
+    if (evidencePath) await writeFile(evidencePath, JSON.stringify(evidence, null, 2) + '\n')
+    await attachSafeDiagnostic(info, `${name}-evidence`, evidence)
   }
 }
 
 test.describe('@crash-recovery', () => {
-  test('requires correlated crash recovery adapters before mutating a disposable target', async ({}, testInfo) => {
-    await blockedScenario('crash-recovery', testInfo)
+  test('recovers original redelivery after both expiry gates and completes publication', async ({}, info) => {
+    await scenario('crash-recovery', info)
   })
 })
-
 test.describe('@long-heartbeat', () => {
-  test('requires correlated heartbeat observation adapters before starting an encode', async ({}, testInfo) => {
-    await blockedScenario('long-heartbeat', testInfo)
+  test('observes repeated successful heartbeats during a real encode with one owner', async ({}, info) => {
+    await scenario('long-heartbeat', info)
   })
 })

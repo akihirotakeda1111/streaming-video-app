@@ -148,15 +148,16 @@ class RunnerChecks(unittest.TestCase):
                 def dispatch(command, **kwargs):
                     self.assertEqual(modes, ["authorize"])
                     self.assertTrue(destination.is_dir())
-                    self.assertEqual(command, ["npm-test", "run", "test:e2e", "--",
+                    self.assertEqual(command, ["node-test", str(MODULE["SAFETY_CLI"].parents[2] / "node_modules/@playwright/test/cli.js"), "test",
                                                "--grep", f"@{scenario}", "--project", "reliability"])
                     self.assertEqual(kwargs["cwd"], MODULE["SAFETY_CLI"].parents[2])
                     self.assertEqual(kwargs["env"]["E2E_RUN_ID"], destination.name)
+                    self.assertEqual(kwargs["env"]["E2E_INCLUDE_RELIABILITY"], "true")
                     self.assertEqual(kwargs["env"]["E2E_EVIDENCE_DIR"], str(destination))
                     return subprocess.CompletedProcess(command, returncode)
 
                 with patch.dict(GLOBALS, {"_settings": authorize}), \
-                        patch("shutil.which", return_value="npm-test"), \
+                        patch("shutil.which", return_value="node-test"), \
                         patch("subprocess.run", side_effect=dispatch) as run:
                     self.assertEqual(MODULE["_run"](config), returncode)
                     run.assert_called_once()

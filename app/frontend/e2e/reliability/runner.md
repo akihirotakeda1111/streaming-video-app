@@ -136,7 +136,7 @@ The standalone Phase 1 `@preflight` browser readiness test retains its existing 
 `--list` shows the implemented selectors: `preflight` (local/browser/API readiness),
 `runtime-authorization` (reliability authorization), `duplicate-delivery`
 (a fail-closed duplicate-delivery entry point), `crash-recovery`, and `long-heartbeat`
-(blocked entry points). Select duplicate delivery with:
+(gated live recovery scenarios). Select duplicate delivery with:
 
 `python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery`
 
@@ -150,11 +150,12 @@ The crash-recovery and long-heartbeat selectors are also dispatched only to the
 
 `python app/scripts/run_reliability_e2e.py --scenario long-heartbeat`
 
-Their current entry points authorize the disposable boundary and then fail
-closed because the scoped worker-control, queue/database observation, and
-cleanup adapters required for safe live mutation are not present. They must not
-be treated as live evidence until those adapters are implemented and a human
-has reviewed redacted evidence from the commands above.
+Both scenarios now run through full-ID Docker control, PostgreSQL observation,
+S3 upload/publication inspection, and correlated worker success logs. They require
+a worker image with observation schema 1 and an explicitly exclusive disposable
+environment. See [the recovery runbook](recovery-runbook.md) for complete setup,
+manual commands, acceptance evidence and retained-resource handling. Live human
+verification remains outstanding until both commands succeed and evidence is reviewed.
 
 The duplicate-delivery entry point calls shared live authorization, then fails
 with `status: unverified` and `scenarioStarted: false` in its diagnostic attachment.
