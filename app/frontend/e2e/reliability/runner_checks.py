@@ -117,8 +117,7 @@ class RunnerChecks(unittest.TestCase):
             self.assertTrue(all(not json.loads(p.read_text())["scenarioStarted"] for p in records))
 
     def test_failed_authorization_cannot_write_or_dispatch(self):
-        for args in (["--live-preflight"], ["--scenario", "runtime-authorization"],
-                     ["--scenario", "duplicate-delivery"]):
+        for args in (["--live-preflight"], *(["--scenario", scenario] for scenario in MODULE["SCENARIOS"])):
             def settings(mode):
                 if mode == "validate":
                     return {"configured": True}
@@ -131,10 +130,10 @@ class RunnerChecks(unittest.TestCase):
 
     def test_duplicate_dispatch_and_failure_propagation(self):
         """Dispatch only the dedicated tag/project and preserve the scenario exit."""
-        for returncode in (0, 1):
-            with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as root:
+        for scenario, returncode in ((scenario, code) for scenario in ("duplicate-delivery", "crash-recovery", "long-heartbeat") for code in (0, 1)):
+            with self.subTest(scenario=scenario, returncode=returncode), tempfile.TemporaryDirectory() as root:
                 destination = Path(root) / "e2e-test"
-                config = MODULE["LiveConfig"](destination, "duplicate-delivery")
+                config = MODULE["LiveConfig"](destination, scenario)
                 modes = []
 
                 def authorize(mode):
@@ -146,7 +145,7 @@ class RunnerChecks(unittest.TestCase):
                     self.assertEqual(modes, ["authorize"])
                     self.assertTrue(destination.is_dir())
                     self.assertEqual(command, ["node-test", str(MODULE["SAFETY_CLI"].parents[2] / "node_modules/@playwright/test/cli.js"), "test",
-                                               "--grep", "@duplicate-delivery", "--project", "reliability"])
+                                               "--grep", "@" + scenario, "--project", "reliability"])
                     self.assertEqual(kwargs["cwd"], MODULE["SAFETY_CLI"].parents[2])
                     self.assertEqual(kwargs["env"]["E2E_RUN_ID"], destination.name)
                     self.assertEqual(kwargs["env"]["E2E_INCLUDE_RELIABILITY"], "true")

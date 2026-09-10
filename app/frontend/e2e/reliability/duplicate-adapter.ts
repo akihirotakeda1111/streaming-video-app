@@ -75,6 +75,8 @@ export function duplicateEvents(text: string, target: DuplicateTarget): Duplicat
       message_id: delivery?.message_id,
       delivery_id: delivery?.delivery_id,
     }
+    // Spec 26 has its own correlated parser; these are not media operations.
+    if (['lease_renewal', 'visibility_extension'].includes(fields.operation)) continue
     if (fields.operation !== undefined)
       fields.outcome =
         mediaOutcomes[fields.operation]?.[fields.outcome] ?? 'unsupported_media_operation'
@@ -122,7 +124,7 @@ export function duplicateEvents(text: string, target: DuplicateTarget): Duplicat
 export class DockerDuplicateAdapter implements DuplicateAdapter {
   readonly processingMs: number
   readonly deliveryMs: number
-  private target?: DuplicateTarget
+  protected target?: DuplicateTarget
   private registered = false
   private uploaded = false
   private uncertain = false
@@ -133,8 +135,8 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
   private since = new Date().toISOString()
   private execute: DuplicateTransport
   constructor(
-    private boundary: Boundary,
-    private env: NodeJS.ProcessEnv = process.env,
+    protected boundary: Boundary,
+    protected env: NodeJS.ProcessEnv = process.env,
     execute?: DuplicateTransport,
   ) {
     this.processingMs = Number(env.E2E_PROCESSING_TIMEOUT_MS)
@@ -170,7 +172,7 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
   }
   now = Date.now
   sleep = (ms: number) => setTimeout(ms)
-  private docker(args: string[], input?: string): string {
+  protected docker(args: string[], input?: string): string {
     return this.execute('docker', ['--host', this.env.E2E_DOCKER_HOST!, ...args], input)
   }
   private aws(args: string[]): any {
@@ -186,7 +188,7 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
       throw new SafeTransportError('invalid_response')
     }
   }
-  private inspect(id: string): any {
+  protected inspect(id: string): any {
     let rows
     try {
       rows = JSON.parse(this.docker(['container', 'inspect', id]))
@@ -197,7 +199,10 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
       fail('Container identity changed')
     return rows[0]
   }
-  private unchanged(): void {
+  protected workerStateMatches(c: any): boolean {
+    return c.State?.Running && c.State.StartedAt === this.boundary.worker.startedAt
+  }
+  protected unchanged(): void {
     let engine
     try {
       engine = JSON.parse(this.docker(['info', '--format', '{{json .}}']))
@@ -208,17 +213,18 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
     for (const b of [this.boundary.worker, this.boundary.database]) {
       const c = this.inspect(b.identity)
       if (
-        !c.State?.Running ||
+        !(b === this.boundary.worker
+          ? this.workerStateMatches(c)
+          : c.State?.Running && c.State.StartedAt === b.startedAt) ||
         c.State.Paused ||
         c.State.Restarting ||
-        c.State.StartedAt !== b.startedAt ||
         c.Config?.Labels?.['com.streaming-video.e2e.scope'] !== b.scope ||
         c.Config?.Labels?.['com.streaming-video.e2e.disposable'] !== 'true'
       )
         fail('Verified container boundary changed')
     }
   }
-  private sql(sql: string): any {
+  protected sql(sql: string): any {
     this.unchanged()
     const output = this.docker(
       [
@@ -427,7 +433,7 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
       return fail('Duplicate send outcome uncertain; retain run resources')
     }
   }
-  async observe() {
+  protected readJob(): DuplicateJob {
     const t = this.target!
     const job: DuplicateJob = this
       .sql(`SELECT json_build_object('status',status,'attempt',attempt,'workerId',worker_id,
@@ -440,11 +446,13 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
       !Number.isSafeInteger(job.attempt)
     )
       fail('Job observation unavailable')
-    const events = duplicateEvents(
-      this.docker(['logs', '--since', this.since, this.boundary.worker.identity]),
-      t,
-    )
-    return { job, events }
+    return job
+  }
+  protected readLogs(): string {
+    return this.docker(['logs', '--since', this.since, this.boundary.worker.identity])
+  }
+  async observe() {
+    return { job: this.readJob(), events: duplicateEvents(this.readLogs(), this.target!) }
   }
   async verifyOutput(keys: string[]): Promise<void> {
     const actual = this.objects(this.env.E2E_OUTPUT_BUCKET!, this.target!.prefix + 'hls/')

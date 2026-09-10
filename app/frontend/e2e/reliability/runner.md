@@ -359,7 +359,61 @@ python app/scripts/run_reliability_e2e.py --list
 
 終了コード0とテストの `passed` を確認し、表示された `evidenceDirectory` 内のシナリオ証跡を開く。
 重複配送では `duplicate-delivery-evidence.json` の **`status=passed`、`cleanup=complete`** が成功条件。
+クラッシュ復旧・長時間heartbeatは、それぞれ `crash-recovery-evidence.json` / `long-heartbeat-evidence.json` の
+`status=passed`、`cleanup=complete` を確認する。クラッシュ復旧では `restoration=complete` も必要。
 Slow test警告だけでは失敗ではない。`unverified` / `retained` の場合は下の診断を確認してから再実行する。
+
+### クラッシュ復旧・長時間heartbeatの追加条件
+
+両シナリオは上記の共通事前確認と同じ専用Worker/DB/S3/SQSを使用する。
+`E2E_DUPLICATE_EXCLUSIVE=true` と `E2E_DUPLICATE_FIXTURE` の絶対MP4パスも共通で使用する。
+fixtureは実際のencode中に2回以上のheartbeat周期とDB leaseの前進を観測できる長さにする。
+短いfixture、観測不足、失敗イベントは `unverified` となり、skipや成功にはしない。
+
+- Workerには `heartbeat_observation_schema=1` と `duplicate_observation_schema=1` が必要。
+- `E2E_CLOCK_SKEW_MS` を1〜5000の整数で明示する。実行ホスト・Worker・DBの時計ずれの上限であり、
+  時刻同期を確認した上で設定する。DB時計は各観測の要求〜応答区間とこの許容幅で照合する。
+  heartbeat要求・応答の時刻差と単調時計によるelapsedも照合する。
+- `E2E_PROCESSING_TIMEOUT_MS` はheartbeat間隔の3倍より大きくする。
+  時計ずれの許容幅の2倍はlease/visibility期間より小さい必要がある。
+- クラッシュ復旧には残り試行回数が必要で、`E2E_MAX_ATTEMPTS >= 2` とする。
+  Workerは保持される専用コンテナーで、restart policyが `no` であることが必要。
+  設定が合わなければ停止せずに失敗する。シナリオ自身はrestart policyを変更しない。
+
+```text
+# 共通設定に加えて、確認した時計ずれ上限を設定する例
+E2E_CLOCK_SKEW_MS=100
+
+python app/scripts/run_reliability_e2e.py --scenario crash-recovery
+python app/scripts/run_reliability_e2e.py --scenario long-heartbeat
+```
+
+クラッシュ復旧はencode開始・複数heartbeat・DB lease更新を確認後、共通事前確認済みのWorkerを
+`docker container stop --signal SIGKILL --timeout 0` で停止する。DBは停止しない。
+停止後のDB lease値とDB時計、最後のvisibility延長を記録し、安全な再開時刻を計算する。
+停止直前の未記録の更新も考慮して、停止観測時刻＋`E2E_VISIBILITY_TIMEOUT_MS` をvisibilityの保守的な上限に含める。
+これはSQSが返した実際の失効時刻ではない。DB上のlease失効とローカルの再開期限の両方を待ち、
+同じコンテナーをstartする。新しい通知を送らず、元message IDの別delivery ID・別owner・attempt 2での再取得を確認する。
+停止中の完了や所有権変更、期限より早い再取得は失敗とする。
+
+長時間heartbeatでは実Workerを止めず、`lease_renewal` と `visibility_extension` の成功を
+message/delivery/cycleで対応付け、両方そろった周期だけを数える。lease側はjob/video/worker/attemptも照合する。
+要求時刻＋期間−時計ずれから得る期限は保守的な下限であり、DB/SQSの確定したexpiryとして扱わない。
+両期限の前進、DB leaseの前進、単一owner/attempt、最終完了までの失敗不在を検証する。
+正常終了直前のキャンセルでも周期の片側しか観測できなければ、現在は保守的に `unverified` とする。
+
+両シナリオとも正規sourceのdownloadからencodeを経て、segment→manifest→COMPLETED→ackの証拠を確認し、
+期待する決定的な出力キーとS3の実際の一覧・metadataを照合する。
+待機はPROCESSING、VISIBILITY、LEASE、NAVIGATIONの設定値から制限し、観測履歴は4000件まで。
+外部コマンド・相関ログ・出力検証・cleanupの上限は重複配送シナリオと共通。
+
+停止後に失敗した場合も同じWorkerを復元してからrun専用の後始末を行う。
+別の起動時刻・Engine・scopeやDB再起動を検出した場合は操作を継続しない。
+復元失敗時は `restoration=failed, cleanup=retained` とし、証跡に記録された同一コンテナーの状態を
+手動確認する。処理中・ack未確認・不明な更新結果ではデータを保持し、queue全体のpurgeやDLQ replayは行わない。
+
+オフライン検証だけではライブ検証完了とはしない。マージ前に使い捨て環境で両コマンドを実行し、
+上記成功条件を満たす証跡を別途保存する必要がある。
 
 <details>
 <summary>シナリオの検証内容・証跡の詳細</summary>
