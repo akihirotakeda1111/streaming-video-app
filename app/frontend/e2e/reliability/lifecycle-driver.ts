@@ -8,6 +8,8 @@ import {
   type DuplicateTarget,
 } from './duplicate-driver.js'
 import {
+  DatabaseClockError,
+  type ClockDiagnostic,
   assertCrashRecovery,
   assertHeartbeats,
   expiryBounds,
@@ -52,6 +54,7 @@ export interface LifecycleReport {
   recoveryAfterMs?: number
   restartRequestedAtMs?: number
   bounds?: ReturnType<typeof expiryBounds>
+  clockDiagnostic?: ClockDiagnostic
   reason?: string
 }
 
@@ -312,6 +315,7 @@ export async function runLifecycle(
     report.status = 'passed'
   } catch (error) {
     report.status = 'unverified'
+    if (error instanceof DatabaseClockError) report.clockDiagnostic = error.clockDiagnostic
     report.reason = error instanceof Error ? error.message : 'Lifecycle scenario failed'
   } finally {
     try {

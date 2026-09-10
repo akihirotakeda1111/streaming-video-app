@@ -599,3 +599,16 @@ cargo test --manifest-path app/backend/worker/Cargo.toml <テスト名>
 コンポーネントテスト成功は実環境シナリオの代用ではない。
 
 </details>
+
+<details>
+<summary>DB時計の許容差エラー</summary>
+
+`Database clock is outside the configured skew bound` はエラー本文と証跡の `clockDiagnostic` で確認する。
+値はミリ秒。`dbNowMs` はDB時刻、`localBeforeMs` / `localAfterMs` は照会前後の実行側時刻、
+`allowedSkewMs` は設定した許容差、`observationElapsedMs` は照会前後の時間差。
+`cause=db_behind` / `db_ahead` の `excessMs` は許容範囲からの超過量。
+`local_clock_reversed` は実行側の時計が逆行したことを示し、`excessMs` は逆行量。
+この診断は時計差の観測であり、OS時刻同期やスリープ復帰などの根本原因を断定しない。
+照会時間が長いだけでは失敗しない。許容差を増やす前に数値と実行環境の時計を確認する。
+
+</details>

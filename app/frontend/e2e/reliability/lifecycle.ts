@@ -41,6 +41,20 @@ export function expiryBounds(input: ExpiryInput) {
     recoveryAfterMs: Math.max(leaseSafeAfterMs, visibilitySafeAfterMs) + input.clockSkewMs,
   }
 }
+export interface ClockDiagnostic {
+  cause: 'local_clock_reversed' | 'db_behind' | 'db_ahead'
+  dbNowMs: number
+  localBeforeMs: number
+  localAfterMs: number
+  allowedSkewMs: number
+  observationElapsedMs: number
+  excessMs: number
+}
+export class DatabaseClockError extends Error {
+  constructor(readonly clockDiagnostic: ClockDiagnostic) {
+    super(`Database clock is outside the configured skew bound: ${JSON.stringify(clockDiagnostic)}`)
+  }
+}
 /** DB time is authoritative; reject observations outside the declared clock tolerance. */
 export function assertDatabaseClock(
   databaseNowMs: number,
@@ -50,7 +64,23 @@ export function assertDatabaseClock(
 ): void {
   for (const value of [databaseNowMs, before, after, skew]) positive(value, 'clock evidence')
   if (after < before || databaseNowMs < before - skew || databaseNowMs > after + skew)
-    fail('Database clock is outside the configured skew bound')
+    throw new DatabaseClockError({
+      cause:
+        after < before
+          ? 'local_clock_reversed'
+          : databaseNowMs < before - skew
+            ? 'db_behind'
+            : 'db_ahead',
+      dbNowMs: databaseNowMs,
+      localBeforeMs: before,
+      localAfterMs: after,
+      allowedSkewMs: skew,
+      observationElapsedMs: after - before,
+      excessMs:
+        after < before
+          ? before - after
+          : Math.max(before - skew - databaseNowMs, databaseNowMs - after - skew),
+    })
 }
 export interface LifecycleEvent {
   outcome: string

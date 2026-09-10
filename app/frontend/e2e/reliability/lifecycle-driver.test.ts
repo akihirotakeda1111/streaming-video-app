@@ -7,7 +7,7 @@ import {
   type LifecycleSnapshot,
   type Scenario,
 } from './lifecycle-driver.js'
-import type { HeartbeatObservation } from './lifecycle.js'
+import { assertDatabaseClock, DatabaseClockError, type HeartbeatObservation } from './lifecycle.js'
 import { safeDiagnostic } from '../diagnostics.js'
 
 const target = duplicateTarget('e2e-11111111-1111-4111-8111-111111111111')
@@ -139,6 +139,42 @@ function fixture(scenario: Scenario = 'crash-recovery') {
   return { adapter, report }
 }
 describe('lifecycle execution with fake boundaries', () => {
+  it.each([
+    [800, 1000, 1100, 'db_behind', 100],
+    [1400, 1000, 1100, 'db_ahead', 200],
+    [1000, 1100, 1000, 'local_clock_reversed', 100],
+  ] as const)(
+    'retains clock diagnostics for db=%s before=%s after=%s',
+    async (db, before, after, cause, excess) => {
+      const f = fixture()
+      f.adapter.observe = async () => {
+        assertDatabaseClock(db, before, after, 100)
+        throw new Error('Expected clock rejection')
+      }
+      await expect(runLifecycle(f.adapter, f.report)).rejects.toThrow('Database clock is outside')
+      const record: Record<string, unknown> = { ...f.report, database_url: 'secret' }
+      const safe = safeDiagnostic(record)
+      expect(safe.clockDiagnostic).toEqual({
+        cause,
+        dbNowMs: db,
+        localBeforeMs: before,
+        localAfterMs: after,
+        allowedSkewMs: 100,
+        observationElapsedMs: after - before,
+        excessMs: excess,
+      })
+      expect(safe.reason).toContain(`"dbNowMs":${db}`)
+      expect(JSON.stringify(safe)).not.toContain('secret')
+      expect(f.adapter.stop).not.toHaveBeenCalled()
+      expect(f.adapter.restore).toHaveBeenCalled()
+    },
+  )
+  it('accepts boundary clock values and slow observations without inventing skew', () => {
+    expect(() => assertDatabaseClock(900, 1000, 1100, 100)).not.toThrow()
+    expect(() => assertDatabaseClock(1200, 1000, 1100, 100)).not.toThrow()
+    expect(() => assertDatabaseClock(5000, 1000, 10000, 100)).not.toThrow()
+    expect(() => assertDatabaseClock(899, 1000, 1100, 100)).toThrow(DatabaseClockError)
+  })
   it('preserves database time and expiry evidence through redaction', async () => {
     const f = fixture()
     await runLifecycle(f.adapter, f.report)
