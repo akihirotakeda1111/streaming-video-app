@@ -3,6 +3,7 @@ import { statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { setTimeout } from 'node:timers/promises'
 import { verifyLiveBoundary } from './safety.mjs'
+import { SafeTransportError, transportFailure } from './transport-diagnostics.js'
 import {
   acknowledged,
   sideEffects,
@@ -162,8 +163,8 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
               AWS_CLI_AUTO_PROMPT: 'off',
             },
           })
-        } catch {
-          return fail('Duplicate transport failed (permission, timeout, or response)')
+        } catch (error) {
+          throw transportFailure(error)
         }
       })
   }
@@ -173,13 +174,16 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
     return this.execute('docker', ['--host', this.env.E2E_DOCKER_HOST!, ...args], input)
   }
   private aws(args: string[]): any {
+    let output: string
     try {
-      return JSON.parse(
-        this.execute('aws', [...args, '--region', this.env.AWS_REGION!, '--output', 'json']) ||
-          '{}',
-      )
+      output = this.execute('aws', [...args, '--region', this.env.AWS_REGION!, '--output', 'json'])
+    } catch (error) {
+      throw transportFailure(error)
+    }
+    try {
+      return JSON.parse(output || '{}')
     } catch {
-      return fail('Run-scoped AWS operation failed')
+      throw new SafeTransportError('invalid_response')
     }
   }
   private inspect(id: string): any {
@@ -380,9 +384,9 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
         '--expected-bucket-owner',
         this.env.E2E_AWS_ACCOUNT_ID!,
       ])
-    } catch {
+    } catch (error) {
       this.uncertain = true
-      fail('Upload outcome uncertain; retain run resources')
+      fail(`Upload outcome uncertain; retain run resources. ${transportFailure(error).message}`)
     }
   }
   async sendDuplicate(): Promise<string> {

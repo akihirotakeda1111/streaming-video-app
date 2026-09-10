@@ -100,6 +100,18 @@ marking Spec 43 live validation complete.
 
 ## Failure and cleanup
 
+Upload failures retain resources and include a fixed diagnostic category in the
+evidence `reason`, for example `Upload outcome uncertain; retain run resources.
+[access_denied] ...`. No raw stderr, command arguments, credentials, or connection
+strings are retained. Categories include `access_denied`, `credentials_missing`,
+`credentials_expired`, `credentials_invalid`, `signature_mismatch`, `timeout`,
+`network`, `tls`, `file_read`, `bucket_missing`, `region_mismatch`, `cli_missing`,
+`process_permission`, `response_too_large`, `invalid_response`, and `unknown`.
+These are diagnostic hints, not proof of whether the remote upload completed.
+Authentication refers to the host AWS CLI identity, not the Worker identity.
+Inspect the category and its fixed advice before rerunning; unsupported CLI error
+formats remain `unknown` rather than exposing raw error text.
+
 On timeout or assertion failure, cleanup can still wait within its own bounded
 budget for durable completion and the latest observed deliveries of every known
 message to be acknowledged. It never calls ReceiveMessage, DeleteMessage, purge,

@@ -55,6 +55,7 @@ function fixture() {
     pending: false,
     uncertainSend: false,
     failUpload: false,
+    uploadError: undefined as unknown,
     failInsert: false,
     sent: 0,
     objectKeys: [] as string[],
@@ -123,6 +124,7 @@ function fixture() {
           ],
         })
       if (args.includes('put-object')) {
+        if (state.uploadError) throw state.uploadError
         if (state.failUpload) throw new Error('private-server-error')
         return '{}'
       }
@@ -248,6 +250,28 @@ describe('delivery log correlation', () => {
 })
 
 describe('dedicated duplicate service adapter', () => {
+  it.each([
+    [{ stderr: 'An error occurred (AccessDenied) private-value' }, 'access_denied'],
+    [{ code: 'ETIMEDOUT', stderr: 'private-value' }, 'timeout'],
+    [{ stderr: "Error parsing parameter '--body': private-value" }, 'file_read'],
+  ])('retains upload resources and exposes only a safe cause', async (error, category) => {
+    const f = fixture()
+    await f.adapter.prepare(f.target)
+    f.state.uploadError = error
+    let reason = ''
+    try {
+      await f.adapter.upload()
+    } catch (failure) {
+      reason = String(failure)
+    }
+    expect(reason).toContain('Upload outcome uncertain')
+    expect(reason).toContain(`[${category}]`)
+    expect(reason).not.toContain('private-value')
+    await expect(f.adapter.cleanup()).rejects.toThrow('Uncertain')
+    expect(
+      f.calls.some((c) => c.args.includes('delete-object') || c.input?.includes('DELETE FROM')),
+    ).toBe(false)
+  })
   it.each(['prefix', 'Prefix', 'PREFIX'])(
     'accepts notification filter names case-insensitively: %s',
     async (name) => {
