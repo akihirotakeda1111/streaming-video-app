@@ -1,3 +1,15 @@
+variable "allowed_account_ids" {
+  type        = list(string)
+  description = "Optional AWS provider account allowlist; empty preserves the existing local setup."
+  default     = []
+}
+
+variable "resource_tags" {
+  type        = map(string)
+  description = "Optional default tags for this deployment."
+  default     = {}
+}
+
 variable "project_name" {
   type        = string
   description = "Logical project name used to compose local runtime identifiers."

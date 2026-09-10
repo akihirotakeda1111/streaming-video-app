@@ -1,0 +1,25 @@
+# Overlay only: docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up --build -d worker
+name: streaming-video-e2e
+
+services:
+  postgres:
+    container_name: ${COMPOSE_PROJECT_NAME}-postgres
+    # The Worker and migration connect over the project network; no host port is needed.
+    ports: !reset []
+    labels:
+      com.streaming-video.e2e.disposable: "true"
+      com.streaming-video.e2e.role: database
+      com.streaming-video.e2e.scope: ${COMPOSE_PROJECT_NAME}
+
+  worker:
+    labels:
+      com.streaming-video.e2e.disposable: "true"
+      com.streaming-video.e2e.role: worker
+      com.streaming-video.e2e.scope: ${COMPOSE_PROJECT_NAME}
+
+volumes:
+  postgres_data:
+    name: ${COMPOSE_PROJECT_NAME}-postgres-data
+    labels:
+      com.streaming-video.e2e.disposable: "true"
+      com.streaming-video.e2e.scope: ${COMPOSE_PROJECT_NAME}

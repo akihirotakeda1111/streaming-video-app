@@ -1,194 +1,485 @@
-# Reliability E2E runner
+# Reliability E2E 運用ガイド
 
-`python app/scripts/run_reliability_e2e.py --check` is offline only. It checks
-for `node`, `npm`, `npx`, `ffmpeg`, `aws`, and `docker`, then invokes the local Node validator
-with a 10-second deadline. It does not contact AWS, databases, queues,
-browsers, containers, or services, create evidence directories, or run scenarios.
-Missing live settings are reported as `not configured` and return zero when
-local tools are available. Malformed supplied settings or missing tools return
-2. Complete settings are reported as `configured; live resources not verified`.
+## 全体構成
 
-The Python runner and direct Playwright reliability authorization use the same
-`safety.mjs` validator. Configuration parsing is separate from live authorization;
-`loadReliabilityConfig()` alone does not authorize scenario operations.
+### 構成要素と責務
 
-Live configuration requires all of the following:
+Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・PostgreSQLを使う。
+準備、設定生成、実体確認、シナリオ実行を分ける。CIはオフライン検証のみとし、Terraformや実環境シナリオは手動で実行する。
 
-- `E2E_ENVIRONMENT=disposable` and `E2E_RELIABILITY_DISPOSABLE=true`.
-- `E2E_FRONTEND_URL` and `E2E_API_URL`: HTTP(S), without credentials, query, or fragment.
-- Non-secret identities: `E2E_SOURCE_QUEUE`, `E2E_DLQ`, `E2E_SOURCE_BUCKET`,
-  `E2E_OUTPUT_BUCKET`, `E2E_WORKER_OBSERVATION`, `E2E_DATABASE_OBSERVATION`,
-  `E2E_WORKER_PROCESS_CONTROL`, and `E2E_DATABASE_PROCESS_CONTROL`.
-- `E2E_SOURCE_DLQ` matching `E2E_DLQ`, and
-  `E2E_SOURCE_DLQ_RELATIONSHIP=verified`. These are declarations, not evidence
-  of an actual source-queue redrive policy. `configured` is allowed offline
-  but is reported as incomplete for live execution.
-- `E2E_MAX_ATTEMPTS`: an integer from 1 through 10; and
-  `E2E_ALARM_IDENTIFIERS`: a nonempty comma-separated list of identities.
-- Explicit integer millisecond values from 1 through 900000 for each of
-  `E2E_NAVIGATION_TIMEOUT_MS`, `E2E_UPLOAD_TIMEOUT_MS`,
-  `E2E_PROCESSING_TIMEOUT_MS`, `E2E_LEASE_TIMEOUT_MS`,
-  `E2E_VISIBILITY_TIMEOUT_MS`, `E2E_DLQ_TIMEOUT_MS`, and `E2E_PLAYBACK_TIMEOUT_MS`.
-  Phase 1 browser tests retain their existing defaults.
-- `E2E_WORKER_CONTROL_SCOPE` and `E2E_DATABASE_CONTROL_SCOPE` identifying
-  test-owned process/service boundaries. Wildcards and `all`, `host`, `shared`,
-  or `production` are rejected even offline. A name alone does not prove ownership.
-- An absolute `E2E_EVIDENCE_DIR` without parent traversal.
+| 要素 | 実装・設定 | 役割 |
+| --- | --- | --- |
+| AWS環境 | `app/infra/terraform-e2e/` | 既存Terraformを再利用し、専用S3・SQS/DLQ・通知・3アラーム・IAMを作成 |
+| ローカル実行環境 | `app/compose.yaml` + `app/compose.e2e.yaml` | 専用プロジェクト・DB volume・ラベル。Worker、DB、migrationは既存定義を再利用 |
+| 設定生成 | `app/scripts/generate_reliability_env.mjs` | AWS/Docker実効値から非機密の環境設定を生成。秘密情報は出力しない |
+| 共通事前確認 | `safety.mjs`、`live.mjs` | 設定形式とAWS/Dockerの実体・所有範囲を確認。プロセス操作やリモート書き込みは行わない |
+| 実行入口 | `app/scripts/run_reliability_e2e.py` | 検証、証跡ディレクトリ作成、実装済みシナリオ選択、Playwright起動 |
+| シナリオ | `*.spec.ts`、driver、adapter | 事前確認後に操作・観測・検証・run単位のcleanupを実施 |
+| 診断 | `transport-diagnostics.ts`、`../diagnostics.ts` | 固定原因分類と秘密情報を除外した証跡 |
 
-## Live preflight and supported adapter
+設定の流れは **AWS準備 → Compose入力と認証設定 → コンテナ起動 → E2E設定生成・読み込み → 事前確認 → シナリオ実行**。
+設定生成だけではシェルも起動済みコンテナも更新されない。事前確認成功もシナリオ成功の代わりにはならない。
 
-The supported adapter uses the AWS CLI and a direct local Docker Engine hosting
-Linux containers. It reads STS, S3, SQS and CloudWatch metadata, plus Docker info
-and container inspection. It never starts, stops or restarts anything.
+### シナリオと検証範囲
 
-Required additional settings:
+| セレクター | 検証範囲 | 実装状況 |
+| --- | --- | --- |
+| `preflight` | ローカル・ブラウザ・APIの準備確認 | 実装済み。API/Frontendとブラウザが必要 |
+| `runtime-authorization` | Reliability共通実行境界の確認 | 実装済み |
+| `duplicate-delivery` | 処理中と完了後の重複配送、単一の有効処理、ack、cleanup | 実装済み。ブラウザ/APIを操作しない |
+| 未登録 | Worker停止・再開、長時間heartbeat | 追加予定。実行可能なセレクターは未登録 |
+| 未登録 | 不正メディア、試行上限、DLQ隔離・アラーム | 追加予定。実行可能なセレクターは未登録 |
+| 未登録 | Reliabilityシナリオ後のブラウザ再生回帰 | 追加予定。既存ブラウザテストとは別に拡張 |
 
-- `AWS_REGION` and the expected 12-digit `E2E_AWS_ACCOUNT_ID`.
-- `E2E_DOCKER_HOST`: a direct local socket, for example
-  `unix:///var/run/docker.sock` on Linux or
-  `npipe:////./pipe/docker_engine` on Docker Desktop. Remote endpoints and
-  authorization-plugin deployments are unsupported and fail closed. The local
-  socket must connect directly to a trusted Engine, not a filtering proxy.
-- Worker and database observation/control identifiers both use
-  `docker:<full 64-character container ID>`. Names, abbreviated IDs and
-  `process:<name>` are unsupported. Obtain the IDs with
-  `docker container inspect --format '{{.Id}}' <test-owned-container>`.
-- Both containers must already have the labels
-  `com.streaming-video.e2e.disposable=true`,
-  `com.streaming-video.e2e.scope=<corresponding E2E control scope>`, and
-  `com.streaming-video.e2e.role=worker` or `database`.
-  These labels are inspected on actual immutable container IDs. The environment
-  owner must assign them only to dedicated disposable resources, including their
-  database storage. Merely setting the E2E environment variables is insufficient.
-  Do not label or reuse shared deployments to make this check pass.
-- Containers must be running, unpaused, non-privileged, outside the host PID
-  namespace, with automatic removal disabled. The Worker must directly run the
-  repository image entrypoint `/usr/local/bin/video-worker`, with no wrapper or
-  extra arguments. PostgreSQL must use `docker-entrypoint.sh postgres`.
-- The Worker container must explicitly contain all five `WORKER_*` reliability
-  variables, `AWS_REGION`, `VIDEO_ENCODING_QUEUE_URL`, `VIDEO_INPUT_BUCKET`,
-  `VIDEO_OUTPUT_BUCKET`, and `DATABASE_URL`. The repository Worker has no defaults
-  for these fields; Compose resolves its defaults before container creation.
-  A direct Worker entrypoint makes its container environment the startup settings.
-  The database host must resolve through a shared Docker network to the inspected
-  PostgreSQL container's address or alias, using its standard port 5432.
-- PostgreSQL must have a passing healthcheck. All attached volumes must be local
-  named Docker volumes with no driver options, labeled disposable and with the
-  corresponding scope just like their container. Volume inspection and the list
-  of all attached containers must show that only the selected container uses each
-  volume. Bind mounts, remote volumes and shared storage are unsupported.
+最新の実装済みセレクターは `--list` で確認する。実環境の受け入れは対象環境で成功した証跡をレビューして判断する。
+シナリオ追加時はこの表と、以下の「シナリオ別の追加条件」「実行」「証跡・復旧」を追記する。
+各シナリオは直接Playwrightで選択されても操作前に共通事前確認を呼び、別テストの成功を認可の代用にしない。
+停止を伴うシナリオでは直前にEngine ID・完全なコンテナID・開始時刻を再照合し、同じコンテナを保持して復旧する。
+再作成・Compose全体の停止・プロセス名での選択を障害注入に使わない。
 
-The existing Compose file is not changed or provisioned by the runner. A human
-must prepare the dedicated labeled environment and verify Phase 2 Terraform
-before live acceptance. An unlabeled existing Compose deployment is blocked.
+## 事前準備
 
-Docker control capability is established through direct Engine access and the
-absence of authorization plugins: Docker's default authorization is all-or-nothing.
-The evidence binds control to the full ID, start time and Engine ID. Future
-failure scenarios must reverify this identity immediately before control, stop
-only that container with a bounded deadline, retain it, and restore by starting
-the same container. Never remove/recreate it, stop a Compose project, select by
-process name, or operate on unrelated containers. Preflight does not perform a
-stop/start probe or prove that a later restart will succeed.
+### ツールと実行場所
 
-Timing values in `E2E_*_TIMEOUT_MS` are observation budgets. SQS seconds are
-converted to milliseconds. Queue visibility and Worker visibility extension must
-fit `E2E_VISIBILITY_TIMEOUT_MS`; Worker lease duration must fit
-`E2E_LEASE_TIMEOUT_MS`; retry delay must fit `E2E_DLQ_TIMEOUT_MS`. Equality is
-accepted; allow extra polling margin for live runs. For example, queue visibility
-180 seconds fits a 180000 ms visibility budget. The Worker heartbeat must leave
-at least one heartbeat interval of safety margin before both visibility and lease
-expire. Retry, lease and extension must be positive and at most 43200 seconds;
-Worker attempts, queue maxReceiveCount and E2E_MAX_ATTEMPTS must agree (1–10).
-The DLQ budget check covers one retry delay, not the entire sequence of receives;
-scenario-specific total wait budgets still need to cover the selected scenario.
+コマンドはリポジトリルートで実行する。特記のないコマンドは **Windows（PowerShell）・WSL（Bash）共通**。
+1行ずつ実行し、失敗した場合は後続へ進まない。
+Python、Node.js、npm、npx、FFmpeg、AWS CLI、Dockerが必要。WSLでPythonのコマンド名が `python3` の場合は、以下の `python` を読み替える。
+TerraformはAWS環境を作成・削除する場合だけ必要（>=1.6、mockテストは>=1.7）。
+Docker Composeは `!reset` 対応版を使用する。構成確認はv2.35.1で実施している。
 
-`E2E_ALARM_IDENTIFIERS` must list three distinct alarm names. Their observed
-AWS/SQS metric and QueueName dimension must cover source oldest-message age,
-source visible count and DLQ visible count exactly once. Bucket observations use
-`--expected-bucket-owner` as well as checking region; queue URLs and ARNs must
-match the expected account and region.
+```text
+npm --prefix app/frontend ci --include=dev
+node app/frontend/node_modules/@playwright/test/cli.js --version
+```
 
-AWS credentials use the normal CLI provider and are never printed. Required
-read operations are STS GetCallerIdentity, S3 HeadBucket/GetBucketLocation, SQS
-GetQueueUrl/GetQueueAttributes, and CloudWatch DescribeAlarms. For general-purpose
-S3 buckets the IAM actions are `s3:ListBucket` and `s3:GetBucketLocation`
-(`s3:HeadBucket` is not an IAM action). Docker inspect responses and database URLs
-stay in memory and are excluded from evidence and failure messages.
+依存関係はテストを実行するOS側にインストールする。Docker内やWindows側のnode_modulesはWSL側の代用にならない。
+WSLではLinux版Nodeを使い、`node -p 'process.platform'` が `linux` であることを確認する。
+ブラウザを使用するシナリオでは、別途Playwrightの対象ブラウザをインストールする。
 
-Every observation is limited to 10 seconds and the common live verification has
-a 120-second total deadline. Python allows 130 seconds for the live subprocess,
-including startup/serialization, while offline validation retains its 10-second
-limit. Permission failures, malformed responses and unsupported capabilities
-block before scenario dispatch.
+### 専用AWS環境
 
-Run the standalone verification with:
+既存の専用環境があれば再作成は不要。新規作成時は通常環境とstate・リソース名を分離する。
+E2E用Terraformはinput/output S3、Standard sourceキューとDLQ、S3通知、3アラーム、API/Worker用IAMユーザー・ポリシー、
+ホストrunner用ポリシーを作成する。アクセスキー、DB、コンテナ、計算リソースは作成しない。
+outputのHLSパスは既存構成と同じ公開読み取り方式。アカウント方針が公開ポリシーを禁止する場合は適用できない。
+バケットは新規・非versionedで、強制オブジェクト削除は有効にしない。
 
-`python app/scripts/run_reliability_e2e.py --live-preflight`
+`terraform.tfvars.example` を同じディレクトリの `terraform.tfvars` にコピーし、
+`aws_account_id` を想定アカウントIDへ変更する。必要なら `aws_region` / `instance` も変更する。
+プロファイル設定だけは使用するシェルに合わせる。
 
-On success it prints redacted verification evidence and writes
-`<E2E_EVIDENCE_DIR>/preflight-<UUID>/live-preflight.json`. This command creates no jobs, queue
-messages, objects, database records, worker changes, or failure injections.
-The Python runner and direct Playwright reliability execution call this same
-shared verification boundary before dispatch or scenario work.
-The standalone Phase 1 `@preflight` browser readiness test retains its existing scope.
+| 設定 | Windows / PowerShell | WSL / Bash |
+| --- | --- | --- |
+| 構築用プロファイル | `$env:AWS_PROFILE = 'e2e-provisioner'` | `export AWS_PROFILE='e2e-provisioner'` |
 
-`--list` shows the implemented selectors: `preflight` (local/browser/API readiness),
-`runtime-authorization` (reliability authorization), and `duplicate-delivery`
-(active and completed redelivery). Select it with:
+```text
+terraform -chdir=app/infra/terraform-e2e init
+terraform -chdir=app/infra/terraform-e2e validate
+terraform -chdir=app/infra/terraform-e2e plan -out=e2e.tfplan
+```
 
-`python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery`
+新規E2Eリソースだけを対象とするplanであることを確認して適用する。
 
-The runner dispatches this selector only to Playwright's `reliability` project
-with the exact `@duplicate-delivery` tag through the installed Node/Playwright CLI.
-Unknown selectors fail. The Python entry point does not require a POSIX shell.
+```text
+terraform -chdir=app/infra/terraform-e2e apply e2e.tfplan
+```
 
-The duplicate scenario verifies the Worker observation capability before creating
-canonical test rows and uploading an MP4. It injects an active duplicate and a
-post-completion duplicate, correlates each message's outcomes through delivery
-spans, and proves one effective encode/publication plus immutable completion.
-The supported adapter and [duplicate execution guide](duplicate-runbook.md) define
-fixture requirements, existing permissions, exact run cleanup and retained-resource
-failure handling. Missing observations, too-short workloads and unsafe cleanup
-remain unverified failures, never skipped/passed checks. Human live evidence is
-still required for acceptance.
+両providerが想定アカウントIDを制限する。リソース名は `streaming-video-e2e-<instance>`、バケット名にはアカウント・リージョンも含む。
+複数環境を持つ場合は異なるinstanceと別checkout等の独立したstateを使う。同じstateでinstanceを変えると置換planになる。
+通常環境のstate・workspace・バケットを流用しない。local stateとbackupはリソースが残っている間は保持する。
+state・plan・実値tfvarsはコミットせず、provider lockファイルはコミットする。チーム共有backend構築は別途扱う。
 
-Every future reliability scenario
-must call that authorization before any operation, even when selected directly;
-a separate authorization test does not establish ordering for other tests.
+### 起動前の接続先と認証
 
-After authorization, the runner creates a unique child directory
-under `E2E_EVIDENCE_DIR` and passes its name as `E2E_RUN_ID`. Diagnostics must use
-existing redaction helpers and exclude credentials, receipt handles, database URLs,
-and full presigned URLs. Worker/database controls must exclude unrelated processes
-and restore the prior test-owned state when safe. Cleanup is limited to canonical
-resources registered by the current run. The runner does
-not edit source, Compose, IAM, networking, Terraform, or queues to enable a run.
+ホスト用とWorker用の認証を分ける。`AWS_PROFILE` だけではWorkerに認証情報は渡らない。
 
-## Offline regression checks
+| 用途 | 起動元シェルの変数 | 設定元・注意点 |
+| --- | --- | --- |
+| 接続先 | `AWS_REGION`、`VIDEO_ENCODING_QUEUE_URL`、`VIDEO_INPUT_BUCKET`、`VIDEO_OUTPUT_BUCKET` | E2E専用Terraform output、または既存専用リソースの実値 |
+| Worker認証 | `WORKER_AWS_ACCESS_KEY_ID`、`WORKER_AWS_SECRET_ACCESS_KEY` | Worker用principalの認証。Composeがコンテナ内の `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` に渡す |
+| Worker一時認証 | `WORKER_AWS_SESSION_TOKEN` | 一時認証なら必須。長期キーの場合は古いtokenを残さない |
+| ホスト認証 | `AWS_PROFILE`、または `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / 必要なら `AWS_SESSION_TOKEN` | 設定生成・実体確認・アップロード・cleanup用。provisionerからrunner用へ切り替える |
+| DB | `POSTGRES_DB`、`POSTGRES_USER`、`POSTGRES_PASSWORD`、`COMPOSE_DATABASE_URL` | 既定値を使用可能。変更時は整合させ、コンテナ内の接続先は `postgres:5432` |
 
-`npm --prefix app/frontend run test:e2e:helpers` includes shared-policy and Python
-entry-point tests. Python must be on PATH, or `PYTHON` may name its executable.
-Tests use disposable dummy identities and fake external command responses while
-executing the real authorization policy. No external services are contacted.
-They cover missing settings, malformed scopes, completeness, redaction, validator
-timeouts, refusal to dispatch without supported adapters, dedicated duplicate
-selector/tag/project dispatch, and nonzero exit propagation. The duplicate entry
-point is checked for authorization failure, successful scenario dispatch and
-retained-resource failures. Driver/adapter tests exercise duplicate side effects,
-wrong acknowledgements, completion overwrites, pending messages and ambiguous
-transport outcomes without invoking live services.
+Terraform outputから非機密のCompose入力とWorker時間設定を読み込む。
 
-Human verification against the intended disposable environment remains
-outstanding until the command above succeeds and its redacted evidence is
-retained. Offline tests and type checks do not replace that evidence.
+<details>
+<summary>Terraform出力の読み込み（使用するシェルだけ実行）</summary>
 
-Evidence roots may already exist; each preflight gets a unique child directory,
-so repeated checks retain previous evidence. A local evidence-write failure is
-reported with a fixed redacted message. Successful offline tests are not live
-acceptance. The PR must retain the outstanding human preflight requirement until
-an actual successful evidence file has been reviewed.
+PowerShell:
 
-Adapter references: [Docker inspect](https://docs.docker.com/reference/cli/docker/container/inspect/),
-[Docker authorization](https://docs.docker.com/engine/extend/plugins_authorization/),
-and [S3 HeadBucket](https://docs.aws.amazon.com/cli/latest/reference/s3api/head-bucket.html).
+```powershell
+$runtimeJson = terraform -chdir=app/infra/terraform-e2e output -json compose_environment
+if ($LASTEXITCODE -ne 0) { throw 'Terraform output failed' }
+$runtime = $runtimeJson | ConvertFrom-Json
+foreach ($entry in $runtime.PSObject.Properties) {
+  [Environment]::SetEnvironmentVariable($entry.Name, [string]$entry.Value, 'Process')
+}
+```
+
+WSL / Bash（jqが必要）:
+
+```bash
+load_runtime() {
+  local runtime_json entries entry
+  runtime_json=$(terraform -chdir=app/infra/terraform-e2e output -json compose_environment) || return 1
+  entries=$(printf '%s' "$runtime_json" | jq -r 'to_entries[] | "\(.key)=\(.value)"') || return 1
+  while IFS= read -r entry; do export "$entry"; done <<< "$entries"
+}
+load_runtime || echo 'Terraform output failed; 起動せず設定を確認してください' >&2
+```
+
+</details>
+
+Terraformを使わない場合は上表の接続先を手動設定する。例: `export VIDEO_ENCODING_QUEUE_URL='https://sqs.ap-northeast-1.amazonaws.com/<account>/専用キュー名'`。
+開発用 `.env` やシェルに残った通常環境の接続先を引き継がない。
+
+認証は手動で用意する。Terraformはキーを発行しない。使用するWorkerユーザーとrunnerポリシーは次で確認できる。
+
+```text
+terraform -chdir=app/infra/terraform-e2e output worker_identity
+terraform -chdir=app/infra/terraform-e2e output runner_policy_arn
+```
+
+runner policyはホスト側principalへ手動付与する。Terraform適用権限は含まず、queueのReceive/Delete/PurgeやDLQ replay権限も付与しない。
+CloudWatch DescribeAlarmsは設定生成の一覧取得に必要なため読み取りの `Resource=*` を使用する。
+AWS認証情報は生成ファイル・tfvars・Git管理ファイルに追記しない。WorkerのDATABASE_URLもコピー不要。
+
+WSLで秘密値を履歴・画面に出さず設定する例:
+
+```bash
+export AWS_PROFILE='<E2E runner用プロファイル名>'
+aws sts get-caller-identity
+read -rsp 'Worker access key ID: ' WORKER_AWS_ACCESS_KEY_ID; printf '\n'
+read -rsp 'Worker secret access key: ' WORKER_AWS_SECRET_ACCESS_KEY; printf '\n'
+read -rsp 'Worker session token (長期キーなら空欄): ' WORKER_AWS_SESSION_TOKEN; printf '\n'
+export WORKER_AWS_ACCESS_KEY_ID WORKER_AWS_SECRET_ACCESS_KEY WORKER_AWS_SESSION_TOKEN
+```
+
+PowerShellでは同じ変数を `$env:変数名` に設定する。ホスト認証が有効でもWorker認証が空・期限切れならWorkerは処理できない。
+
+### Docker環境と起動
+
+ローカルのLinux Engineに直接接続する。WSLの既定ソケットは `unix:///var/run/docker.sock`、Windowsは `npipe:////./pipe/docker_engine`。
+リモート接続・authorization plugin・共有ストレージは未対応。設定生成はDocker contextを推測しない。
+必要なら `--docker-host` で実際のローカルソケットを指定する。
+
+```text
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml config --quiet
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up --build -d worker
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps
+```
+
+この起動ではWorkerと依存するDB・migrationだけが対象。API/Frontendが必要なシナリオでは追加起動し、公開ポート・URL・CORSも準備する。
+`start-e2e-compose.sh` は通常Compose全体を起動するため、専用overrideの代用にはしない。
+DB名は `streaming-video-e2e-postgres`、volume名は `streaming-video-e2e-postgres-data`。DBホスト公開ポートは除去される。
+`-p` を変えると名前・scopeも変わる。全操作で同じプロジェクト名と2ファイルを指定する。
+AWSリソースはComposeで分離されないため、他consumerと共有しない専用キュー・バケットを指定する。
+
+共通事前確認が求める条件:
+
+- Worker/DBに `com.streaming-video.e2e.disposable=true`、対応する `com.streaming-video.e2e.scope`、`com.streaming-video.e2e.role=worker|database`。
+- Running、非Paused、非Restarting。Privileged・host PID・AutoRemoveは無効。
+- Workerは `/usr/local/bin/video-worker` を追加引数やwrapperなしで直接起動。
+- DBは `docker-entrypoint.sh postgres` で起動し、healthcheckはhealthy。
+- WorkerのDATABASE_URLは同一Dockerネットワークの対象DB・標準ポート5432を指す。
+- Worker/DBに付くvolumeはlocal named volume、driver optionsなし。同じdisposable/scopeラベルを持ち、他コンテナから未使用。bind mountは不可。
+
+ラベルだけで専有を証明したとは扱わない。事前確認はvolume利用者・ネットワーク・完全ID・開始時刻・Engine IDを検査する。
+コンテナ制御能力の確認は接続条件に基づき、実際のstop/startや再起動成功の保証は行わない。
+
+起動後に接続先・認証を変更した場合、テストが終了していることを確認してWorkerを再作成する。
+
+```text
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up -d --no-deps --force-recreate worker
+```
+
+IDが変わるためE2E設定を再生成・再読込する。`VIDEO_ENCODING_QUEUE_URL` と `E2E_SOURCE_QUEUE`、各VIDEOバケットとE2Eバケットは同じ対象である必要がある。
+
+### E2E設定の生成と読み込み
+
+生成処理はAWS CLI認証を使い、既存ラベル・Worker実効値・STS・sourceのRedrivePolicy・DLQ・アラームを読み取る。
+取得失敗・値の不整合・複数のアラーム候補はエラーにする。各コマンド10秒、全体120秒、応答4 MiBが上限。
+バケット・SQS・アラームの作成、認証値の出力、シナリオ実行は行わない。
+
+使用するシェルの手順だけ実行し、同じシェルで「実行手順」へ進む。
+コンテナを再作成した場合は再生成・再読込する。
+
+<details>
+<summary>Windows / PowerShell：設定生成・読み込み</summary>
+
+PowerShellの例（アカウントとfixtureを実値へ置換）:
+
+```powershell
+$workerId = docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q worker
+$dbId = docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q postgres
+node app/scripts/generate_reliability_env.mjs --worker $workerId --database $dbId --account 123456789012 --fixture C:/e2e/long.mp4 --exclusive --output ./reliability-env.local.ps1
+# 成功を確認し、内容をレビューしてから同じシェルに読み込む
+Get-Content ./reliability-env.local.ps1
+. ./reliability-env.local.ps1
+```
+
+既存ファイルは上書きしない。再生成時は別の出力ファイル名を使う。
+
+</details>
+
+<details>
+<summary>WSL / Bash：設定生成・読み込み</summary>
+
+CLIの出力はPowerShell専用のため、Bashでは取得関数のJSONを読み込む（jqが必要）。
+
+```bash
+worker_id=$(docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q worker)
+db_id=$(docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q postgres)
+# 専用・破棄可能環境であることを確認してから実行。アカウントとfixtureを実値へ置換
+load_e2e() {
+  local settings entries entry
+  settings=$(node --input-type=module - "$worker_id" "$db_id" '123456789012' "$HOME/e2e/fixtures/test.mp4" <<'JS'
+import { discoverEnvironment } from './app/scripts/generate_reliability_env.mjs'
+const [worker, database, account, fixture] = process.argv.slice(2)
+try {
+  const env = discoverEnvironment({ worker, database, account, fixture, exclusive: true })
+  console.log(JSON.stringify(env))
+} catch { console.error('E2E設定生成失敗。認証・接続先・ラベル・アラームを確認してください'); process.exitCode = 2 }
+JS
+  ) || return 1
+  entries=$(printf '%s' "$settings" | jq -r 'to_entries[] | "\(.key)=\(.value)"') || return 1
+  while IFS= read -r entry; do export "$entry"; done <<< "$entries"
+}
+load_e2e || echo '設定生成失敗。後続の実行を止めて確認してください' >&2
+```
+
+</details>
+
+生成JSON・コマンドはいずれも非機密設定だけだが、環境固有の値なのでGitにはコミットしない。
+認証を別シェルで使う場合は、そのシェルでも既存AWS CLIログイン・認証変数を手動設定する。
+
+| 生成時の指定 | 省略時・用途 |
+| --- | --- |
+| `--worker` / `--database` | 必須。DB名ではなくコンテナ名またはID |
+| `--account` | 推奨。STSアカウントと照合。省略時はSTS値を使用 |
+| `--profile` | 任意の既存AWSプロファイル名。秘密情報は受け付けない |
+| `--docker-host` | DOCKER_HOST、なければOS別ローカルソケット |
+| `--frontend-url` / `--api-url` | 既定は `http://127.0.0.1:5173` / `http://127.0.0.1:8000`。自動検出・稼働確認ではない |
+| `--evidence-dir` | カレントディレクトリの `artifacts/reliability-e2e` を絶対パス化 |
+| `--fixture` | 絶対パスへ変換し存在・拡張子・サイズを検査。省略時は空欄を手動補完 |
+| `--exclusive` | 専用・破棄可能環境であるという利用者の宣言。省略時はdisposable/exclusiveが空欄 |
+| `--alarms A,B,C` | 候補が重複・多数ある場合に実際の3アラーム名を指定 |
+
+<details>
+<summary>設定値・待機時間の詳細（調整時に参照）</summary>
+
+生成値を上書きする場合の共通契約:
+
+| 設定 | 必須条件 |
+| --- | --- |
+| `E2E_ENVIRONMENT` / `E2E_RELIABILITY_DISPOSABLE` | `disposable` / `true` |
+| `AWS_REGION` / `E2E_AWS_ACCOUNT_ID` | 実対象のリージョン / 12桁アカウント。全リソースと一致 |
+| `E2E_FRONTEND_URL` / `E2E_API_URL` | HTTP(S)、認証情報・query・fragmentなし。ブラウザを使わないシナリオでも現行共通契約で必須 |
+| `E2E_SOURCE_QUEUE` / `E2E_DLQ` | 異なるキューの名前またはURL。ARNではない |
+| `E2E_SOURCE_DLQ` / `E2E_SOURCE_DLQ_RELATIONSHIP` | E2E_DLQと同じ文字列 / `verified`。実際のRedrivePolicyも照合 |
+| `E2E_SOURCE_BUCKET` / `E2E_OUTPUT_BUCKET` | Worker設定と一致する異なるバケット |
+| `E2E_MAX_ATTEMPTS` | 1〜10の整数。Workerとsource maxReceiveCountに一致 |
+| `E2E_ALARM_IDENTIFIERS` | 異なる3アラーム名。AWS/SQS・QueueName dimensionのみで、source最古メッセージ年齢、source可視件数、DLQ可視件数を各1個 |
+| `E2E_DOCKER_HOST` | 前述の直接ローカルソケット |
+| `E2E_WORKER_OBSERVATION` / `E2E_WORKER_PROCESS_CONTROL` | 同じ `docker:<完全64文字ID>` |
+| `E2E_DATABASE_OBSERVATION` / `E2E_DATABASE_PROCESS_CONTROL` | 同じ `docker:<完全64文字ID>` |
+| `E2E_WORKER_CONTROL_SCOPE` / `E2E_DATABASE_CONTROL_SCOPE` | 実ラベルと一致。ワイルドカードやall/host/shared/productionは不可 |
+| `E2E_EVIDENCE_DIR` | 書き込み可能な絶対パス。親ディレクトリ参照 `..` は不可 |
+
+`E2E_RUN_ID` と `E2E_INCLUDE_RELIABILITY` はrunnerが設定する。`.env` はPlaywright/runnerでは自動読込しない。
+全7種類の `E2E_*_TIMEOUT_MS` は1〜900000の整数（ミリ秒）で明示設定が必要。生成値は次のとおり。
+
+| 時間設定 | 生成値・照合 |
+| --- | --- |
+| NAVIGATION | 30000。配送ポーリングの余裕にも使う |
+| UPLOAD | 120000。大きなMP4では実際の転送時間に合わせて延長 |
+| PROCESSING | 300000。エンコード・出力検証・cleanupの各段階に使用 |
+| PLAYBACK | 120000 |
+| VISIBILITY | max(SQS visibility, Worker延長) ×1000 + 30000（上限900000） |
+| LEASE | Worker lease ×1000 + 30000（上限900000） |
+| DLQ | Worker retry ×1000 + 30000（上限900000） |
+
+実設定自体が900000 msを超える場合、生成はエラー。E2E予算はWorker/SQSの設定を変更しない。
+Worker時間設定は秒単位、`2 × heartbeat <= min(visibility延長, lease)` が必要。
+DLQ予算の共通チェックは1回分のretryをカバーするだけで、全再配送の所要時間はシナリオ側で確保する。
+
+</details>
+
+### シナリオ別の追加条件
+
+| シナリオ | 条件 |
+| --- | --- |
+| 重複配送 | 他のテスト・consumerと対象を共有せず `E2E_DUPLICATE_EXCLUSIVE=true`。DB内のUPLOADING/QUEUED/PROCESSINGが0件 |
+| 重複配送 | `E2E_DUPLICATE_FIXTURE` は有効なMP4の絶対パス、非空、1 GiB以下。WSLでは `/home/.../test.mp4` 形式 |
+| 重複配送 | encode中にbusy配送を観測できる処理時間が必要。短すぎればunverified、長すぎてredrive上限に達しても失敗 |
+| 重複配送 | 非versionedバケット。Enabled/Suspendedは不可。Standardキューに単一の直接S3通知、他のSNS/Lambda/EventBridge通知なし |
+| 重複配送 | 通知フィルタが `videos/<video UUID>/jobs/<job UUID>/source.mp4` に一致。通常prefix `videos/`、suffix `/source.mp4`。フィルタ名の大小文字は吸収するが値は厳密比較 |
+| 重複配送 | Worker起動ログに `duplicate_observation_schema=1`。起動以降の末尾2000行から確認できること |
+
+ホストには共通のSTS、S3 HeadBucket/GetBucketLocation、SQS GetQueueUrl/GetQueueAttributes、CloudWatch DescribeAlarmsの読み取りが必要。
+重複配送ではさらにsource SendMessage、S3通知/versioning/list、source PutObject、output HeadObject、runオブジェクトDeleteObjectを使う。
+HeadBucketのIAM権限はListBucket、HeadObjectはGetObject。DBロールには対象video/jobの作成・参照・削除が必要で、DB名・ユーザー名は英数字とunderscoreのみ対応。
+
+## 実行手順
+
+事前準備でコンテナを起動し、E2E設定と認証を読み込んだ**同じシェル**で実行する。
+以下のコマンドはWindows（PowerShell）・WSL（Bash）共通。
+
+### 1. 事前確認
+
+```text
+python app/scripts/run_reliability_e2e.py --check
+python app/scripts/run_reliability_e2e.py --live-preflight
+```
+
+`--check` が `configured; live resources not verified`、`--live-preflight` が `status=verified` になったら次へ進む。
+`not configured` / `blocked` の場合は設定を確認する。
+実環境の事前確認は読み取りだけを行い、結果を `preflight-<UUID>/live-preflight.json` に保存する。
+シナリオ固有のfixture・通知・DB等の条件は実行時にも確認する。
+
+### 2. シナリオ実行
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery
+```
+
+`duplicate-delivery` は実行対象に置き換える。選択肢は次で確認できる。
+
+```text
+python app/scripts/run_reliability_e2e.py --list
+```
+
+実行時にも共通事前確認を行い、runごとに新しい証跡ディレクトリを作成する。自動再試行は行わない。
+
+### 3. 結果確認
+
+終了コード0とテストの `passed` を確認し、表示された `evidenceDirectory` 内のシナリオ証跡を開く。
+重複配送では `duplicate-delivery-evidence.json` の **`status=passed`、`cleanup=complete`** が成功条件。
+Slow test警告だけでは失敗ではない。`unverified` / `retained` の場合は下の診断を確認してから再実行する。
+
+<details>
+<summary>シナリオの検証内容・証跡の詳細</summary>
+
+重複配送では新しいvideo/jobを作り、sourceをS3へアップロードする。処理中に同じsourceの通知を注入し、
+同じ所有者・attempt・有効leaseのまま対象メッセージがbusy/retainedになることを確認する。
+一度のdownload/encode/publication、manifest-last、COMPLETED、元メッセージとbusyメッセージのackを待つ。
+完了後にもう一度通知し、already_completedとackのみ、updated_atを含むDB状態の不変を確認して出力検証・cleanupを行う。
+
+自動シナリオ再試行は行わない。配送待機はVISIBILITY+NAVIGATION、処理完了/ack待機はPROCESSING+配送予算。
+外部コマンドは10秒、source uploadのみUPLOAD予算。出力一覧は512オブジェクト、相関ログは20000イベント/16 MiBが上限。
+
+証跡にはrun/video/job ID、3つのmessage ID、受信ごとのdelivery ID、owner/attempt、処理段階、lease・状態・cleanupを残す。
+`observedAtMs` はDB時計、イベントの `at` はWorker UTC時刻。認証情報・receipt handle・DB URL・生ログ・presigned queryは含めない。
+`worker_delivery` spanで配送を、`worker_attempt` spanでjob/video/worker/attemptを相関する。
+処理段階は `operation=download|encode|segment_upload|manifest_upload` と `outcome=start|success` から正規化する。
+Workerログに個々のオブジェクトキーはないため、upload回数と順序から期待キーを算出し、S3一覧・metadataと独立に照合する。
+相関不能なunknown message IDや不足した観測はunverified。証跡は環境ごと・実行ごとに保持する。
+
+</details>
+
+<details>
+<summary>失敗時の診断・再実行</summary>
+
+| 診断 | 確認箇所 |
+| --- | --- |
+| `Cannot find module ... @playwright/test/cli.js` | 実行OS側で `npm --prefix app/frontend ci --include=dev` |
+| `disposable container is not stably running` | Worker/DBのRunning・Restarting・PID。再起動中はWorkerログと認証を確認 |
+| `read-only docker observation failed` | Docker接続先、CLI権限、10秒期限、再作成後の古いID、volume観測 |
+| `worker resource settings do not match observed targets` | WorkerのAWS/VIDEO設定とシェルのAWS/E2E設定を照合。変更後は再生成・再読込 |
+| `Source key does not match notification filters` | 実バケットとprefix/suffixの値を確認 |
+| `Dedicated database contains active work` | 過去の失敗で残ったUPLOADING等を証跡のjob/video IDと照合 |
+| `Upload outcome uncertain ... [分類]` | ホスト認証・ファイル・通信・UPLOAD予算。Worker認証ではない |
+
+アップロード診断の分類は `access_denied`、`credentials_missing`、`credentials_expired`、`credentials_invalid`、
+`signature_mismatch`、`timeout`、`network`、`tls`、`file_read`、`bucket_missing`、`region_mismatch`、
+`cli_missing`、`process_permission`、`response_too_large`、`invalid_response`、`unknown`。
+分類は原因の手掛かりであり、リモート処理の成否を断定しない。timeoutにはローカルの時間制限とCLI通信タイムアウトの両方を含む。
+元エラー・秘密値は出力しない。
+
+次はWindows・WSL共通。`<...>` は生成済み設定と今回の証跡から転記する。
+DB名・ユーザーを変更した場合は `-U` / `-d` も変更する。
+
+```text
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps
+aws s3api head-object --bucket "<E2E_SOURCE_BUCKETの値>" --key "<証跡のtarget.sourceKey>" --region "<AWS_REGIONの値>"
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml exec postgres psql -U streaming_video -d streaming_video
+```
+
+S3の404は確認時点で不在、403は存在判定不能。DB接続後は次で未完了のjobを確認する。
+
+```sql
+SELECT id, video_id, status, attempt, worker_id, lease_expires_at, updated_at
+FROM jobs WHERE status IN ('UPLOADING', 'QUEUED', 'PROCESSING') ORDER BY updated_at;
+```
+
+曖昧なupload/send、未ack通知、active lease、コンテナ変更、未知オブジェクト、所有権確認不能は
+`cleanup=retained` / `status=unverified` とする。S3が404でも、upload前に作成したDBレコードは残り得る。
+証跡の正確なID、DB状態、S3状態、未処理通知を照合し、対象runだけを手動復旧してから再実行する。
+全件DELETE、状態の強制変更、queue purge、DLQ自動replayで通してはいけない。
+通常cleanupは完了と既知メッセージの最新配送のackを待ち、削除対象全体を検査してsource/HLSと所有確認済みvideoを削除する（jobsはCASCADE）。
+テスト自体はReceiveMessage/DeleteMessageを使わない。SQSの後発再配送が永久にないことまでは保証しない。
+
+</details>
+
+<details>
+<summary>環境の終了・削除（不要になったときだけ）</summary>
+
+環境を終了する際は証跡と保持リソースを確認してから実行する。
+
+```text
+# コンテナ・ネットワークを終了。DB volumeは保持
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml down
+```
+
+DBも破棄可能と確認した場合だけ同じコマンドに `--volumes` を付ける。AWSの保持データはCompose終了では削除されない。
+AWS環境も不要になったら、専用Worker停止、残存オブジェクト、手動付与policy attachment・IAM認証情報を管理者が確認する。
+
+構築時と同じ方法で `AWS_PROFILE` を `e2e-provisioner` に切り替える。
+
+```text
+terraform -chdir=app/infra/terraform-e2e plan -destroy -out=destroy.tfplan
+# 当該E2E環境だけが対象であることを確認後
+terraform -chdir=app/infra/terraform-e2e apply destroy.tfplan
+```
+
+非空バケットを自動で強制削除する設定にはしていない。stateは正常な削除が完了するまで保持する。
+
+</details>
+
+<details>
+<summary>実装変更時の検証（通常のE2E実行では不要）</summary>
+
+```text
+npm --prefix app/frontend run test:e2e:helpers
+npm --prefix app/frontend run test:e2e:type-check
+```
+
+helpersはfake境界で認可・redaction・シナリオ・cleanup・設定生成を検証する。
+
+Terraformの変更を検証する場合（手動）:
+
+```text
+terraform -chdir=app/infra/terraform-e2e fmt -check
+terraform -chdir=app/infra/terraform-e2e init -backend=false
+terraform -chdir=app/infra/terraform-e2e validate
+terraform -chdir=app/infra/terraform-e2e test
+```
+
+initはprovider取得のため通信する。テストはmockで既存構成とE2E側の受け渡しを分けて検証し、AWSを操作しない。
+Workerのコンポーネント証跡も維持する。各テストは次の形式で選択できる。
+
+```text
+cargo test --manifest-path app/backend/worker/Cargo.toml <テスト名>
+```
+
+| 検証範囲 | テスト名・証拠 |
+| --- | --- |
+| download / manifest失敗 | `each_pipeline_failure_obeys_attempt_budget_and_cleans_up`（stage 0 / 4）。未完了・試行上限・作業領域cleanup |
+| 部分segment upload | `partial_upload_redelivery_reacquires_and_publishes_before_acknowledgement`。状態・attempt・encode回数・公開/ack順序 |
+| DB更新失敗・古い所有者 | `stale_owner_and_database_errors_never_report_terminal_success`。InfrastructureFailure / OwnershipLostの区別 |
+| 完了後の削除失敗 | `delete_failure_redelivery_only_retries_acknowledgement`。COMPLETED維持・再encodeなし・削除のみ再試行 |
+
+コンポーネントテスト成功は実環境シナリオの代用ではない。
+
+</details>
