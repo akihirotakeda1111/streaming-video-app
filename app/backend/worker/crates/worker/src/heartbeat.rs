@@ -539,7 +539,65 @@ fn log_heartbeat_success(
 }
 
 #[cfg(test)]
+pub(crate) mod observation_test_support {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Capture {
+        // Only used by current-thread Tokio tests: spawned tasks are polled
+        // on the guarded thread. No second global subscriber is installed.
+        pub(crate) fn install(enabled: bool) -> (Self, tracing::subscriber::DefaultGuard) {
+            let capture = Self::default();
+            let writer = capture.clone();
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .with_filter(tracing_subscriber::filter::dynamic_filter_fn(
+                    move |_, _| enabled,
+                ));
+            let guard =
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+            (capture, guard)
+        }
+
+        pub(crate) fn events(&self) -> Vec<serde_json::Value> {
+            let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+            for secret in ["secret-receipt", "secret-db", "secret-sqs", "secret-source"] {
+                assert!(!text.contains(secret), "observation leaked {secret}");
+            }
+            text.lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        pub(crate) fn heartbeats(&self) -> Vec<serde_json::Value> {
+            self.events()
+                .into_iter()
+                .map(|event| event["fields"].clone())
+                .filter(|fields| fields["message"] == "worker heartbeat observation")
+                .collect()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::observation_test_support::Capture;
     use super::*;
     use crate::{acquisition::WorkerIdentity, event::WorkItem};
     use std::{
@@ -591,6 +649,7 @@ mod tests {
         log: Log,
         steps: VecDeque<Step<Result<JobOperationOutcome, PersistenceError>>>,
         active: Arc<AtomicUsize>,
+        expected_worker: String,
     }
     impl JobState for Jobs {
         async fn claim(&mut self, _: &str, _: &str) -> Result<bool, PersistenceError> {
@@ -607,7 +666,7 @@ mod tests {
             seconds: u64,
         ) -> Result<JobOperationOutcome, PersistenceError> {
             assert_eq!(video, "video");
-            assert_eq!(worker, "worker-a");
+            assert_eq!(worker, self.expected_worker);
             assert_eq!(seconds, 300);
             self.log.lock().unwrap().push((Instant::now(), job.into()));
             let step = self
@@ -628,7 +687,7 @@ mod tests {
             receipt: &str,
             duration: Duration,
         ) -> Result<(), QueueError> {
-            assert_eq!(receipt, "receipt");
+            assert!(matches!(receipt, "receipt" | "secret-receipt"));
             assert_eq!(duration, Duration::from_secs(120));
             self.log
                 .lock()
@@ -657,6 +716,7 @@ mod tests {
                     log: log.clone(),
                     steps: VecDeque::new(),
                     active: active.clone(),
+                    expected_worker: "worker-a".into(),
                 })),
                 queue: Arc::new(Mutex::new(Queue {
                     log: log.clone(),
@@ -706,6 +766,45 @@ mod tests {
                 .map(|(t, name)| (t.duration_since(self.epoch).as_secs(), name.clone()))
                 .collect()
         }
+        fn observed(&self, delivery: &str, count: usize, attempt: u32) -> HeartbeatHandle {
+            self.observed_identity("same-message", delivery, count, attempt, "worker-a")
+        }
+        fn observed_identity(
+            &self,
+            message: &str,
+            delivery: &str,
+            count: usize,
+            attempt: u32,
+            worker: &str,
+        ) -> HeartbeatHandle {
+            self.jobs.try_lock().unwrap().expected_worker = worker.into();
+            start_with_context(
+                self.jobs.clone(),
+                self.queue.clone(),
+                "secret-receipt",
+                (0..count)
+                    .map(|i| AcquiredJob {
+                        item: WorkItem {
+                            job_id: format!("job-{i}"),
+                            video_id: "video".into(),
+                            bucket: "input".into(),
+                            key: "secret-source".into(),
+                        },
+                        worker_id: WorkerIdentity::from_value(worker).unwrap(),
+                        attempt,
+                        lease_expires_at: SystemTime::UNIX_EPOCH,
+                    })
+                    .collect(),
+                HeartbeatSettings::from_seconds(30, 300, 120).unwrap(),
+                HeartbeatDeadlines {
+                    lease: self.epoch + Duration::from_secs(300),
+                    visibility: self.epoch + Duration::from_secs(120),
+                },
+                message,
+                delivery,
+            )
+            .unwrap()
+        }
         async fn loss(&self, handle: HeartbeatHandle, expected: HeartbeatLoss) {
             let cancelled = handle.ownership_lost();
             // A timeout makes failure bounded even if the watchdog regresses.
@@ -733,6 +832,311 @@ mod tests {
     }
     fn lease_loss(job: &str) -> HeartbeatLoss {
         HeartbeatLoss::LeaseDeadlineExceeded { job_id: job.into() }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observations_emit_nothing_without_jobs_or_before_an_expired_initial_deadline() {
+        let (capture, _guard) = Capture::install(true);
+        let empty = Fixture::new();
+        assert!(empty.start(0, 300, 120).is_none());
+        advance(30).await;
+        assert!(empty.calls().is_empty());
+        for (lease, visibility, expected) in [
+            (0, 120, lease_loss("job-0")),
+            (300, 0, HeartbeatLoss::VisibilityDeadlineExceeded),
+            (5, 120, lease_loss("job-0")),
+        ] {
+            let f = Fixture::new();
+            let h = f.start(1, lease, visibility).unwrap();
+            advance(5).await;
+            f.loss(h, expected).await;
+            assert!(f.calls().is_empty());
+        }
+        assert!(capture.heartbeats().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observations_measure_real_calls_across_two_multi_record_cycles() {
+        let (capture, _guard) = Capture::install(true);
+        let f = Fixture::new();
+        f.jobs
+            .lock()
+            .await
+            .steps
+            .extend((0..4).map(|_| Step::after(2, Ok(JobOperationOutcome::Applied))));
+        f.queue
+            .lock()
+            .await
+            .steps
+            .extend((0..2).map(|_| Step::after(3, Ok(()))));
+        let wall_before = unix_ms();
+        let h = f.observed("timed-delivery", 2, 4);
+        advance(30).await;
+        for cycle in 0..2 {
+            advance(2).await;
+            advance(2).await;
+            advance(3).await;
+            if cycle == 0 {
+                advance(23).await;
+            }
+        }
+        assert_eq!(h.cancel_and_join().await.unwrap(), Ok(()));
+        let wall_after = unix_ms();
+        let events = capture.heartbeats();
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            f.calls(),
+            [
+                (30, "job-0".into()),
+                (32, "job-1".into()),
+                (34, "visibility".into()),
+                (60, "job-0".into()),
+                (62, "job-1".into()),
+                (64, "visibility".into())
+            ]
+        );
+        for (index, event) in events.iter().enumerate() {
+            let lease = index % 3 < 2;
+            assert_eq!(
+                event["operation"],
+                if lease {
+                    "lease_renewal"
+                } else {
+                    "visibility_extension"
+                }
+            );
+            assert_eq!(event["outcome"], "success");
+            assert_eq!(event["message_id"], "same-message");
+            assert_eq!(event["delivery_id"], "timed-delivery");
+            assert_eq!(event["heartbeat_cycle"], index / 3 + 1);
+            assert_eq!(event["duration_seconds"], if lease { 300 } else { 120 });
+            assert_eq!(event["elapsed_ms"], if lease { 2000 } else { 3000 });
+            // Paused Tokio time advances seconds; wall timestamps stay within
+            // the real test interval and must not be fabricated from it.
+            for field in ["request_started_at_unix_ms", "response_observed_at_unix_ms"] {
+                let value = event[field]
+                    .as_u64()
+                    .expect("integer wall time in milliseconds");
+                assert!((wall_before..=wall_after).contains(&value));
+            }
+            if lease {
+                assert_eq!(event["job_id"], format!("job-{}", index % 3));
+                assert_eq!(event["video_id"], "video");
+                assert_eq!(event["worker_id"], "worker-a");
+                assert_eq!(event["attempt"], 4);
+            } else {
+                for field in ["job_id", "video_id", "worker_id", "attempt"] {
+                    assert!(event.get(field).is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observations_keep_concurrent_and_redelivered_message_contexts_separate() {
+        let (capture, _guard) = Capture::install(true);
+        let a = Fixture::new();
+        let b = Fixture::new();
+        let first = a.observed("delivery-a", 1, 2);
+        let second = b.observed_identity("other-message", "delivery-b", 2, 3, "worker-b");
+        advance(30).await;
+        assert_eq!(first.cancel_and_join().await.unwrap(), Ok(()));
+        assert_eq!(second.cancel_and_join().await.unwrap(), Ok(()));
+        let c = Fixture::new();
+        let redelivered = c.observed_identity("same-message", "delivery-c", 1, 4, "worker-c");
+        advance(30).await;
+        assert_eq!(redelivered.cancel_and_join().await.unwrap(), Ok(()));
+        let events = capture.heartbeats();
+        assert_eq!(events.len(), 7);
+        for (delivery, count, attempt) in [
+            ("delivery-a", 1, 2),
+            ("delivery-b", 2, 3),
+            ("delivery-c", 1, 4),
+        ] {
+            let own: Vec<_> = events
+                .iter()
+                .filter(|e| e["delivery_id"] == delivery)
+                .collect();
+            assert_eq!(own.len(), count + 1);
+            for (index, event) in own.iter().enumerate() {
+                assert_eq!(
+                    event["message_id"],
+                    if delivery == "delivery-b" {
+                        "other-message"
+                    } else {
+                        "same-message"
+                    }
+                );
+                assert_eq!(event["heartbeat_cycle"], 1);
+                if index < count {
+                    assert_eq!(event["operation"], "lease_renewal");
+                    assert_eq!(event["job_id"], format!("job-{index}"));
+                    assert_eq!(event["attempt"], attempt);
+                    assert_eq!(
+                        event["worker_id"],
+                        match delivery {
+                            "delivery-a" => "worker-a",
+                            "delivery-b" => "worker-b",
+                            _ => "worker-c",
+                        }
+                    );
+                } else {
+                    assert_eq!(event["operation"], "visibility_extension");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observations_exclude_retired_records_including_lock_wait_short_circuit() {
+        let (capture, _guard) = Capture::install(true);
+        let f = Fixture::new();
+        let h = f.observed("retired", 3, 1);
+        h.activity(0).store(false, Ordering::SeqCst);
+        let lock = f.jobs.lock().await;
+        advance(30).await;
+        h.activity(1).store(false, Ordering::SeqCst);
+        drop(lock);
+        advance(1).await;
+        assert_eq!(h.cancel_and_join().await.unwrap(), Ok(()));
+        let events = capture.heartbeats();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["job_id"], "job-2");
+        assert_eq!(events[1]["operation"], "visibility_extension");
+        assert_eq!(f.calls(), [(30, "job-2".into()), (30, "visibility".into())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observations_suppress_failures_and_late_results_but_preserve_partial_success() {
+        for case in [
+            "not-owner",
+            "db-error",
+            "sqs-error",
+            "db-timeout",
+            "sqs-timeout",
+            "db-late",
+            "sqs-late",
+            "later-job",
+        ] {
+            let (capture, _guard) = Capture::install(true);
+            let f = Fixture::new();
+            match case {
+                "not-owner" => f
+                    .jobs
+                    .lock()
+                    .await
+                    .steps
+                    .push_back(Step::after(0, Ok(JobOperationOutcome::NotOwner))),
+                "db-error" => f
+                    .jobs
+                    .lock()
+                    .await
+                    .steps
+                    .push_back(Step::after(0, Err(PersistenceError("secret-db".into())))),
+                "sqs-error" => f
+                    .queue
+                    .lock()
+                    .await
+                    .steps
+                    .push_back(Step::after(0, Err(QueueError("secret-sqs".into())))),
+                "db-timeout" => f
+                    .jobs
+                    .lock()
+                    .await
+                    .steps
+                    .push_back(Step::pending(Ok(JobOperationOutcome::Applied))),
+                "sqs-timeout" => f.queue.lock().await.steps.push_back(Step::pending(Ok(()))),
+                "db-late" => f
+                    .jobs
+                    .lock()
+                    .await
+                    .steps
+                    .push_back(Step::after(90, Ok(JobOperationOutcome::Applied))),
+                "sqs-late" => f
+                    .queue
+                    .lock()
+                    .await
+                    .steps
+                    .push_back(Step::after(90, Ok(()))),
+                "later-job" => f.jobs.lock().await.steps.extend([
+                    Step::after(0, Ok(JobOperationOutcome::Applied)),
+                    Step::after(0, Ok(JobOperationOutcome::NotOwner)),
+                ]),
+                _ => unreachable!(),
+            }
+            let h = f.observed(case, if case == "later-job" { 2 } else { 1 }, 1);
+            advance(30).await;
+            if case.ends_with("timeout") || case.ends_with("late") {
+                advance(90).await;
+            }
+            let expected = match case {
+                "not-owner" | "later-job" => HeartbeatLoss::LeaseLost {
+                    job_id: if case == "later-job" {
+                        "job-1"
+                    } else {
+                        "job-0"
+                    }
+                    .into(),
+                },
+                "db-error" => HeartbeatLoss::Database(PersistenceError("secret-db".into())),
+                "sqs-error" => HeartbeatLoss::Visibility(QueueError("secret-sqs".into())),
+                _ => HeartbeatLoss::VisibilityDeadlineExceeded,
+            };
+            f.loss(h, expected).await;
+            let events = capture.heartbeats();
+            let partial = case.starts_with("sqs") || case == "later-job";
+            assert_eq!(events.len(), usize::from(partial), "{case}: {events:?}");
+            if partial {
+                assert_eq!(events[0]["operation"], "lease_renewal");
+                assert_eq!(events[0]["job_id"], "job-0");
+                assert_eq!(events[0]["heartbeat_cycle"], 1);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observations_suppress_cancelled_calls_and_disabled_logging_preserves_behavior() {
+        for stage in 0..3 {
+            let mut baseline = None;
+            for enabled in [true, false] {
+                let (capture, _guard) = Capture::install(enabled);
+                let f = Fixture::new();
+                if stage == 1 {
+                    f.jobs
+                        .lock()
+                        .await
+                        .steps
+                        .push_back(Step::pending(Ok(JobOperationOutcome::Applied)));
+                }
+                f.queue.lock().await.steps.push_back(Step::pending(Ok(())));
+                let h = f.observed("cancelled", 1, 2);
+                let lost = h.ownership_lost();
+                if stage > 0 {
+                    advance(30).await;
+                }
+                assert_eq!(h.cancel_and_join().await.unwrap(), Ok(()));
+                assert!(*lost.borrow());
+                assert_eq!(f.active.load(Ordering::SeqCst), 0);
+                assert!(f.jobs.try_lock().is_ok());
+                assert!(f.queue.try_lock().is_ok());
+                let calls = f.calls();
+                advance(400).await;
+                assert_eq!(f.calls(), calls);
+                if let Some(expected) = &baseline {
+                    assert_eq!(&calls, expected);
+                } else {
+                    baseline = Some(calls);
+                }
+                let events = capture.heartbeats();
+                assert_eq!(events.len(), usize::from(enabled && stage == 2));
+                if enabled && stage == 2 {
+                    assert_eq!(events[0]["operation"], "lease_renewal");
+                }
+                if !enabled {
+                    assert!(capture.events().is_empty());
+                }
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

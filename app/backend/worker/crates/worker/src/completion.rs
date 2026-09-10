@@ -903,6 +903,60 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_logging_preserves_completion_attempts_and_acknowledgement() {
+        use crate::heartbeat::observation_test_support::Capture;
+        for failure in ["none", "lease", "visibility", "processing"] {
+            let mut baseline = None;
+            for enabled in [true, false] {
+                let (capture, _guard) = Capture::install(enabled);
+                let f = Fixture::new(Duration::from_millis(65), failure == "processing");
+                {
+                    let mut state = f.state.lock().unwrap();
+                    state.attempt = 3;
+                    state.renewal_failure = failure == "lease";
+                    state.visibility_failure = failure == "visibility";
+                }
+                f.run(&[FIRST]).await;
+                assert_eq!(
+                    f.state.lock().unwrap().acquired_attempts.get(FIRST),
+                    Some(&3)
+                );
+                let calls = f.state.lock().unwrap().calls.clone();
+                assert_eq!(calls.iter().any(|call| call == "delete"), failure == "none");
+                assert_eq!(
+                    calls.iter().any(|call| call.starts_with("complete:")),
+                    failure == "none"
+                );
+                assert_eq!(
+                    calls.iter().any(|call| call.starts_with("release:")),
+                    failure == "processing"
+                );
+                if let Some(expected) = &baseline {
+                    assert_eq!(&calls, expected, "{failure}");
+                } else {
+                    baseline = Some(calls.clone());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(f.state.lock().unwrap().calls, calls);
+                let events = capture.heartbeats();
+                if enabled && failure == "none" {
+                    assert!(!events.is_empty());
+                    for event in &events {
+                        assert_eq!(event["message_id"], "message-test");
+                        assert_eq!(event["delivery_id"], "delivery-test");
+                        if event["operation"] == "lease_renewal" {
+                            assert_eq!(event["attempt"], 3);
+                        }
+                    }
+                }
+                if !enabled {
+                    assert!(capture.events().is_empty());
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn encoder_panic_keeps_the_whole_message_and_stops_heartbeat() {
         let f = Fixture::new(Duration::from_millis(60), false);
