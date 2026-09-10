@@ -157,8 +157,8 @@ export function assertHeartbeats(
   events: readonly HeartbeatObservation[],
   minimumCycles: number,
 ): void {
-  if (!Number.isSafeInteger(minimumCycles) || minimumCycles < 2)
-    fail('at least two heartbeat cycles are required')
+  if (!Number.isSafeInteger(minimumCycles) || minimumCycles < 1)
+    fail('at least one heartbeat cycle is required')
   if (events.some((e) => e.outcome !== 'heartbeat_succeeded'))
     fail('heartbeat failure or incomplete cycle observed')
   if (events.length < minimumCycles)

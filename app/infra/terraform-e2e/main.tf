@@ -42,10 +42,10 @@ module "foundation" {
   video_output_bucket = "${local.prefix}-${var.aws_account_id}-${var.aws_region}-output"
   frontend_origin     = var.frontend_origin
 
-  source_visibility_timeout_seconds   = 120
-  worker_heartbeat_interval_seconds   = 30
-  worker_visibility_extension_seconds = 120
-  worker_lease_duration_seconds       = 300
+  source_visibility_timeout_seconds   = 30
+  worker_heartbeat_interval_seconds   = 5
+  worker_visibility_extension_seconds = 30
+  worker_lease_duration_seconds       = 30
   worker_retry_delay_seconds          = 900
   worker_maximum_attempts             = 5
   queue_max_receive_count             = 5

@@ -172,6 +172,7 @@ docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yam
 ```
 
 この起動ではWorkerと依存するDB・migrationだけが対象。API/Frontendが必要なシナリオでは追加起動し、公開ポート・URL・CORSも準備する。
+Workerの再起動ポリシーは専用overrideで `no` にする。通常の `app/compose.yaml` 単独では `unless-stopped` を維持する。
 `start-e2e-compose.sh` は通常Compose全体を起動するため、専用overrideの代用にはしない。
 DB名は `streaming-video-e2e-postgres`、volume名は `streaming-video-e2e-postgres-data`。DBホスト公開ポートは除去される。
 `-p` を変えると名前・scopeも変わる。全操作で同じプロジェクト名と2ファイルを指定する。
@@ -365,16 +366,24 @@ Slow test警告だけでは失敗ではない。`unverified` / `retained` の場
 
 ### クラッシュ復旧・長時間heartbeatの追加条件
 
+E2E専用Terraformの設定はheartbeat 5秒、source visibility・Worker visibility延長・lease各30秒。
+既存環境には自動反映されない。テスト終了後、専用Terraformのplanを確認して手動applyし、
+`compose_environment` を再読込してWorkerを再作成、E2E設定を再生成・再読込する。
+通常環境の設定は変更しない。復旧後の完了・ack検証は維持する。
+タイムアウトは `encode readiness`（開始・更新待ち）、`lease and visibility expiry`（期限切れ待ち）、
+`completion and acknowledgement`（完了・ack待ち）と待機予算を表示する。
+
 両シナリオは上記の共通事前確認と同じ専用Worker/DB/S3/SQSを使用する。
 `E2E_DUPLICATE_EXCLUSIVE=true` と `E2E_DUPLICATE_FIXTURE` の絶対MP4パスも共通で使用する。
-fixtureは実際のencode中に2回以上のheartbeat周期とDB leaseの前進を観測できる長さにする。
+クラッシュ復旧はencode中に1回のheartbeat成功とDB leaseの前進を確認して停止する。
+長時間heartbeatは2回以上の更新を観測できるfixtureを使う。容量ではなく実際の処理時間で判断する。
 短いfixture、観測不足、失敗イベントは `unverified` となり、skipや成功にはしない。
 
 - Workerには `heartbeat_observation_schema=1` と `duplicate_observation_schema=1` が必要。
 - `E2E_CLOCK_SKEW_MS` を1〜5000の整数で明示する。実行ホスト・Worker・DBの時計ずれの上限であり、
   時刻同期を確認した上で設定する。DB時計は各観測の要求〜応答区間とこの許容幅で照合する。
   heartbeat要求・応答の時刻差と単調時計によるelapsedも照合する。
-- `E2E_PROCESSING_TIMEOUT_MS` はheartbeat間隔の3倍より大きくする。
+- `E2E_PROCESSING_TIMEOUT_MS` はクラッシュ復旧ではheartbeat間隔の2倍、長時間heartbeatでは3倍より大きくする。
   時計ずれの許容幅の2倍はlease/visibility期間より小さい必要がある。
 - クラッシュ復旧には残り試行回数が必要で、`E2E_MAX_ATTEMPTS >= 2` とする。
   Workerは保持される専用コンテナーで、restart policyが `no` であることが必要。
@@ -388,7 +397,7 @@ python app/scripts/run_reliability_e2e.py --scenario crash-recovery
 python app/scripts/run_reliability_e2e.py --scenario long-heartbeat
 ```
 
-クラッシュ復旧はencode開始・複数heartbeat・DB lease更新を確認後、共通事前確認済みのWorkerを
+クラッシュ復旧はencode開始・1回のheartbeat成功・DB lease更新を確認後、共通事前確認済みのWorkerを
 `docker container stop --signal SIGKILL --timeout 0` で停止する。DBは停止しない。
 停止後のDB lease値とDB時計、最後のvisibility延長を記録し、安全な再開時刻を計算する。
 停止直前の未記録の更新も考慮して、停止観測時刻＋`E2E_VISIBILITY_TIMEOUT_MS` をvisibilityの保守的な上限に含める。

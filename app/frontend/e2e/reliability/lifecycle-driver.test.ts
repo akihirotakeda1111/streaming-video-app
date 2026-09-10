@@ -142,7 +142,11 @@ describe('lifecycle execution with fake boundaries', () => {
   it('preserves database time and expiry evidence through redaction', async () => {
     const f = fixture()
     await runLifecycle(f.adapter, f.report)
-    const record: Record<string, unknown> = { ...f.report, database_url: 'private', receipt_handle: 'private' }
+    const record: Record<string, unknown> = {
+      ...f.report,
+      database_url: 'private',
+      receipt_handle: 'private',
+    }
     const safe = safeDiagnostic(record)
     expect(safe.observations).toEqual(f.report.observations)
     expect(safe.bounds).toEqual(f.report.bounds)
@@ -164,6 +168,54 @@ describe('lifecycle execution with fake boundaries', () => {
         expect(f.report.restartRequestedAtMs).toBeGreaterThanOrEqual(f.report.recoveryAfterMs!)
         expect(f.report.restoration).toBe('complete')
       }
+    },
+  )
+  it('crashes after one renewal without waiting for repeated heartbeat cycles', async () => {
+    const f = fixture()
+    const observe = f.adapter.observe
+    f.adapter.observe = async () => {
+      const s = await observe()
+      s.heartbeats = s.heartbeats.slice(0, 1)
+      s.operations = s.operations.filter((op) => op.cycle === 1)
+      return s
+    }
+    await runLifecycle(f.adapter, f.report)
+    expect(f.report.status).toBe('passed')
+    expect(f.report.stoppedAtMs).toBeLessThan(1800)
+  })
+  it('still requires repeated renewals for long heartbeat', async () => {
+    const f = fixture('long-heartbeat')
+    const observe = f.adapter.observe
+    f.adapter.observe = async () => {
+      const s = await observe()
+      s.heartbeats = s.heartbeats.slice(0, 1)
+      return s
+    }
+    await expect(runLifecycle(f.adapter, f.report)).rejects.toThrow('repeated renewals')
+    expect(f.adapter.stop).not.toHaveBeenCalled()
+  })
+  it.each(['encode readiness', 'lease and visibility expiry', 'completion and acknowledgement'])(
+    'identifies the %s timeout and restores the worker',
+    async (phase) => {
+      const f = fixture()
+      const observe = f.adapter.observe
+      if (phase === 'encode readiness') f.adapter.processingMs = 1
+      if (phase === 'lease and visibility expiry') f.adapter.recoveryMs = 1
+      if (phase === 'completion and acknowledgement') {
+        f.adapter.observe = async () => {
+          const s = await observe()
+          if (s.job.attempt === 2) {
+            s.job.status = 'PROCESSING'
+            s.events = s.events.filter((e) => e.outcome !== 'deleted')
+          }
+          return s
+        }
+      }
+      await expect(runLifecycle(f.adapter, f.report)).rejects.toThrow(
+        `Lifecycle ${phase} timed out after`,
+      )
+      expect(f.adapter.restore).toHaveBeenCalled()
+      expect(f.report.status).toBe('unverified')
     },
   )
   it('never injects a final-attempt crash', async () => {

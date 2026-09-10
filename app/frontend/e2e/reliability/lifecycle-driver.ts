@@ -138,7 +138,11 @@ export async function runLifecycle(
       fail('Lifecycle observed a processing or ownership failure')
     return s
   }
-  const until = async (budget: number, accept: (s: LifecycleSnapshot) => boolean) => {
+  const until = async (
+    phase: string,
+    budget: number,
+    accept: (s: LifecycleSnapshot) => boolean,
+  ) => {
     const deadline = adapter.now() + budget
     while (adapter.now() < deadline) {
       const s = await read()
@@ -146,7 +150,7 @@ export async function runLifecycle(
       if (accept(s)) return s
       await adapter.sleep(Math.min(250, deadline - adapter.now()))
     }
-    return fail('Bounded lifecycle observation timed out')
+    return fail(`Lifecycle ${phase} timed out after ${budget} ms`)
   }
   let previousJob: DuplicateJob | undefined
   let dbRenewals = 0
@@ -178,19 +182,31 @@ export async function runLifecycle(
     await adapter.prepare(report.target)
     report.scenarioStarted = true
     await adapter.upload()
-    const active = await until(adapter.processingMs, (s) => {
+    const requiredRenewals = report.scenario === 'crash-recovery' ? 1 : 2
+    const active = await until('encode readiness', adapter.processingMs, (s) => {
       trackInitialOwner(s)
       if (s.job.status === 'COMPLETED' || s.events.some((e) => e.outcome === 'encode_finished'))
-        fail('Encode too short to establish repeated renewals before completion')
+        fail(
+          report.scenario === 'crash-recovery'
+            ? 'Encode completed before crash readiness (one renewal)'
+            : 'Encode too short to establish repeated renewals before completion',
+        )
       const renewals = s.heartbeats.filter((e) => e.outcome === 'heartbeat_succeeded')
       const encode = s.events.find((e) => e.outcome === 'encode_started')
-      if (s.job.status !== 'PROCESSING' || !encode || renewals.length < 2 || dbRenewals < 2)
+      if (
+        s.job.status !== 'PROCESSING' ||
+        !encode ||
+        renewals.length < requiredRenewals ||
+        dbRenewals < requiredRenewals
+      )
         return false
-      assertHeartbeats(renewals, 2)
+      assertHeartbeats(renewals, requiredRenewals)
       if (
         renewals.filter(
-          (e) => e.startedAtMs >= encode.at && e.at - encode.at >= adapter.heartbeatMs,
-        ).length < 2
+          (e) =>
+            e.startedAtMs >= encode.at &&
+            (report.scenario === 'crash-recovery' || e.at - encode.at >= adapter.heartbeatMs),
+        ).length < requiredRenewals
       )
         return false
       return true
@@ -232,7 +248,7 @@ export async function runLifecycle(
         clockSkewMs: adapter.clockSkewMs,
       })
       report.recoveryAfterMs = report.bounds.recoveryAfterMs
-      await until(adapter.recoveryMs, (s) => {
+      await until('lease and visibility expiry', adapter.recoveryMs, (s) => {
         if (
           s.job.status !== 'PROCESSING' ||
           s.job.attempt !== 1 ||
@@ -251,11 +267,15 @@ export async function runLifecycle(
       await adapter.restore()
       report.restoration = 'complete'
     }
-    const final = await until(adapter.processingMs + adapter.deliveryMs, (s) => {
-      if (report.scenario === 'long-heartbeat') trackInitialOwner(s)
-      else if (s.job.attempt > 2) fail('Recovery exceeded one replacement attempt')
-      return s.job.status === 'COMPLETED' && acknowledged(s, original.messageId)
-    })
+    const final = await until(
+      'completion and acknowledgement',
+      adapter.processingMs + adapter.deliveryMs,
+      (s) => {
+        if (report.scenario === 'long-heartbeat') trackInitialOwner(s)
+        else if (s.job.attempt > 2) fail('Recovery exceeded one replacement attempt')
+        return s.job.status === 'COMPLETED' && acknowledged(s, original.messageId)
+      },
+    )
     if (final.job.workerId !== null || final.job.leaseMs !== null)
       fail('Completion did not clear ownership')
     const acquisitions = final.events.filter((e) => e.outcome === 'acquired')

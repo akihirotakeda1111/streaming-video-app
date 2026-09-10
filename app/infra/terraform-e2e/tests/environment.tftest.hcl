@@ -16,9 +16,9 @@ override_module {
     api_local_execution      = { user_name = "api-user", policy_arn = "arn:aws:iam::123456789012:policy/api" }
     worker_local_execution   = { user_name = "worker-user", policy_arn = "arn:aws:iam::123456789012:policy/worker" }
     runtime_configuration = {
-      worker_heartbeat_interval_seconds   = 30
-      worker_visibility_extension_seconds = 120
-      worker_lease_duration_seconds       = 300
+      worker_heartbeat_interval_seconds   = 5
+      worker_visibility_extension_seconds = 30
+      worker_lease_duration_seconds       = 30
       worker_retry_delay_seconds          = 900
       worker_maximum_attempts             = 5
       video_encoding_queue_url            = "placeholder-not-to-be-exported"

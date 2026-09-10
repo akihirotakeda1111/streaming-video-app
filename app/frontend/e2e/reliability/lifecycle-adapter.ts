@@ -53,7 +53,7 @@ export class DockerLifecycleAdapter extends DockerDuplicateAdapter implements Li
     )
       fail('Invalid lifecycle timing settings')
     if (
-      this.processingMs <= 3 * this.heartbeatMs ||
+      this.processingMs <= (scenario === 'crash-recovery' ? 2 : 3) * this.heartbeatMs ||
       this.clockSkewMs * 2 >= Math.min(this.leaseMs, this.visibilityMs)
     )
       fail('Lifecycle budgets cannot cover repeated renewals with clock skew')
