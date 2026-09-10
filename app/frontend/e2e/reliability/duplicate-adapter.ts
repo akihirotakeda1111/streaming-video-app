@@ -339,10 +339,12 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
       !Array.isArray(rules) ||
       rules.some(
         (r: { Name: string; Value: string }) =>
+          !r ||
+          typeof r.Name !== 'string' ||
           typeof r.Value !== 'string' ||
-          (r.Name === 'prefix'
+          (r.Name.toLowerCase() === 'prefix'
             ? !target.sourceKey.startsWith(r.Value)
-            : r.Name === 'suffix'
+            : r.Name.toLowerCase() === 'suffix'
               ? !target.sourceKey.endsWith(r.Value)
               : true),
       )

@@ -59,6 +59,7 @@ function fixture() {
     sent: 0,
     objectKeys: [] as string[],
     invalidMetadata: false,
+    filterRules: [] as { Name: string; Value: string }[],
     raw: '',
   }
   const calls: { tool: string; args: string[]; input?: string }[] = []
@@ -114,7 +115,11 @@ function fixture() {
       if (args.includes('get-bucket-notification-configuration'))
         return JSON.stringify({
           QueueConfigurations: [
-            { QueueArn: boundary.sourceQueue, Events: ['s3:ObjectCreated:Put'] },
+            {
+              QueueArn: boundary.sourceQueue,
+              Events: ['s3:ObjectCreated:Put'],
+              Filter: { Key: { FilterRules: state.filterRules } },
+            },
           ],
         })
       if (args.includes('put-object')) {
@@ -243,6 +248,27 @@ describe('delivery log correlation', () => {
 })
 
 describe('dedicated duplicate service adapter', () => {
+  it.each(['prefix', 'Prefix', 'PREFIX'])(
+    'accepts notification filter names case-insensitively: %s',
+    async (name) => {
+      const f = fixture()
+      f.state.filterRules = [
+        { Name: name, Value: 'videos/' },
+        { Name: 'Suffix', Value: '/source.mp4' },
+      ]
+      await expect(f.adapter.prepare(f.target)).resolves.toBeUndefined()
+    },
+  )
+  it.each([
+    { Name: 'Prefix', Value: 'Videos/' },
+    { Name: 'Suffix', Value: '/other.mp4' },
+    { Name: 'Unknown', Value: 'videos/' },
+  ])('rejects mismatched or unknown filter %j before creating rows', async (rule) => {
+    const f = fixture()
+    f.state.filterRules = [rule]
+    await expect(f.adapter.prepare(f.target)).rejects.toThrow('notification filters')
+    expect(f.calls.some((c) => c.input?.includes('INSERT INTO'))).toBe(false)
+  })
   it.each(['matching', 'missing', 'extra', 'wrong-key', 'empty'])(
     'checks canonical expectations independently against %s S3 output',
     async (mode) => {
