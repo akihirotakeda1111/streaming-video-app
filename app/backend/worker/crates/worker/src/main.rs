@@ -12,7 +12,7 @@ use worker::{
 async fn shutdown_requested() -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         let mut terminate = signal(SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result,
@@ -34,7 +34,11 @@ async fn main() {
         .with_env_filter(filter)
         .json()
         .init();
-    info!(duplicate_observation_schema = 1, "worker observation capability");
+    info!(
+        duplicate_observation_schema = 1,
+        heartbeat_observation_schema = 1,
+        "worker observation capability"
+    );
 
     let config = match worker::Config::from_env() {
         Ok(config) => config,
@@ -144,9 +148,7 @@ mod tests {
         ));
         assert!(DOCKERFILE.contains("ENV FFMPEG_PATH=/usr/local/bin/ffmpeg"));
         assert!(DOCKERFILE.contains("TMPDIR=/tmp/video-worker"));
-        assert!(DOCKERFILE.contains(
-            "apt-get install -y --no-install-recommends ca-certificates"
-        ));
+        assert!(DOCKERFILE.contains("apt-get install -y --no-install-recommends ca-certificates"));
         assert!(DOCKERFILE.contains("/usr/local/bin/ffmpeg -version"));
         assert!(DOCKERFILE.contains("/usr/local/bin/ffprobe -version"));
         assert!(DOCKERFILE.contains("USER worker"));

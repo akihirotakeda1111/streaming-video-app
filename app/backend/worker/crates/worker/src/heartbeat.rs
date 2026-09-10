@@ -3,18 +3,18 @@
 use std::{
     fmt,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use persistence::{JobOperationOutcome, JobState, PersistenceError};
 use queue::{ChangeVisibility, QueueError};
 use tokio::{
-    sync::{Mutex, watch},
+    sync::{watch, Mutex},
     task::JoinHandle,
-    time::{Instant, MissedTickBehavior, interval_at, sleep_until},
+    time::{interval_at, sleep_until, Instant, MissedTickBehavior},
 };
 
 use crate::acquisition::AcquiredJob;
@@ -232,6 +232,12 @@ pub struct HeartbeatCoordinator<J, Q> {
     settings: HeartbeatSettings,
 }
 
+#[derive(Clone, Debug)]
+struct HeartbeatObservationContext {
+    message_id: String,
+    delivery_id: String,
+}
+
 impl<J, Q> HeartbeatCoordinator<J, Q> {
     pub fn new(jobs: Arc<Mutex<J>>, queue: Arc<Mutex<Q>>, settings: HeartbeatSettings) -> Self {
         Self {
@@ -277,11 +283,42 @@ where
     J: JobState + Send + 'static,
     Q: ChangeVisibility + Send + 'static,
 {
+    start_with_context(
+        jobs,
+        queue,
+        receipt_handle,
+        acquired,
+        settings,
+        initial_deadlines,
+        "unknown",
+        "unknown",
+    )
+}
+
+/// Starts a heartbeat with the allowlisted identity of one queue delivery.
+pub fn start_with_context<J, Q>(
+    jobs: Arc<Mutex<J>>,
+    queue: Arc<Mutex<Q>>,
+    receipt_handle: impl Into<String>,
+    acquired: Vec<AcquiredJob>,
+    settings: HeartbeatSettings,
+    initial_deadlines: HeartbeatDeadlines,
+    message_id: impl Into<String>,
+    delivery_id: impl Into<String>,
+) -> Option<HeartbeatHandle>
+where
+    J: JobState + Send + 'static,
+    Q: ChangeVisibility + Send + 'static,
+{
     if acquired.is_empty() {
         return None;
     }
 
     let receipt_handle = receipt_handle.into();
+    let observation = HeartbeatObservationContext {
+        message_id: message_id.into(),
+        delivery_id: delivery_id.into(),
+    };
     let (cancel, mut cancellation) = watch::channel(false);
     let (lost, ownership_lost) = watch::channel(
         Instant::now() >= initial_deadlines.lease || Instant::now() >= initial_deadlines.visibility,
@@ -311,6 +348,7 @@ where
             active: tracked,
             visibility: initial_deadlines.visibility,
         };
+        let mut heartbeat_cycle = 0_u64;
         loop {
             tokio::select! {
                 biased;
@@ -322,6 +360,7 @@ where
             }
 
             {
+                heartbeat_cycle += 1;
                 let tick = renew_tick(
                     jobs.clone(),
                     queue.clone(),
@@ -329,6 +368,8 @@ where
                     &acquired,
                     settings,
                     &mut deadlines,
+                    &observation,
+                    heartbeat_cycle,
                 );
                 tokio::pin!(tick);
                 tokio::select! {
@@ -359,6 +400,8 @@ async fn renew_tick<J, Q>(
     acquired: &[AcquiredJob],
     settings: HeartbeatSettings,
     deadlines: &mut OwnershipDeadlines,
+    observation: &HeartbeatObservationContext,
+    heartbeat_cycle: u64,
 ) -> Result<(), HeartbeatLoss>
 where
     J: JobState + Send + 'static,
@@ -369,26 +412,48 @@ where
             continue;
         }
         let started = Instant::now();
+        let mut called = false;
+        let mut request_started_at_unix_ms = 0_u64;
+        let mut response_observed_at_unix_ms = 0_u64;
+        let mut response_elapsed = Duration::ZERO;
         let outcome = before_deadline(deadlines, acquired, async {
             let mut jobs = jobs.lock().await;
             // The attempt retires under this same lock after its state update.
             if !deadlines.active[index].load(Ordering::SeqCst) {
                 return Ok(JobOperationOutcome::Applied);
             }
-            jobs.renew_lease(
-                &job.item.job_id,
-                &job.item.video_id,
-                job.worker_id.as_str(),
-                settings.lease_duration.as_secs(),
-            )
-            .await
-            .map_err(HeartbeatLoss::Database)
+            called = true;
+            let request_started = Instant::now();
+            request_started_at_unix_ms = unix_ms();
+            let result = jobs
+                .renew_lease(
+                    &job.item.job_id,
+                    &job.item.video_id,
+                    job.worker_id.as_str(),
+                    settings.lease_duration.as_secs(),
+                )
+                .await;
+            response_elapsed = request_started.elapsed();
+            response_observed_at_unix_ms = unix_ms();
+            result.map_err(HeartbeatLoss::Database)
         })
         .await?;
         if outcome != JobOperationOutcome::Applied {
             return Err(HeartbeatLoss::LeaseLost {
                 job_id: job.item.job_id.clone(),
             });
+        }
+        if called {
+            log_heartbeat_success(
+                "lease_renewal",
+                observation,
+                heartbeat_cycle,
+                job,
+                settings.lease_duration,
+                request_started_at_unix_ms,
+                response_observed_at_unix_ms,
+                response_elapsed,
+            );
         }
         // Start the budget before the request, never at response completion.
         // If a duration cannot be represented, retain the earlier safe deadline.
@@ -398,19 +463,79 @@ where
     }
 
     let started = Instant::now();
+    let mut called = false;
+    let mut request_started_at_unix_ms = 0_u64;
+    let mut response_observed_at_unix_ms = 0_u64;
+    let mut response_elapsed = Duration::ZERO;
     before_deadline(deadlines, acquired, async {
-        queue
-            .lock()
-            .await
+        let mut queue = queue.lock().await;
+        called = true;
+        let request_started = Instant::now();
+        request_started_at_unix_ms = unix_ms();
+        let result = queue
             .change_visibility(receipt_handle, settings.visibility_extension)
-            .await
-            .map_err(HeartbeatLoss::Visibility)
+            .await;
+        response_elapsed = request_started.elapsed();
+        response_observed_at_unix_ms = unix_ms();
+        result.map_err(HeartbeatLoss::Visibility)
     })
     .await?;
+    if called {
+        // Unix timestamps are local wall-clock observations in milliseconds;
+        // elapsed_ms is monotonic request timing. Neither is a database lease
+        // expiry or an authoritative SQS visibility expiry.
+        tracing::info!(
+            operation = "visibility_extension",
+            outcome = "success",
+            message_id = %observation.message_id,
+            delivery_id = %observation.delivery_id,
+            heartbeat_cycle,
+            duration_seconds = settings.visibility_extension.as_secs(),
+            request_started_at_unix_ms,
+            response_observed_at_unix_ms,
+            elapsed_ms = response_elapsed.as_millis() as u64,
+            "worker heartbeat observation",
+        );
+    }
     deadlines.visibility = started
         .checked_add(settings.visibility_extension)
         .unwrap_or(deadlines.visibility);
     Ok(())
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn log_heartbeat_success(
+    operation: &'static str,
+    observation: &HeartbeatObservationContext,
+    heartbeat_cycle: u64,
+    job: &AcquiredJob,
+    duration: Duration,
+    request_started_at_unix_ms: u64,
+    response_observed_at_unix_ms: u64,
+    elapsed: Duration,
+) {
+    tracing::info!(
+        operation,
+        outcome = "success",
+        message_id = %observation.message_id,
+        delivery_id = %observation.delivery_id,
+        heartbeat_cycle,
+        video_id = %job.item.video_id,
+        job_id = %job.item.job_id,
+        worker_id = %job.worker_id.as_str(),
+        attempt = job.attempt,
+        duration_seconds = duration.as_secs(),
+        request_started_at_unix_ms,
+        response_observed_at_unix_ms,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "worker heartbeat observation",
+    );
 }
 
 #[cfg(test)]
@@ -421,8 +546,8 @@ mod tests {
         collections::VecDeque,
         future::pending,
         sync::{
-            Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
+            Mutex as StdMutex,
         },
         time::SystemTime,
     };
