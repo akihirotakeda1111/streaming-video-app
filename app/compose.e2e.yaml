@@ -12,6 +12,8 @@ services:
       com.streaming-video.e2e.scope: ${COMPOSE_PROJECT_NAME}
 
   worker:
+    # Let lifecycle tests control crash recovery and restart timing.
+    restart: "no"
     labels:
       com.streaming-video.e2e.disposable: "true"
       com.streaming-video.e2e.role: worker
