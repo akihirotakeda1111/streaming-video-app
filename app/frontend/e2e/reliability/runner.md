@@ -366,10 +366,60 @@ Slow test警告だけでは失敗ではない。`unverified` / `retained` の場
 
 ### クラッシュ復旧・長時間heartbeatの追加条件
 
-E2E専用Terraformの設定はheartbeat 5秒、source visibility・Worker visibility延長・lease各30秒。
-既存環境には自動反映されない。テスト終了後、専用Terraformのplanを確認して手動applyし、
-`compose_environment` を再読込してWorkerを再作成、E2E設定を再生成・再読込する。
-通常環境の設定は変更しない。復旧後の完了・ack検証は維持する。
+E2E専用Terraformの `timing_profile` で時間設定を選択する。既定は `standard`。
+
+| プロファイル | heartbeat | source visibility / Worker延長 | lease | 用途 |
+| --- | --- | --- | --- | --- |
+| `standard` | 30秒 | 120秒 | 300秒 | 重複配送など通常のE2E |
+| `lifecycle` | 5秒 | 30秒 | 30秒 | 復旧・heartbeat検証の待ち時間短縮 |
+
+**設定はその専用環境全体に適用される。シナリオ選択による自動切り替え・自動復元は行わない。**
+同時に別シナリオを実行しない。並行実行が必要なら別instance・別state・別Composeプロジェクトを用意する。
+
+<details>
+<summary>短い時間設定への切り替え・元に戻す手順（Windows・WSL共通）</summary>
+
+実行中のテスト・jobと保持リソースを確認し、切り替えてよい状態にしてWorkerを停止する。
+AWS認証は構築用プロファイルを使用する。
+
+```text
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml stop worker
+terraform -chdir=app/infra/terraform-e2e plan -var="timing_profile=lifecycle" -out=lifecycle.tfplan
+```
+
+対象が専用環境であることをplanで確認して適用する。
+
+```text
+terraform -chdir=app/infra/terraform-e2e apply lifecycle.tfplan
+```
+
+`compose_environment` を再読込し、Worker用認証を設定した同じシェルで再作成する。
+
+```text
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up -d --no-deps --force-recreate worker
+```
+
+ホスト認証をrunner用に戻し、E2E設定を再生成・再読込して事前確認と対象シナリオを実行する。
+CLIの `-var` は次回のplanには引き継がれない。継続利用する専用環境なら実値tfvarsで明示する。
+
+他のE2Eへ戻す前に同じ停止・確認手順を行い、以下で標準設定へ戻す。
+
+```text
+terraform -chdir=app/infra/terraform-e2e plan -var="timing_profile=standard" -out=standard.tfplan
+```
+
+planを確認後に適用する。
+
+```text
+terraform -chdir=app/infra/terraform-e2e apply standard.tfplan
+```
+
+戻す場合もCompose出力再読込・Worker再作成・E2E設定再生成が必要。tfvarsで変更した場合も `standard` に戻す。
+以前の一律短縮設定を適用済みの環境にも、この標準設定への復元手順を使用する。
+通常環境のTerraformと復旧後の完了・ack検証は変更しない。
+
+</details>
+
 タイムアウトは `encode readiness`（開始・更新待ち）、`lease and visibility expiry`（期限切れ待ち）、
 `completion and acknowledgement`（完了・ack待ち）と待機予算を表示する。
 

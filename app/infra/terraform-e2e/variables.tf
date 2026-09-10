@@ -30,3 +30,14 @@ variable "frontend_origin" {
   type    = string
   default = "http://localhost:5173"
 }
+
+variable "timing_profile" {
+  type        = string
+  description = "Timing preset for this entire dedicated environment: standard, or lifecycle for crash/heartbeat tests."
+  default     = "standard"
+  nullable    = false
+  validation {
+    condition     = contains(["standard", "lifecycle"], var.timing_profile)
+    error_message = "timing_profile must be standard or lifecycle."
+  }
+}
