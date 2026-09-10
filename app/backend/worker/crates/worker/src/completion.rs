@@ -7,7 +7,7 @@ use persistence::JobState;
 use queue::{ChangeVisibility, Delete, Message};
 use storage::{Read, Write};
 use tokio::{
-    sync::{Mutex, watch},
+    sync::{watch, Mutex},
     time::Instant,
 };
 use tracing::Instrument;
@@ -18,7 +18,7 @@ use crate::{
     },
     heartbeat::{HeartbeatDeadlines, HeartbeatSettings},
     retry::{OwnedAttemptProcessor, ProcessingOutcome, RetrySettings},
-    runtime::{MessageProcessor, cancellation_requested},
+    runtime::{cancellation_requested, MessageProcessor},
 };
 
 /// Coordinates all records in one queue message. A message is acknowledged
@@ -138,7 +138,9 @@ where
             message_id = message.message_id.as_deref().unwrap_or("unknown"),
             delivery_id = %message.delivery_id,
         );
-        self.process_delivery(message, shutdown).instrument(delivery).await
+        self.process_delivery(message, shutdown)
+            .instrument(delivery)
+            .await
     }
 }
 
@@ -211,13 +213,15 @@ where
                 _ => None,
             })
             .collect();
-        let heartbeat = crate::heartbeat::start(
+        let heartbeat = crate::heartbeat::start_with_context(
             self.heartbeat_jobs.clone(),
             self.queue.clone(),
             message.receipt_handle.clone(),
             acquired,
             self.heartbeat,
             HeartbeatDeadlines { lease, visibility },
+            message.message_id.as_deref().unwrap_or("unknown"),
+            message.delivery_id.clone(),
         );
 
         let mut acknowledge = true;
@@ -744,12 +748,11 @@ mod tests {
             || c.starts_with("release:")
             || c.starts_with("fail:")));
         assert_eq!(calls.iter().filter(|c| *c == "encode").count(), 1);
-        assert!(
-            !f.log
-                .calls()
-                .iter()
-                .any(|c| matches!(c, crate::fakes::Call::Write { .. }))
-        );
+        assert!(!f
+            .log
+            .calls()
+            .iter()
+            .any(|c| matches!(c, crate::fakes::Call::Write { .. })));
         assert_eq!(queue_log.calls().len(), 1);
         assert!(std::fs::read_dir(f._root.path()).unwrap().next().is_none());
         assert!(f.processor.heartbeat_jobs.try_lock().is_ok());
@@ -900,6 +903,60 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_logging_preserves_completion_attempts_and_acknowledgement() {
+        use crate::heartbeat::observation_test_support::Capture;
+        for failure in ["none", "lease", "visibility", "processing"] {
+            let mut baseline = None;
+            for enabled in [true, false] {
+                let (capture, _guard) = Capture::install(enabled);
+                let f = Fixture::new(Duration::from_millis(65), failure == "processing");
+                {
+                    let mut state = f.state.lock().unwrap();
+                    state.attempt = 3;
+                    state.renewal_failure = failure == "lease";
+                    state.visibility_failure = failure == "visibility";
+                }
+                f.run(&[FIRST]).await;
+                assert_eq!(
+                    f.state.lock().unwrap().acquired_attempts.get(FIRST),
+                    Some(&3)
+                );
+                let calls = f.state.lock().unwrap().calls.clone();
+                assert_eq!(calls.iter().any(|call| call == "delete"), failure == "none");
+                assert_eq!(
+                    calls.iter().any(|call| call.starts_with("complete:")),
+                    failure == "none"
+                );
+                assert_eq!(
+                    calls.iter().any(|call| call.starts_with("release:")),
+                    failure == "processing"
+                );
+                if let Some(expected) = &baseline {
+                    assert_eq!(&calls, expected, "{failure}");
+                } else {
+                    baseline = Some(calls.clone());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(f.state.lock().unwrap().calls, calls);
+                let events = capture.heartbeats();
+                if enabled && failure == "none" {
+                    assert!(!events.is_empty());
+                    for event in &events {
+                        assert_eq!(event["message_id"], "message-test");
+                        assert_eq!(event["delivery_id"], "delivery-test");
+                        if event["operation"] == "lease_renewal" {
+                            assert_eq!(event["attempt"], 3);
+                        }
+                    }
+                }
+                if !enabled {
+                    assert!(capture.events().is_empty());
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn encoder_panic_keeps_the_whole_message_and_stops_heartbeat() {
         let f = Fixture::new(Duration::from_millis(60), false);
@@ -912,12 +969,11 @@ mod tests {
             || c.starts_with("complete:")
             || c.starts_with("fail:")
             || c.starts_with("release:")));
-        assert!(
-            !f.log
-                .calls()
-                .iter()
-                .any(|c| matches!(c, crate::fakes::Call::Write { .. }))
-        );
+        assert!(!f
+            .log
+            .calls()
+            .iter()
+            .any(|c| matches!(c, crate::fakes::Call::Write { .. })));
         assert!(std::fs::read_dir(f._root.path()).unwrap().next().is_none());
         assert!(f.processor.heartbeat_jobs.try_lock().is_ok());
         assert!(f.processor.queue.try_lock().is_ok());
@@ -973,7 +1029,11 @@ mod tests {
                 let transition = format!(
                     "{}:{FIRST}",
                     if first_fails {
-                        if attempt == 5 { "fail" } else { "release" }
+                        if attempt == 5 {
+                            "fail"
+                        } else {
+                            "release"
+                        }
                     } else {
                         "complete"
                     }
@@ -1002,20 +1062,18 @@ mod tests {
                 s.visibility_failure = visibility;
             }
             f.run(&[FIRST]).await;
-            assert!(
-                !f.log
-                    .calls()
-                    .iter()
-                    .any(|c| matches!(c, crate::fakes::Call::Write { .. }))
-            );
-            assert!(
-                !f.state
-                    .lock()
-                    .unwrap()
-                    .calls
-                    .iter()
-                    .any(|c| c == "delete" || c.starts_with("complete:"))
-            );
+            assert!(!f
+                .log
+                .calls()
+                .iter()
+                .any(|c| matches!(c, crate::fakes::Call::Write { .. })));
+            assert!(!f
+                .state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|c| c == "delete" || c.starts_with("complete:")));
         }
     }
     #[tokio::test]
