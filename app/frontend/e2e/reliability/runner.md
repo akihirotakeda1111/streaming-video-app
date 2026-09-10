@@ -27,7 +27,8 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | `preflight` | ローカル・ブラウザ・APIの準備確認 | 実装済み。API/Frontendとブラウザが必要 |
 | `runtime-authorization` | Reliability共通実行境界の確認 | 実装済み |
 | `duplicate-delivery` | 処理中と完了後の重複配送、単一の有効処理、ack、cleanup | 実装済み。ブラウザ/APIを操作しない |
-| 未登録 | Worker停止・再開、長時間heartbeat | 追加予定。実行可能なセレクターは未登録 |
+| `crash-recovery` | 取得後・永続完了前のWorker停止、可視性とDB lease expiry後の再取得 | 実装済み。停止対象は共通事前確認済みの同一Workerのみ |
+| `long-heartbeat` | 複数heartbeat周期の可視性延長・lease更新、単一owner維持 | 実装済み。短すぎるfixtureは成功扱いにしない |
 | 未登録 | 不正メディア、試行上限、DLQ隔離・アラーム | 追加予定。実行可能なセレクターは未登録 |
 | 未登録 | Reliabilityシナリオ後のブラウザ再生回帰 | 追加予定。既存ブラウザテストとは別に拡張 |
 
@@ -171,6 +172,7 @@ docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yam
 ```
 
 この起動ではWorkerと依存するDB・migrationだけが対象。API/Frontendが必要なシナリオでは追加起動し、公開ポート・URL・CORSも準備する。
+Workerの再起動ポリシーは専用overrideで `no` にする。通常の `app/compose.yaml` 単独では `unless-stopped` を維持する。
 `start-e2e-compose.sh` は通常Compose全体を起動するため、専用overrideの代用にはしない。
 DB名は `streaming-video-e2e-postgres`、volume名は `streaming-video-e2e-postgres-data`。DBホスト公開ポートは除去される。
 `-p` を変えると名前・scopeも変わる。全操作で同じプロジェクト名と2ファイルを指定する。
@@ -342,6 +344,8 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 
 ```text
 python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery
+python app/scripts/run_reliability_e2e.py --scenario crash-recovery
+python app/scripts/run_reliability_e2e.py --scenario long-heartbeat
 ```
 
 `duplicate-delivery` は実行対象に置き換える。選択肢は次で確認できる。
@@ -356,7 +360,119 @@ python app/scripts/run_reliability_e2e.py --list
 
 終了コード0とテストの `passed` を確認し、表示された `evidenceDirectory` 内のシナリオ証跡を開く。
 重複配送では `duplicate-delivery-evidence.json` の **`status=passed`、`cleanup=complete`** が成功条件。
+クラッシュ復旧・長時間heartbeatは、それぞれ `crash-recovery-evidence.json` / `long-heartbeat-evidence.json` の
+`status=passed`、`cleanup=complete` を確認する。クラッシュ復旧では `restoration=complete` も必要。
 Slow test警告だけでは失敗ではない。`unverified` / `retained` の場合は下の診断を確認してから再実行する。
+
+### クラッシュ復旧・長時間heartbeatの追加条件
+
+E2E専用Terraformの `timing_profile` で時間設定を選択する。既定は `standard`。
+
+| プロファイル | heartbeat | source visibility / Worker延長 | lease | 用途 |
+| --- | --- | --- | --- | --- |
+| `standard` | 30秒 | 120秒 | 300秒 | 重複配送など通常のE2E |
+| `lifecycle` | 5秒 | 30秒 | 30秒 | 復旧・heartbeat検証の待ち時間短縮 |
+
+**設定はその専用環境全体に適用される。シナリオ選択による自動切り替え・自動復元は行わない。**
+同時に別シナリオを実行しない。並行実行が必要なら別instance・別state・別Composeプロジェクトを用意する。
+
+<details>
+<summary>短い時間設定への切り替え・元に戻す手順（Windows・WSL共通）</summary>
+
+実行中のテスト・jobと保持リソースを確認し、切り替えてよい状態にしてWorkerを停止する。
+AWS認証は構築用プロファイルを使用する。
+
+```text
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml stop worker
+terraform -chdir=app/infra/terraform-e2e plan -var="timing_profile=lifecycle" -out=lifecycle.tfplan
+```
+
+対象が専用環境であることをplanで確認して適用する。
+
+```text
+terraform -chdir=app/infra/terraform-e2e apply lifecycle.tfplan
+```
+
+`compose_environment` を再読込し、Worker用認証を設定した同じシェルで再作成する。
+
+```text
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up -d --no-deps --force-recreate worker
+```
+
+ホスト認証をrunner用に戻し、E2E設定を再生成・再読込して事前確認と対象シナリオを実行する。
+CLIの `-var` は次回のplanには引き継がれない。継続利用する専用環境なら実値tfvarsで明示する。
+
+他のE2Eへ戻す前に同じ停止・確認手順を行い、以下で標準設定へ戻す。
+
+```text
+terraform -chdir=app/infra/terraform-e2e plan -var="timing_profile=standard" -out=standard.tfplan
+```
+
+planを確認後に適用する。
+
+```text
+terraform -chdir=app/infra/terraform-e2e apply standard.tfplan
+```
+
+戻す場合もCompose出力再読込・Worker再作成・E2E設定再生成が必要。tfvarsで変更した場合も `standard` に戻す。
+以前の一律短縮設定を適用済みの環境にも、この標準設定への復元手順を使用する。
+通常環境のTerraformと復旧後の完了・ack検証は変更しない。
+
+</details>
+
+タイムアウトは `encode readiness`（開始・更新待ち）、`lease and visibility expiry`（期限切れ待ち）、
+`completion and acknowledgement`（完了・ack待ち）と待機予算を表示する。
+
+両シナリオは上記の共通事前確認と同じ専用Worker/DB/S3/SQSを使用する。
+`E2E_DUPLICATE_EXCLUSIVE=true` と `E2E_DUPLICATE_FIXTURE` の絶対MP4パスも共通で使用する。
+クラッシュ復旧はencode中に1回のheartbeat成功とDB leaseの前進を確認して停止する。
+長時間heartbeatは2回以上の更新を観測できるfixtureを使う。容量ではなく実際の処理時間で判断する。
+短いfixture、観測不足、失敗イベントは `unverified` となり、skipや成功にはしない。
+
+- Workerには `heartbeat_observation_schema=1` と `duplicate_observation_schema=1` が必要。
+- `E2E_CLOCK_SKEW_MS` を1〜5000の整数で明示する。実行ホスト・Worker・DBの時計ずれの上限であり、
+  時刻同期を確認した上で設定する。DB時計は各観測の要求〜応答区間とこの許容幅で照合する。
+  heartbeat要求・応答の時刻差と単調時計によるelapsedも照合する。
+- `E2E_PROCESSING_TIMEOUT_MS` はクラッシュ復旧ではheartbeat間隔の2倍、長時間heartbeatでは3倍より大きくする。
+  時計ずれの許容幅の2倍はlease/visibility期間より小さい必要がある。
+- クラッシュ復旧には残り試行回数が必要で、`E2E_MAX_ATTEMPTS >= 2` とする。
+  Workerは保持される専用コンテナーで、restart policyが `no` であることが必要。
+  設定が合わなければ停止せずに失敗する。シナリオ自身はrestart policyを変更しない。
+
+```text
+# 共通設定に加えて、確認した時計ずれ上限を設定する例
+E2E_CLOCK_SKEW_MS=100
+
+python app/scripts/run_reliability_e2e.py --scenario crash-recovery
+python app/scripts/run_reliability_e2e.py --scenario long-heartbeat
+```
+
+クラッシュ復旧はencode開始・1回のheartbeat成功・DB lease更新を確認後、共通事前確認済みのWorkerを
+`docker container stop --signal SIGKILL --timeout 0` で停止する。DBは停止しない。
+停止後のDB lease値とDB時計、最後のvisibility延長を記録し、安全な再開時刻を計算する。
+停止直前の未記録の更新も考慮して、停止観測時刻＋`E2E_VISIBILITY_TIMEOUT_MS` をvisibilityの保守的な上限に含める。
+これはSQSが返した実際の失効時刻ではない。DB上のlease失効とローカルの再開期限の両方を待ち、
+同じコンテナーをstartする。新しい通知を送らず、元message IDの別delivery ID・別owner・attempt 2での再取得を確認する。
+停止中の完了や所有権変更、期限より早い再取得は失敗とする。
+
+長時間heartbeatでは実Workerを止めず、`lease_renewal` と `visibility_extension` の成功を
+message/delivery/cycleで対応付け、両方そろった周期だけを数える。lease側はjob/video/worker/attemptも照合する。
+要求時刻＋期間−時計ずれから得る期限は保守的な下限であり、DB/SQSの確定したexpiryとして扱わない。
+両期限の前進、DB leaseの前進、単一owner/attempt、最終完了までの失敗不在を検証する。
+正常終了直前のキャンセルでも周期の片側しか観測できなければ、現在は保守的に `unverified` とする。
+
+両シナリオとも正規sourceのdownloadからencodeを経て、segment→manifest→COMPLETED→ackの証拠を確認し、
+期待する決定的な出力キーとS3の実際の一覧・metadataを照合する。
+待機はPROCESSING、VISIBILITY、LEASE、NAVIGATIONの設定値から制限し、観測履歴は4000件まで。
+外部コマンド・相関ログ・出力検証・cleanupの上限は重複配送シナリオと共通。
+
+停止後に失敗した場合も同じWorkerを復元してからrun専用の後始末を行う。
+別の起動時刻・Engine・scopeやDB再起動を検出した場合は操作を継続しない。
+復元失敗時は `restoration=failed, cleanup=retained` とし、証跡に記録された同一コンテナーの状態を
+手動確認する。処理中・ack未確認・不明な更新結果ではデータを保持し、queue全体のpurgeやDLQ replayは行わない。
+
+オフライン検証だけではライブ検証完了とはしない。マージ前に使い捨て環境で両コマンドを実行し、
+上記成功条件を満たす証跡を別途保存する必要がある。
 
 <details>
 <summary>シナリオの検証内容・証跡の詳細</summary>
@@ -481,5 +597,18 @@ cargo test --manifest-path app/backend/worker/Cargo.toml <テスト名>
 | 完了後の削除失敗 | `delete_failure_redelivery_only_retries_acknowledgement`。COMPLETED維持・再encodeなし・削除のみ再試行 |
 
 コンポーネントテスト成功は実環境シナリオの代用ではない。
+
+</details>
+
+<details>
+<summary>DB時計の許容差エラー</summary>
+
+`Database clock is outside the configured skew bound` はエラー本文と証跡の `clockDiagnostic` で確認する。
+値はミリ秒。`dbNowMs` はDB時刻、`localBeforeMs` / `localAfterMs` は照会前後の実行側時刻、
+`allowedSkewMs` は設定した許容差、`observationElapsedMs` は照会前後の時間差。
+`cause=db_behind` / `db_ahead` の `excessMs` は許容範囲からの超過量。
+`local_clock_reversed` は実行側の時計が逆行したことを示し、`excessMs` は逆行量。
+この診断は時計差の観測であり、OS時刻同期やスリープ復帰などの根本原因を断定しない。
+照会時間が長いだけでは失敗しない。許容差を増やす前に数値と実行環境の時計を確認する。
 
 </details>

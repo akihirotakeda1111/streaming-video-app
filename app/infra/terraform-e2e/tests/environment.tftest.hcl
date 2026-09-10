@@ -67,3 +67,30 @@ run "invalid_instance" {
   }
   expect_failures = [var.instance]
 }
+
+run "default_timing" {
+  command = plan
+  assert {
+    condition     = var.timing_profile == "standard" && local.timing.heartbeat == 30 && local.timing.visibility == 120 && local.timing.lease == 300
+    error_message = "Default timings must preserve other reliability scenarios."
+  }
+}
+
+run "lifecycle_timing" {
+  command = plan
+  variables {
+    timing_profile = "lifecycle"
+  }
+  assert {
+    condition     = local.timing.heartbeat == 5 && local.timing.visibility == 30 && local.timing.lease == 30
+    error_message = "Lifecycle timings must be explicitly selected and coherent."
+  }
+}
+
+run "invalid_timing" {
+  command = plan
+  variables {
+    timing_profile = "unknown"
+  }
+  expect_failures = [var.timing_profile]
+}

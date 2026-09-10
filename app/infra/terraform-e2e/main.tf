@@ -21,6 +21,12 @@ provider "aws" {
 }
 
 locals {
+  timing_profiles = {
+    standard  = { heartbeat = 30, visibility = 120, lease = 300 }
+    lifecycle = { heartbeat = 5, visibility = 30, lease = 30 }
+  }
+  timing = local.timing_profiles[var.timing_profile]
+
   prefix = "streaming-video-e2e-${var.instance}"
   tags = {
     Environment = "e2e"
@@ -42,10 +48,10 @@ module "foundation" {
   video_output_bucket = "${local.prefix}-${var.aws_account_id}-${var.aws_region}-output"
   frontend_origin     = var.frontend_origin
 
-  source_visibility_timeout_seconds   = 120
-  worker_heartbeat_interval_seconds   = 30
-  worker_visibility_extension_seconds = 120
-  worker_lease_duration_seconds       = 300
+  source_visibility_timeout_seconds   = local.timing.visibility
+  worker_heartbeat_interval_seconds   = local.timing.heartbeat
+  worker_visibility_extension_seconds = local.timing.visibility
+  worker_lease_duration_seconds       = local.timing.lease
   worker_retry_delay_seconds          = 900
   worker_maximum_attempts             = 5
   queue_max_receive_count             = 5
