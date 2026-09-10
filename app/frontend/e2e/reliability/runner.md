@@ -27,7 +27,8 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | `preflight` | ローカル・ブラウザ・APIの準備確認 | 実装済み。API/Frontendとブラウザが必要 |
 | `runtime-authorization` | Reliability共通実行境界の確認 | 実装済み |
 | `duplicate-delivery` | 処理中と完了後の重複配送、単一の有効処理、ack、cleanup | 実装済み。ブラウザ/APIを操作しない |
-| 未登録 | Worker停止・再開、長時間heartbeat | 追加予定。実行可能なセレクターは未登録 |
+| `crash-recovery` | 取得後・永続完了前のWorker停止、可視性とDB lease expiry後の再取得 | 実装済み。停止対象は共通事前確認済みの同一Workerのみ |
+| `long-heartbeat` | 複数heartbeat周期の可視性延長・lease更新、単一owner維持 | 実装済み。短すぎるfixtureは成功扱いにしない |
 | 未登録 | 不正メディア、試行上限、DLQ隔離・アラーム | 追加予定。実行可能なセレクターは未登録 |
 | 未登録 | Reliabilityシナリオ後のブラウザ再生回帰 | 追加予定。既存ブラウザテストとは別に拡張 |
 
@@ -342,6 +343,8 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 
 ```text
 python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery
+python app/scripts/run_reliability_e2e.py --scenario crash-recovery
+python app/scripts/run_reliability_e2e.py --scenario long-heartbeat
 ```
 
 `duplicate-delivery` は実行対象に置き換える。選択肢は次で確認できる。

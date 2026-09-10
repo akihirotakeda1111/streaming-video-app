@@ -17,6 +17,8 @@ SCENARIOS = {
     "preflight": ("@preflight", "local/browser/API readiness"),
     "runtime-authorization": ("@reliability", "reliability authorization"),
     "duplicate-delivery": ("@duplicate-delivery", "active and completed redelivery with correlated media and acknowledgement evidence"),
+    "crash-recovery": ("@crash-recovery", "worker crash recovery after lease and visibility expiry"),
+    "long-heartbeat": ("@long-heartbeat", "multiple correlated heartbeat lease and visibility renewals"),
 }
 TOOLS = ("node", "npm", "npx", "ffmpeg", "aws", "docker")
 SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"
@@ -104,10 +106,10 @@ def _run(config: LiveConfig) -> int:
         raise ValueError("required local tool missing: node")
     cli = SAFETY_CLI.parents[2] / "node_modules/@playwright/test/cli.js"
     args = [node, str(cli), "test", "--grep", grep]
-    if config.scenario in ("runtime-authorization", "duplicate-delivery"):
+    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat"):
         args.extend(["--project", "reliability"])
     child_environment = os.environ.copy()
-    if config.scenario in ("runtime-authorization", "duplicate-delivery"):
+    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat"):
         child_environment["E2E_INCLUDE_RELIABILITY"] = "true"
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
