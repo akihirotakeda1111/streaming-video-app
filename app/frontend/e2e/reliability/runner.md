@@ -29,10 +29,17 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | `duplicate-delivery` | 処理中と完了後の重複配送、単一の有効処理、ack、cleanup | 実装済み。ブラウザ/APIを操作しない |
 | `crash-recovery` | 取得後・永続完了前のWorker停止、可視性とDB lease expiry後の再取得 | 実装済み。停止対象は共通事前確認済みの同一Workerのみ |
 | `long-heartbeat` | 複数heartbeat周期の可視性延長・lease更新、単一owner維持 | 実装済み。短すぎるfixtureは成功扱いにしない |
-| 未登録 | 不正メディア、試行上限、DLQ隔離・アラーム | 追加予定。実行可能なセレクターは未登録 |
+| `ffmpeg-exhaustion` | 不正メディアの実FFmpeg失敗、試行上限、FAILED、manifest非公開、run-owned DLQ隔離 | 実装済み。`--scenario ffmpeg-exhaustion` |
 | 未登録 | Reliabilityシナリオ後のブラウザ再生回帰 | 追加予定。既存ブラウザテストとは別に拡張 |
 
 最新の実装済みセレクターは `--list` で確認する。実環境の受け入れは対象環境で成功した証跡をレビューして判断する。
+
+FFmpeg exhaustion observes the DLQ with `ReceiveMessage` only to correlate the
+run-owned body and canonical IDs. Receiving temporarily changes message
+visibility, so this helper is allowed only inside the gated disposable run.
+It never replays or deletes messages, and it must not delete unrelated messages;
+receipt handles are excluded from evidence. Queue metrics and alarm state are
+reserved for the later queue-observation scenario.
 シナリオ追加時はこの表と、以下の「シナリオ別の追加条件」「実行」「証跡・復旧」を追記する。
 各シナリオは直接Playwrightで選択されても操作前に共通事前確認を呼び、別テストの成功を認可の代用にしない。
 停止を伴うシナリオでは直前にEngine ID・完全なコンテナID・開始時刻を再照合し、同じコンテナを保持して復旧する。

@@ -89,6 +89,7 @@ class RunnerChecks(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("runtime-authorization", output)
         self.assertIn("duplicate-delivery", output)
+        self.assertIn("ffmpeg-exhaustion", output)
         self.assertIn("active and completed redelivery", output)
         self.assertEqual(calls, [])
         with self.assertRaises(SystemExit) as error:
@@ -130,7 +131,7 @@ class RunnerChecks(unittest.TestCase):
 
     def test_duplicate_dispatch_and_failure_propagation(self):
         """Dispatch only the dedicated tag/project and preserve the scenario exit."""
-        for scenario, returncode in ((scenario, code) for scenario in ("duplicate-delivery", "crash-recovery", "long-heartbeat") for code in (0, 1)):
+        for scenario, returncode in ((scenario, code) for scenario in ("duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion") for code in (0, 1)):
             with self.subTest(scenario=scenario, returncode=returncode), tempfile.TemporaryDirectory() as root:
                 destination = Path(root) / "e2e-test"
                 config = MODULE["LiveConfig"](destination, scenario)
