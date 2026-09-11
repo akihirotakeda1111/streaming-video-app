@@ -20,6 +20,7 @@ SCENARIOS = {
     "crash-recovery": ("@crash-recovery", "worker crash recovery after lease and visibility expiry"),
     "long-heartbeat": ("@long-heartbeat", "multiple correlated heartbeat lease and visibility renewals"),
     "ffmpeg-exhaustion": ("@ffmpeg-exhaustion", "invalid media FFmpeg exhaustion and run-owned DLQ isolation"),
+    "poison-isolation": ("@poison-isolation", "malformed and unknown-job poison DLQ isolation with a concurrently valid job"),
 }
 TOOLS = ("node", "npm", "npx", "ffmpeg", "aws", "docker")
 SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"
@@ -107,10 +108,10 @@ def _run(config: LiveConfig) -> int:
         raise ValueError("required local tool missing: node")
     cli = SAFETY_CLI.parents[2] / "node_modules/@playwright/test/cli.js"
     args = [node, str(cli), "test", "--grep", grep]
-    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion"):
+    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion", "poison-isolation"):
         args.extend(["--project", "reliability"])
     child_environment = os.environ.copy()
-    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion"):
+    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion", "poison-isolation"):
         child_environment["E2E_INCLUDE_RELIABILITY"] = "true"
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)

@@ -30,6 +30,7 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | `crash-recovery` | 取得後・永続完了前のWorker停止、可視性とDB lease expiry後の再取得 | 実装済み。停止対象は共通事前確認済みの同一Workerのみ |
 | `long-heartbeat` | 複数heartbeat周期の可視性延長・lease更新、単一owner維持 | 実装済み。短すぎるfixtureは成功扱いにしない |
 | `ffmpeg-exhaustion` | 不正メディアの実FFmpeg失敗、試行上限、FAILED、manifest非公開、run-owned DLQ隔離 | 実装済み。`--scenario ffmpeg-exhaustion` |
+| `poison-isolation` | malformed/unknown-job poison のDLQ隔離と、同時実行する正常jobの完了 | 実装済み。`--scenario poison-isolation` |
 | 未登録 | Reliabilityシナリオ後のブラウザ再生回帰 | 追加予定。既存ブラウザテストとは別に拡張 |
 
 最新の実装済みセレクターは `--list` で確認する。実環境の受け入れは対象環境で成功した証跡をレビューして判断する。
@@ -326,6 +327,8 @@ FFmpegシナリオでは `E2E_FFMPEG_INVALID_FIXTURE` に非空の不正MP4フ�
 同一Workerのログ出現順でイベント順序を検証し、UTC時刻の単調増加は要求しない。UTCは証跡に残す。待機期限は単調増加時計を使い、ホストの時計補正に影響されない。相関エラーには対象attemptと期待順序を記録する。
 途中失敗時の証跡にはtarget ID、収集済みsnapshot、開始状態、失敗段階と秘匿化した理由を残す。
 成功時はrun所有のDB/source/outputのみcleanupし、DLQメッセージは削除せず手動cleanup用に残す。
+`poison-isolation` は malformed と unknown-job の実メッセージをDLQで相関する。DLQの受信は一時的にvisibilityを変更するため、明示的に認可されたdisposable runの中だけで bounded に行う。受信結果を自動replayせず、今回のrunが作成した対象以外のメッセージを削除しない。receipt handleは証跡に出力しない。
+別々のDLQ受信で得た相関はmessage IDごとに保持する。`poison-isolation-evidence.json` の `result` に送信対象のID・本文ハッシュ、UTC観測履歴、失敗段階、cleanup結果を残す。途中失敗でもrun所有資源の安全なcleanupを試みるが、所有権や処理終了を確認できない場合、または送信結果が不確実な場合は資源を保持し、元の失敗理由とは別に `cleanupReason` を記録する。DLQメッセージは引き続き人手確認・cleanup用に残す。
 自動テスト成功のみでは実環境確認済みとしない。IAM適用後のdisposable live証跡を別途確認する。
 
 </details>

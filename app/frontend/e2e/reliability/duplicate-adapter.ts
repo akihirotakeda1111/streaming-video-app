@@ -10,6 +10,7 @@ import {
   type DuplicateAdapter,
   type DuplicateEvent,
   type DuplicateJob,
+  type DuplicateSnapshot,
   type DuplicateTarget,
 } from './duplicate-driver.js'
 
@@ -128,10 +129,10 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
   private registered = false
   private uploaded = false
   private uncertain = false
-  private messages: string[] = []
+  protected messages: string[] = []
   private dbUser = ''
   private dbName = ''
-  private sourceUrl = ''
+  protected sourceUrl = ''
   private since = new Date().toISOString()
   private execute: DuplicateTransport
   constructor(
@@ -175,7 +176,7 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
   protected docker(args: string[], input?: string): string {
     return this.execute('docker', ['--host', this.env.E2E_DOCKER_HOST!, ...args], input)
   }
-  private aws(args: string[]): any {
+  protected aws(args: string[]): any {
     let output: string
     try {
       output = this.execute('aws', [...args, '--region', this.env.AWS_REGION!, '--output', 'json'])
@@ -395,26 +396,8 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
       fail(`Upload outcome uncertain; retain run resources. ${transportFailure(error).message}`)
     }
   }
-  async sendDuplicate(): Promise<string> {
+  protected sendQueueMessage(body: string): string {
     this.unchanged()
-    const t = this.target!
-    const body = JSON.stringify({
-      Records: [
-        {
-          eventVersion: '2.1',
-          eventSource: 'aws:s3',
-          awsRegion: this.env.AWS_REGION,
-          eventTime: new Date().toISOString(),
-          eventName: 'ObjectCreated:Put',
-          s3: {
-            s3SchemaVersion: '1.0',
-            configurationId: 'duplicate-e2e',
-            bucket: { name: this.env.E2E_SOURCE_BUCKET },
-            object: { key: t.sourceKey },
-          },
-        },
-      ],
-    })
     try {
       const result = this.aws([
         'sqs',
@@ -432,6 +415,16 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
       this.uncertain = true
       return fail('Duplicate send outcome uncertain; retain run resources')
     }
+  }
+  async sendDuplicate(): Promise<string> {
+    const t = this.target!
+    return this.sendQueueMessage(JSON.stringify({
+      Records: [{
+        eventVersion: '2.1', eventSource: 'aws:s3', awsRegion: this.env.AWS_REGION,
+        eventTime: new Date().toISOString(), eventName: 'ObjectCreated:Put',
+        s3: { s3SchemaVersion: '1.0', configurationId: 'duplicate-e2e', bucket: { name: this.env.E2E_SOURCE_BUCKET }, object: { key: t.sourceKey } },
+      }],
+    }))
   }
   protected readJob(): DuplicateJob {
     const t = this.target!
@@ -506,7 +499,7 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
       let drained = false
       while (this.now() < deadline) {
         const s = await this.observe()
-        const ids = new Set([...this.messages, ...s.events.map((e) => e.messageId)])
+        const ids = new Set([...this.cleanupMessageIds(), ...this.cleanupEvents(s).map((e) => e.messageId)])
         if (
           s.job.status === 'COMPLETED' &&
           s.job.workerId === null &&
@@ -562,5 +555,13 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
       `DELETE FROM videos WHERE video_id='${t.videoId}' AND file_name='${t.runId}.mp4' AND upload_key='${t.sourceKey}';`,
     )
     this.registered = false
+  }
+
+  protected cleanupEvents(snapshot: DuplicateSnapshot): DuplicateEvent[] {
+    return snapshot.events
+  }
+
+  protected cleanupMessageIds(): string[] {
+    return this.messages
   }
 }
