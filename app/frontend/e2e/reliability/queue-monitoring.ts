@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readFile, realpath } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { observeUntil, ObservationTimeout, type PollTimeoutEvidence } from './evidence.js'
 import { validateAlarmIdentifiers } from './alarm-identifiers.mjs'
 import { correlateMonitoringEvidence, utcTime } from './queue-monitoring-evidence.js'
@@ -56,6 +56,7 @@ export interface QueueMonitoringReport {
     runId?: string
     status?: string
     evidenceFile: string
+    requestedRunId?: string
     evidenceTimestamp?: string
     evidenceComplete: boolean
   }[]
@@ -132,12 +133,22 @@ export async function observeQueueMonitoring(options: {
   evidenceDir: string
   runId: string
   timeoutMs: number
+  ffmpegEvidenceRun?: string
+  poisonEvidenceRun?: string
   execute?: Execute
   now?: () => number
   sleep?: (ms: number) => Promise<void>
 }): Promise<QueueMonitoringReport> {
   const execute = options.execute ?? executeAws
   validateAlarmIdentifiers(options.alarmIdentifiers)
+  for (const run of [options.ffmpegEvidenceRun, options.poisonEvidenceRun]) {
+    if (
+      run !== undefined &&
+      !/^e2e-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(run)
+    ) {
+      throw new Error('evidence reference must be an e2e-UUIDv4 run directory name')
+    }
+  }
   if (!/^[a-z]{2}-[a-z]+-\d+$/.test(options.region))
     throw new Error('observation region is malformed')
   if (!/^e2e-[0-9a-f-]+$/.test(options.runId))
@@ -287,11 +298,26 @@ export async function observeQueueMonitoring(options: {
 
   const correlatedEvidence: Array<QueueMonitoringReport['correlatedEvidence'][number]> = []
   for (const file of ['ffmpeg-exhaustion-evidence.json', 'poison-isolation-evidence.json']) {
+    const scenario = file.replace('-evidence.json', '')
+    const requestedRunId =
+      scenario === 'ffmpeg-exhaustion' ? options.ffmpegEvidenceRun : options.poisonEvidenceRun
     try {
-      const evidence = parseJson(await readFile(join(options.evidenceDir, file), 'utf8'))
-      const scenario = file.replace('-evidence.json', '')
+      let directory = options.evidenceDir
+      if (requestedRunId !== undefined) {
+        const root = await realpath(dirname(options.evidenceDir))
+        directory = join(root, requestedRunId)
+        // Reject symlink/junction escapes, including redirects to another run.
+        if (
+          (await realpath(directory)) !== directory ||
+          (await realpath(join(directory, file))) !== join(directory, file)
+        ) {
+          throw new Error('evidence reference leaves its selected run directory')
+        }
+      }
+      const evidence = parseJson(await readFile(join(directory, file), 'utf8'))
       const correlation = correlateMonitoringEvidence(evidence, scenario, {
         ...options,
+        runId: requestedRunId ?? options.runId,
         now: now(),
       })
       correlatedEvidence.push({
@@ -299,10 +325,16 @@ export async function observeQueueMonitoring(options: {
         runId: typeof evidence.runId === 'string' ? evidence.runId : undefined,
         status: typeof evidence.status === 'string' ? evidence.status : undefined,
         evidenceFile: file,
+        requestedRunId,
         ...correlation,
       })
     } catch {
-      /* absence is reported as outstanding below */
+      correlatedEvidence.push({
+        scenario,
+        evidenceFile: file,
+        requestedRunId,
+        evidenceComplete: false,
+      })
     }
   }
   const missing = ['ffmpeg-exhaustion', 'poison-isolation'].filter(

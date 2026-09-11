@@ -170,6 +170,47 @@ class RunnerChecks(unittest.TestCase):
             self.assertEqual(MODULE["main"](["--live-preflight"]), 2)
         self.assertNotIn("private-value", output.getvalue())
 
+    def test_monitoring_reference_arguments_dispatch_without_inheriting_old_values(self):
+        first = "e2e-11111111-1111-4111-8111-111111111111"
+        second = "e2e-22222222-2222-4222-8222-222222222222"
+        for supplied in ([], ["--ffmpeg-evidence-run", first],
+                         ["--ffmpeg-evidence-run", first, "--poison-evidence-run", second]):
+            with self.subTest(supplied=supplied), tempfile.TemporaryDirectory() as root:
+                def dispatch(command, **kwargs):
+                    env = kwargs["env"]
+                    self.assertEqual(env.get("E2E_FFMPEG_EVIDENCE_RUN"), first if supplied else None)
+                    self.assertEqual(env.get("E2E_POISON_EVIDENCE_RUN"), second if len(supplied) == 4 else None)
+                    self.assertEqual(Path(env["E2E_EVIDENCE_DIR"]).parent, Path(root).resolve())
+                    self.assertNotIn(env["E2E_RUN_ID"], (first, second))
+                    self.assertEqual(command[-4:], ["--grep", "@queue-monitoring", "--project", "reliability"])
+                    return subprocess.CompletedProcess(command, 0)
+                with patch.dict(os.environ, {"E2E_EVIDENCE_DIR": root,
+                                             "E2E_FFMPEG_EVIDENCE_RUN": "old", "E2E_POISON_EVIDENCE_RUN": "old"}), \
+                        patch.dict(GLOBALS, {"_settings": lambda mode: {"status": "verified"}}), \
+                        patch("shutil.which", return_value="node-test"), \
+                        patch("subprocess.run", side_effect=dispatch) as run, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(MODULE["main"](["--scenario", "queue-monitoring", *supplied]), 0)
+                    run.assert_called_once()
+
+    def test_reference_arguments_reject_paths_and_other_modes_before_any_operation(self):
+        valid = "e2e-11111111-1111-4111-8111-111111111111"
+        cases = [["--scenario", "queue-monitoring", "--ffmpeg-evidence-run", value]
+                 for value in ("../private-value", "C:/private-value", "", valid + "/child", "e2e-invalid")]
+        cases += [["--scenario", "poison-isolation", "--poison-evidence-run", valid]]
+        cases += [["--scenario", "queue-monitoring", mode, "--poison-evidence-run", valid]
+                  for mode in ("--list", "--check", "--live-preflight")]
+        for args in cases:
+            with self.subTest(args=args), \
+                    patch.dict(GLOBALS, {"_settings": lambda mode: self.fail("must not validate live settings")}), \
+                    patch("subprocess.run", side_effect=AssertionError("must not dispatch")), \
+                    patch.object(Path, "mkdir", side_effect=AssertionError("must not write")), \
+                    contextlib.redirect_stderr(io.StringIO()) as output:
+                with self.assertRaises(SystemExit) as error:
+                    MODULE["main"](args)
+                self.assertEqual(error.exception.code, 2)
+                self.assertNotIn("private-value", output.getvalue())
+
     def test_live_modes_allow_the_shared_deadline_and_require_verified(self):
         for mode in ("preflight", "authorize"):
             with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, '{"status":"verified"}')) as run:

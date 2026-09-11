@@ -38,7 +38,21 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 
 `queue-monitoring` の観測期限はalarm取得を含む全AWS観測に適用する。期限到達時は実行中のCLIを中断し、追加取得せず最後の観測値を残す。SQS属性の件数は `attributeBacklog`、CloudWatchの件数・ageはメトリクス自身の時刻とともに別々に記録する。欠落・不正・遅延したメトリクスや未取得alarmは `outstanding` とし、実際の `INSUFFICIENT_DATA` と区別する。
 
-先行証跡は現在の証跡ディレクトリ内のみを参照する。シナリオ名、同一run/target、検証済みキュー、UTC時刻、実際のDLQ相関を確認し、不足・不整合は `outstanding` とする。poison証跡にもpreflight結果を保存するため、この情報を持たない旧証跡は未確認扱いとなる。別実行の証跡受け渡し方式は保留中であり、通常の単独実行では先行証跡不足が残る。
+先行証跡は `--ffmpeg-evidence-run` と `--poison-evidence-run` に各シナリオの証跡ディレクトリ名（`e2e-<UUIDv4>`）を指定して参照する。どちらも `--scenario queue-monitoring` 専用の任意引数であり、パスやファイル名は指定できない。`E2E_EVIDENCE_DIR` は3回の実行を通じて同じ証跡親ディレクトリを設定する。
+
+1. `python app/scripts/run_reliability_e2e.py --scenario ffmpeg-exhaustion` を実行し、表示された `evidenceDirectory` の末尾のrun IDを控える。
+2. `python app/scripts/run_reliability_e2e.py --scenario poison-isolation` を実行し、同様にrun IDを控える。
+3. 実際のrun IDに置き換えて次を実行する（1行のコマンド）。
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario queue-monitoring --ffmpeg-evidence-run e2e-11111111-1111-4111-8111-111111111111 --poison-evidence-run e2e-22222222-2222-4222-8222-222222222222
+```
+
+監視は新しいrun IDへ結果を保存し、先行証跡は読み取りのみで変更しない。入力は `<E2E_EVIDENCE_DIR>/<指定run ID>/ffmpeg-exhaustion-evidence.json` または `poison-isolation-evidence.json` に固定し、symlink/junctionによる別ディレクトリへの転送も拒否する。CLI引数は子プロセスへ内部環境変数で渡すが、以前の環境変数の値は引き継がない。
+
+シナリオ名、指定run IDと証跡内run/targetの整合性、監視と同じ検証済みキュー・AWS account/region、UTC時刻、実際のDLQ相関を確認する。監視run IDと先行run IDが異なることは許容する。報告の `correlatedEvidence` に `requestedRunId`、証跡自身の `runId`、ファイル名、観測時刻、完全性を記録する。両証跡が `passed` かつ完全で、メトリクスとalarmの観測が揃ったときのみ全体を `passed` とする。
+
+指定ファイルの欠落・不整合は `outstanding`。未指定のシナリオは従来どおり監視の証跡ディレクトリ内のみを確認し、他runの自動検索や障害シナリオの再実行はしない。通常の単独実行では、引数未指定分の先行証跡不足が残る。preflight情報のない旧poison証跡も未確認扱いとなる。先行テスト時点の隔離証拠と監視時点の近似メトリクスは別の観測であり、全alarmの強制的な `ALARM` 遷移は完了条件に含めない。
 
 FFmpeg exhaustion observes the DLQ with `ReceiveMessage` only to correlate the
 run-owned S3 notification bucket/key and canonical IDs. Receiving temporarily changes message

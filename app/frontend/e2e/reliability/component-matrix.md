@@ -20,6 +20,13 @@ pending until that Spec supplies an executable selector and redacted evidence.
 | Source backlog/age, DLQ depth and queue/alarm inspection | `queue-monitoring.spec.ts` (`@queue-monitoring`), `queue-monitoring.ts`; offline helper assertions | `python app/scripts/run_reliability_e2e.py --scenario queue-monitoring` | read-only source/DLQ attributes and CloudWatch metrics, alarm identifiers and actual states/reasons including `INSUFFICIENT_DATA`, bounded observation timestamps, correlation with Specs 45/46 evidence; missing evidence remains outstanding | Implemented — human disposable live verification outstanding |
 | Phase 1 browser playback | Spec 48 live scenario | successor selector pending | API completion, manifest/segment checks, browser playback trace without unsafe artifacts | Pending — Spec 48 |
 
+Queue monitoring can explicitly reuse the two earlier run artifacts with
+`--ffmpeg-evidence-run e2e-<UUIDv4>` and `--poison-evidence-run e2e-<UUIDv4>`;
+keep `E2E_EVIDENCE_DIR` set to the same parent directory for all three runs.
+See `runner.md` for the full command and completion criteria. The monitoring run
+remains distinct; missing or mismatched references are outstanding, and only
+complete passed isolation artifacts plus actual metric/alarm observations pass.
+
 The component suite also proves the required distinction between failure before
 durable completion and acknowledgement failure after it: retryable failures may
 release before completion, while completed redelivery only retries deletion.

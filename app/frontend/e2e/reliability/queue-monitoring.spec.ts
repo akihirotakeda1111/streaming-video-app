@@ -18,6 +18,8 @@ test.describe('@queue-monitoring', () => {
       const result = await observeQueueMonitoring({
         region: boundary.region, sourceQueueArn: boundary.sourceQueue, deadLetterQueueArn: boundary.deadLetterQueue,
         alarmIdentifiers: boundary.alarms, evidenceDir: directory, runId: process.env.E2E_RUN_ID!, timeoutMs: 300000,
+        ffmpegEvidenceRun: process.env.E2E_FFMPEG_EVIDENCE_RUN,
+        poisonEvidenceRun: process.env.E2E_POISON_EVIDENCE_RUN,
       })
       report = { ...report, ...result }
       await writeFile(destination, JSON.stringify(safeDiagnostic(report), null, 2) + '\n', { flag: 'wx' })
@@ -29,4 +31,3 @@ test.describe('@queue-monitoring', () => {
     }
   })
 })
-

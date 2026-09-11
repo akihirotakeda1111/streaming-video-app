@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, symlink, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { observeQueueMonitoring } from './queue-monitoring.js'
@@ -344,6 +344,114 @@ describe('queue monitoring', () => {
       metricStatus: 'metric-delay',
     })
   })
+})
+
+describe('explicit prerequisite run references', () => {
+  const ffmpegRun = 'e2e-22222222-2222-4222-8222-222222222222'
+  const poisonRun = 'e2e-33333333-3333-4333-8333-333333333333'
+  async function references() {
+    const root = await evidenceDirectory()
+    const directory = join(root, options.runId)
+    await mkdir(directory)
+    const artifactsByScenario: Record<string, any> = artifacts()
+    for (const [key, run, scenario] of [
+      ['ffmpeg', ffmpegRun, 'ffmpeg-exhaustion'],
+      ['poison', poisonRun, 'poison-isolation'],
+    ] as const) {
+      const evidence = artifactsByScenario[key]
+      evidence.runId = run
+      evidence.target.runId = run
+      await mkdir(join(root, run))
+      await writeFile(join(root, run, `${scenario}-evidence.json`), JSON.stringify(evidence))
+    }
+    return { root, directory }
+  }
+  it('reads two distinct earlier runs without changing their artifacts or the monitoring run ID', async () => {
+    const { root, directory } = await references()
+    const file = join(root, ffmpegRun, 'ffmpeg-exhaustion-evidence.json')
+    const before = await readFile(file, 'utf8')
+    const report = await observeQueueMonitoring({
+      ...options,
+      execute: transport(),
+      evidenceDir: directory,
+      ffmpegEvidenceRun: ffmpegRun,
+      poisonEvidenceRun: poisonRun,
+    })
+    expect(report.status).toBe('passed')
+    expect(report.runId).toBe(options.runId)
+    expect(report.correlatedEvidence.map((item) => [item.requestedRunId, item.runId])).toEqual([
+      [ffmpegRun, ffmpegRun],
+      [poisonRun, poisonRun],
+    ])
+    expect(await readFile(file, 'utf8')).toBe(before)
+  })
+  it('leaves an unspecified prerequisite outstanding without searching sibling directories', async () => {
+    const { directory } = await references()
+    const report = await observeQueueMonitoring({
+      ...options,
+      execute: transport(),
+      evidenceDir: directory,
+      ffmpegEvidenceRun: ffmpegRun,
+    })
+    expect(report.outstanding).toEqual(['poison-isolation evidence is outstanding'])
+  })
+  it.each(['missing', 'mismatch', 'environment', 'malformed'])(
+    'keeps invalid references outstanding: %s',
+    async (fault) => {
+      const { root, directory } = await references()
+      const file = join(root, ffmpegRun, 'ffmpeg-exhaustion-evidence.json')
+      const evidence = JSON.parse(await readFile(file, 'utf8'))
+      if (fault === 'missing') await rm(file)
+      if (fault === 'mismatch') {
+        evidence.runId = options.runId
+        await writeFile(file, JSON.stringify(evidence))
+      }
+      if (fault === 'environment') {
+        evidence.verification.sourceQueue = 'other'
+        await writeFile(file, JSON.stringify(evidence))
+      }
+      if (fault === 'malformed') await writeFile(file, '{')
+      const report = await observeQueueMonitoring({
+        ...options,
+        execute: transport(),
+        evidenceDir: directory,
+        ffmpegEvidenceRun: ffmpegRun,
+        poisonEvidenceRun: poisonRun,
+      })
+      expect(report.outstanding).toEqual(['ffmpeg-exhaustion evidence is outstanding'])
+      expect(report.correlatedEvidence[0]).toMatchObject({
+        requestedRunId: ffmpegRun,
+        evidenceComplete: false,
+      })
+    },
+  )
+  it('rejects a junction redirect outside the selected run', async () => {
+    const root = await evidenceDirectory()
+    const directory = join(root, options.runId)
+    await mkdir(directory)
+    // Junctions require no elevated symlink privilege on Windows.
+    await symlink(root, join(root, ffmpegRun), process.platform === 'win32' ? 'junction' : 'dir')
+    const report = await observeQueueMonitoring({
+      ...options,
+      execute: transport(),
+      evidenceDir: directory,
+      ffmpegEvidenceRun: ffmpegRun,
+    })
+    expect(report.correlatedEvidence[0]).toMatchObject({
+      requestedRunId: ffmpegRun,
+      evidenceComplete: false,
+    })
+  })
+  it.each(['../outside', 'C:/outside', '', `${ffmpegRun}/child`])(
+    'rejects a path as a run ID before AWS calls',
+    async (value) => {
+      const execute = transport()
+      await expect(
+        observeQueueMonitoring({ ...options, execute, ffmpegEvidenceRun: value }),
+      ).rejects.toThrow('run directory name')
+      expect(execute).not.toHaveBeenCalled()
+    },
+  )
 })
 
 describe('scenario evidence correlation', () => {
