@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 
 export interface RunMessageIdentity {
   messageId: string
@@ -21,6 +22,21 @@ export interface DlqTarget {
   videoId: string
   sourceKey: string
   sourceBucket: string
+}
+
+export interface PoisonDlqTarget {
+  messageId: string
+  body: string
+  kind: 'malformed' | 'unknown-job'
+  canonicalIds?: { videoId: string; jobId: string }
+}
+
+export interface PoisonDlqCorrelation {
+  messageId: string
+  receivedAt: string
+  kind: PoisonDlqTarget['kind']
+  bodySha256: string
+  canonicalIds?: { videoId: string; jobId: string }
 }
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -95,6 +111,54 @@ export function correlateRunOwnedDlq(
   }
   if (result.length > 100) throw new Error('DLQ observation exceeded the bounded run limit')
   return result
+}
+
+/** Correlates the exact run-owned poison bodies without retaining their contents or handles. */
+export function correlateRunOwnedPoisonDlq(
+  messages: readonly RunMessageIdentity[],
+  targets: readonly PoisonDlqTarget[],
+): PoisonDlqCorrelation[] {
+  if (new Set(targets.map((target) => target.messageId)).size !== targets.length)
+    throw new Error('Malformed poison correlation targets')
+  const result: PoisonDlqCorrelation[] = []
+  for (const message of messages) {
+    if (!messageId.test(message.messageId) || !Number.isFinite(Date.parse(message.receivedAt)) || typeof message.body !== 'string')
+      throw new Error('Malformed bounded poison observation')
+    const target = targets.find((candidate) => candidate.messageId === message.messageId)
+    if (!target || target.body !== message.body) continue
+    if (target.kind === 'unknown-job' && (!target.canonicalIds || !uuid.test(target.canonicalIds.videoId) || !uuid.test(target.canonicalIds.jobId)))
+      throw new Error('Malformed unknown-job poison identity')
+    result.push({
+      messageId: message.messageId,
+      receivedAt: new Date(message.receivedAt).toISOString(),
+      kind: target.kind,
+      bodySha256: createHash('sha256').update(message.body).digest('hex'),
+      ...(target.canonicalIds ? { canonicalIds: target.canonicalIds } : {}),
+    })
+  }
+  if (result.length > targets.length) throw new Error('Duplicate poison DLQ correlation')
+  return result
+}
+
+export function receiveRunOwnedPoisonDlq(
+  queueUrl: string,
+  targets: readonly PoisonDlqTarget[],
+  options: { region: string; timeoutMs: number; maxMessages?: number; execute?: DlqTransport },
+): PoisonDlqCorrelation[] {
+  if (!/^https:\/\/sqs\.[a-z]{2}-[a-z]+-\d+\.amazonaws\.com\/\d{12}\/[A-Za-z0-9_-]+(?:\.fifo)?$/.test(queueUrl))
+    throw new Error('DLQ URL is malformed')
+  const limit = options.maxMessages ?? 10
+  if (!/^[a-z]{2}-[a-z]+-\d+$/.test(options.region) || !Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > 900000 || !Number.isSafeInteger(limit) || limit < 1 || limit > 10)
+    throw new Error('Invalid bounded poison observation')
+  const execute = options.execute ?? ((tool, args) => execFileSync(tool, args, { encoding: 'utf8', timeout: Math.min(options.timeoutMs, 10000), maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }))
+  let parsed: any
+  try {
+    parsed = JSON.parse(execute('aws', ['sqs', 'receive-message', '--queue-url', queueUrl, '--max-number-of-messages', String(limit), '--visibility-timeout', '30', '--wait-time-seconds', '0', '--region', options.region, '--output', 'json']))
+  } catch {
+    throw new Error('bounded DLQ observation failed')
+  }
+  if (!Array.isArray(parsed?.Messages)) return []
+  return correlateRunOwnedPoisonDlq(parsed.Messages.map((m: any) => ({ messageId: m.MessageId, body: m.Body, receivedAt: new Date().toISOString() })), targets)
 }
 
 export type DlqTransport = (tool: string, args: string[]) => string
