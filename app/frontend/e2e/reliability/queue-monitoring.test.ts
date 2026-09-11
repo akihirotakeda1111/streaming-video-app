@@ -160,6 +160,48 @@ function transport(change?: (response: any, args: readonly string[]) => void) {
 }
 
 describe('queue monitoring', () => {
+  it.each(['invalid-json', 'cli-failed', 'Forbidden'])(
+    'reports metric request errors with query context: %s',
+    async (fault) => {
+      const respond = transport()
+      const execute = vi.fn((file: string, args: readonly string[]) => {
+        if (args[1] === 'get-metric-data') {
+          if (fault === 'invalid-json') return '{'
+          if (fault === 'cli-failed') throw new Error('private-value')
+          return JSON.stringify({
+            MetricDataResults: JSON.parse(args[3]!).map((query: any) => ({
+              Id: query.Id,
+              StatusCode: 'Forbidden',
+              Values: [],
+              Timestamps: [],
+            })),
+          })
+        }
+        return respond(file, args)
+      })
+      const report = await observeQueueMonitoring({
+        ...options,
+        execute,
+        evidenceDir: await evidenceDirectory(),
+      })
+      expect(report.status).toBe('outstanding')
+      expect(report.metricObservation).toEqual({ status: 'error' })
+      expect(report.queueObservations[0]?.metricRequest).toMatchObject({
+        region: 'us-east-1',
+        queueName: 'source',
+        namespace: 'AWS/SQS',
+        periodSeconds: 60,
+        statistic: 'Maximum',
+      })
+      expect(report.queueObservations[0]?.metricDiagnostics[0]).toMatchObject(
+        fault === 'Forbidden'
+          ? { reason: 'service-error', statusCode: 'Forbidden' }
+          : { reason: 'request-error', errorCode: fault },
+      )
+      expect(execute).toHaveBeenCalledTimes(5)
+      expect(JSON.stringify(report)).not.toContain('private-value')
+    },
+  )
   it('records actual metrics independently from SQS attributes, including zero and metric timestamps', async () => {
     const execute = transport()
     const report = await observeQueueMonitoring({

@@ -3,7 +3,25 @@ import { readFile, realpath } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { observeUntil, ObservationTimeout, type PollTimeoutEvidence } from './evidence.js'
 import { validateAlarmIdentifiers } from './alarm-identifiers.mjs'
-import { correlateMonitoringEvidence, utcTime } from './queue-monitoring-evidence.js'
+import { correlateMonitoringEvidence } from './queue-monitoring-evidence.js'
+import { diagnoseMetric, type MetricDiagnostic } from './metric-diagnostics.js'
+
+class ObservationRequestError extends Error {
+  constructor(readonly errorCode: string) {
+    super('read-only queue or alarm observation failed')
+  }
+}
+
+function requestError(error: any, stderr = ''): ObservationRequestError {
+  const awsCode =
+    /\((AccessDenied|AccessDeniedException|UnauthorizedOperation|ExpiredToken|ExpiredTokenException|InvalidClientTokenId|Throttling|ThrottlingException|InvalidParameterValue|ResourceNotFound|ResourceNotFoundException)\)/.exec(
+      stderr,
+    )?.[1]
+  return new ObservationRequestError(
+    awsCode ??
+      (error?.code === 'ENOENT' ? 'cli-not-found' : error?.killed ? 'cli-timeout' : 'cli-failed'),
+  )
+}
 
 type Execute = (
   file: string,
@@ -17,8 +35,8 @@ const executeAws: Execute = (file, args, options) =>
       file,
       args,
       { ...options, encoding: 'utf8', windowsHide: true, maxBuffer: 1024 * 1024 },
-      (error, stdout) => {
-        if (error) reject(new Error('read-only queue or alarm observation failed'))
+      (error, stdout, stderr) => {
+        if (error) reject(requestError(error, stderr))
         else resolve(stdout)
       },
     )
@@ -33,6 +51,16 @@ export interface QueueMetricObservation {
   ageTimestamp?: string
   observedAt: string
   metricStatus: 'observed' | 'metric-delay'
+  metricRequest: {
+    region: string
+    queueName: string
+    namespace: string
+    startTime: string
+    endTime: string
+    periodSeconds: number
+    statistic: string
+  }
+  metricDiagnostics: MetricDiagnostic[]
 }
 
 export interface AlarmObservation {
@@ -50,7 +78,8 @@ export interface QueueMonitoringReport {
   observedAt: string
   queueObservations: readonly QueueMetricObservation[]
   alarmObservations: readonly AlarmObservation[]
-  metricObservation: PollTimeoutEvidence<readonly QueueMetricObservation[]> | { status: 'observed' }
+  metricObservation:
+    PollTimeoutEvidence<readonly QueueMetricObservation[]> | { status: 'observed' | 'error' }
   correlatedEvidence: readonly {
     scenario: string
     runId?: string
@@ -102,9 +131,14 @@ const command = async (
       timeout: Math.min(10_000, remainingMs),
     })
     signal.throwIfAborted()
-    return parseJson(result)
-  } catch {
-    throw new Error('read-only queue or alarm observation failed')
+    try {
+      return JSON.parse(result)
+    } catch {
+      throw new ObservationRequestError('invalid-json')
+    }
+  } catch (error) {
+    signal.throwIfAborted()
+    throw error instanceof ObservationRequestError ? error : requestError(error)
   }
 }
 
@@ -211,56 +245,46 @@ export async function observeQueueMonitoring(options: {
             : undefined
         const end = now()
         const start = end - 300000
-        const metrics = (
-          await read([
+        const metricRequest = {
+          region: options.region,
+          queueName: queue,
+          namespace: 'AWS/SQS',
+          startTime: new Date(start).toISOString(),
+          endTime: new Date(end).toISOString(),
+          periodSeconds: 60,
+          statistic: 'Maximum',
+        }
+        const queries = [
+          metricQuery(queue, 'ApproximateNumberOfMessagesVisible', kind + 'backlog'),
+          metricQuery(queue, 'ApproximateAgeOfOldestMessage', kind + 'age'),
+        ]
+        let metricDiagnostics: MetricDiagnostic[]
+        try {
+          const response = await read([
             'cloudwatch',
             'get-metric-data',
             '--metric-data-queries',
-            JSON.stringify([
-              metricQuery(queue, 'ApproximateNumberOfMessagesVisible', `${kind}backlog`),
-              metricQuery(queue, 'ApproximateAgeOfOldestMessage', `${kind}age`),
-            ]),
+            JSON.stringify(queries),
             '--start-time',
-            new Date(start).toISOString(),
+            metricRequest.startTime,
             '--end-time',
-            new Date(end).toISOString(),
+            metricRequest.endTime,
           ])
-        ).MetricDataResults
-        const point = (id: string): { value: number; timestamp: string } | undefined => {
-          if (!Array.isArray(metrics)) return undefined
-          const matches = metrics.filter((item: any) => item?.Id === id)
-          const result = matches[0]
-          if (
-            matches.length !== 1 ||
-            result.StatusCode !== 'Complete' ||
-            !Array.isArray(result.Values) ||
-            !result.Values.length ||
-            !Array.isArray(result.Timestamps) ||
-            result.Values.length !== result.Timestamps.length
+          metricDiagnostics = queries.map((query) =>
+            diagnoseMetric(response, query.Id, query.MetricStat.Metric.MetricName, start, end),
           )
-            return undefined
-          const points = result.Values.map((value: unknown, index: number) => ({
-            value,
-            time: utcTime(result.Timestamps[index]),
+        } catch (error) {
+          signal.throwIfAborted()
+          if (!(error instanceof ObservationRequestError)) throw error
+          metricDiagnostics = queries.map((query) => ({
+            id: query.Id,
+            metricName: query.MetricStat.Metric.MetricName,
+            reason: 'request-error',
+            errorCode: error.errorCode,
           }))
-          if (
-            !points.every(
-              (p: any) =>
-                typeof p.value === 'number' &&
-                Number.isFinite(p.value) &&
-                p.value >= 0 &&
-                p.time !== undefined &&
-                p.time <= end,
-            )
-          )
-            return undefined
-          const recent = points.filter((point: any) => point.time >= start)
-          if (!recent.length) return undefined
-          const latest = recent.reduce((a: any, b: any) => (a.time > b.time ? a : b))
-          return { value: latest.value, timestamp: new Date(latest.time).toISOString() }
         }
-        const backlog = point(`${kind}backlog`),
-          age = point(`${kind}age`)
+        const backlog = metricDiagnostics[0]?.point,
+          age = metricDiagnostics[1]?.point
         return {
           queue: kind,
           ...(Number.isSafeInteger(attributeBacklog) ? { attributeBacklog } : {}),
@@ -268,6 +292,8 @@ export async function observeQueueMonitoring(options: {
           ...(age ? { ageSeconds: age.value, ageTimestamp: age.timestamp } : {}),
           observedAt: observedAt(),
           metricStatus: backlog && age ? 'observed' : 'metric-delay',
+          metricRequest,
+          metricDiagnostics,
         } as QueueMetricObservation
       }),
     )
@@ -280,7 +306,13 @@ export async function observeQueueMonitoring(options: {
         status: 'observed' as const,
         value: await observeUntil(
           readSnapshot,
-          (value) => value.every((item) => item.metricStatus === 'observed'),
+          (value) =>
+            value.every((item) => item.metricStatus === 'observed') ||
+            value.some((item) =>
+              item.metricDiagnostics.some((diagnostic) =>
+                ['request-error', 'service-error'].includes(diagnostic.reason),
+              ),
+            ),
           { timeoutMs: options.timeoutMs, now: options.now, sleep: options.sleep },
         ),
       }
@@ -344,6 +376,19 @@ export async function observeQueueMonitoring(options: {
       ),
   )
   const outstanding = [
+    ...queueObservations.flatMap((item) =>
+      item.metricDiagnostics
+        .filter((diagnostic) => diagnostic.reason !== 'observed')
+        .map(
+          (diagnostic) =>
+            item.queue +
+            ':' +
+            diagnostic.id +
+            ': ' +
+            diagnostic.reason +
+            (diagnostic.errorCode ? ' (' + diagnostic.errorCode + ')' : ''),
+        ),
+    ),
     ...missing.map((item) => `${item} evidence is outstanding`),
     ...alarmObservations
       .filter((item) => item.observationStatus !== 'observed')
@@ -357,7 +402,14 @@ export async function observeQueueMonitoring(options: {
     observedAt: observedAt(),
     queueObservations,
     alarmObservations,
-    metricObservation: metric.status === 'observed' ? { status: 'observed' } : metric.evidence,
+    metricObservation:
+      metric.status === 'observed'
+        ? {
+            status: queueObservations.every((item) => item.metricStatus === 'observed')
+              ? 'observed'
+              : 'error',
+          }
+        : metric.evidence,
     correlatedEvidence,
     outstanding,
     readOnlyOperations: [

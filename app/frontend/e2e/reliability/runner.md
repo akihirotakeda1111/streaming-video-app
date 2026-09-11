@@ -659,3 +659,21 @@ cargo test --manifest-path app/backend/worker/Cargo.toml <テスト名>
 照会時間が長いだけでは失敗しない。許容差を増やす前に数値と実行環境の時計を確認する。
 
 </details>
+
+### CloudWatchメトリクス診断
+
+`queueObservations[].metricRequest` にregion、QueueName、namespace、取得期間、集計周期・方法を記録する。`metricDiagnostics` は各メトリクスのquery ID、メトリクス名、返却ID、StatusCode、値・時刻の件数、最大3点のサンプル、最大5件のAWSメッセージを保持する。文字列は長さを制限し、秘密情報やURLクエリを除去する。
+
+| reason | 意味 |
+| --- | --- |
+| `observed` | 有効な値と時刻を取得 |
+| `no-datapoints` | Complete応答だがデータ点が0件。未配信・非活動・取得条件の不一致のどれかは、この結果だけでは断定しない |
+| `missing-result` / `duplicate-result` | 要求IDが応答にない／重複 |
+| `partial-data` | AWSがPartialDataを返した |
+| `service-error` | AWSがForbiddenまたはInternalErrorを返した |
+| `invalid-status` / `invalid-response` | 状態値や応答構造、配列長が不正 |
+| `invalid-values` / `invalid-timestamps` | 数値またはUTC時刻を解析・検証できない |
+| `outside-window` | データが取得期間外 |
+| `request-error` | CLI失敗、タイムアウト、JSON解析失敗など。errorCodeに固定分類を記録 |
+
+`outstanding` にキュー・query ID・理由を併記する。request-error/service-errorは待機を打ち切り、`metricObservation.status: error` として証跡を保存する。それ以外の未確認は期限まで再観測し、最後の診断を保持する。`metric-delay`だけを根拠にAWSの配信遅延と判断しない。現在の必須メトリクスと成功条件は維持している。
