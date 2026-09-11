@@ -35,7 +35,7 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 最新の実装済みセレクターは `--list` で確認する。実環境の受け入れは対象環境で成功した証跡をレビューして判断する。
 
 FFmpeg exhaustion observes the DLQ with `ReceiveMessage` only to correlate the
-run-owned body and canonical IDs. Receiving temporarily changes message
+run-owned S3 notification bucket/key and canonical IDs. Receiving temporarily changes message
 visibility, so this helper is allowed only inside the gated disposable run.
 It never replays or deletes messages, and it must not delete unrelated messages;
 receipt handles are excluded from evidence. Queue metrics and alarm state are
@@ -149,7 +149,7 @@ terraform -chdir=app/infra/terraform-e2e output worker_identity
 terraform -chdir=app/infra/terraform-e2e output runner_policy_arn
 ```
 
-runner policyはホスト側principalへ手動付与する。Terraform適用権限は含まず、queueのReceive/Delete/PurgeやDLQ replay権限も付与しない。
+runner policyはホスト側principalへ手動付与する。専用DLQに限定した `sqs:ReceiveMessage` を含む。source queueのReceive、queueのDelete/Purge、DLQ replay、Terraform適用権限は含まない。既存環境では更新したrunner policyを人手で適用してからFFmpeg exhaustionを実行する。
 CloudWatch DescribeAlarmsは設定生成の一覧取得に必要なため読み取りの `Resource=*` を使用する。
 AWS認証情報は生成ファイル・tfvars・Git管理ファイルに追記しない。WorkerのDATABASE_URLもコピー不要。
 
@@ -312,6 +312,19 @@ load_e2e || echo '設定生成失敗。後続の実行を止めて確認して�
 実設定自体が900000 msを超える場合、生成はエラー。E2E予算はWorker/SQSの設定を変更しない。
 Worker時間設定は秒単位、`2 × heartbeat <= min(visibility延長, lease)` が必要。
 DLQ予算の共通チェックは1回分のretryをカバーするだけで、全再配送の所要時間はシナリオ側で確保する。
+
+`ffmpeg-exhaustion` の待機予算は `attempts × PROCESSING + (attempts − 1) × Worker retry(ms) + VISIBILITY + DLQ`。
+DLQ確認後は `VISIBILITY + DLQ` の間、DB状態・attempt・更新時刻、追加encodingの不在とmanifest非公開を観測する。
+Playwrightの上限はこれらにUPLOAD、cleanup用PROCESSING、事前確認等の180秒を加えた値とする。個々の環境変数の900000 ms上限は変更しない。
+standard設定（5試行・retry 900秒）ではシナリオ待機上限は6,150,000 msで、実行は1時間以上かかり得る。
+
+FFmpegシナリオでは `E2E_FFMPEG_INVALID_FIXTURE` に非空の不正MP4ファイルの絶対パスを設定する。
+例えば作業ディレクトリで `node -e "require('node:fs').writeFileSync('invalid.mp4', 'not an mp4')"` により作成できる。
+専用環境の共通事前確認後、runデータ作成前にDLQ受信を試して権限を確認する。この受信もvisibilityを変更する。
+各attemptの取得・encode開始・retry/final failureを相関し、最終エラーがFFmpegの非ゼロ終了であることを必須とする。
+途中失敗時の証跡にはtarget ID、収集済みsnapshot、開始状態、失敗段階と秘匿化した理由を残す。
+成功時はrun所有のDB/source/outputのみcleanupし、DLQメッセージは削除せず手動cleanup用に残す。
+自動テスト成功のみでは実環境確認済みとしない。IAM適用後のdisposable live証跡を別途確認する。
 
 </details>
 

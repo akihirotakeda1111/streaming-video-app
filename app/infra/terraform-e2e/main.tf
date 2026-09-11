@@ -83,6 +83,11 @@ data "aws_iam_policy_document" "runner" {
     actions   = ["sqs:SendMessage"]
     resources = ["arn:aws:sqs:${var.aws_region}:${var.aws_account_id}:${local.prefix}-encoding"]
   }
+  statement {
+    sid       = "ObserveDedicatedDlq"
+    actions   = ["sqs:ReceiveMessage"]
+    resources = ["arn:aws:sqs:${var.aws_region}:${var.aws_account_id}:${local.prefix}-encoding-dlq"]
+  }
   # The generator lists alarms and the existing preflight describes them.
   statement {
     sid       = "DiscoverAlarms"

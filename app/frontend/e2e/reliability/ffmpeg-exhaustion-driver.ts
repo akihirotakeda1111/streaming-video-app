@@ -7,46 +7,155 @@ export interface ExhaustionJob {
   failure: string | null
   updatedAtMs: number
 }
-export interface ExhaustionSnapshot { job: ExhaustionJob; events: DuplicateEvent[]; dlq: DlqCorrelation[] }
+export interface ExhaustionSnapshot {
+  job: ExhaustionJob
+  events: DuplicateEvent[]
+  dlq: DlqCorrelation[]
+}
 export interface ExhaustionAdapter {
   attempts: number
   processingMs: number
+  exhaustionMs: number
+  stabilityMs: number
   prepare(target: DuplicateTarget): Promise<void>
   uploadInvalidMedia(): Promise<void>
-  observe(): Promise<ExhaustionSnapshot>
+  observe(receiveDlq?: boolean): Promise<ExhaustionSnapshot>
   hasManifest(target: DuplicateTarget): Promise<boolean>
   cleanup(): Promise<void>
   now(): number
   sleep(ms: number): Promise<void>
 }
 
-const fail = (reason: string): never => { throw new Error(reason) }
-const failureOutcomes = new Set(['encode_started', 'encode_finished', 'segment_upload_started', 'segment_published', 'manifest_upload_started', 'manifest_published', 'completed'])
+const fail = (reason: string): never => {
+  throw new Error(reason)
+}
+const unexpected = new Set([
+  'encode_finished',
+  'segment_upload_started',
+  'segment_published',
+  'manifest_upload_started',
+  'manifest_published',
+  'completed',
+])
 
-export function validateExhaustionResult(initial: ExhaustionSnapshot, final: ExhaustionSnapshot, target: DuplicateTarget, maximumAttempts = final.job.attempt): void {
-  for (const snapshot of [initial, final]) {
-    if (snapshot.job.status !== 'FAILED' || snapshot.job.attempt !== maximumAttempts || snapshot.job.attempt < 1 || !snapshot.job.failure?.trim()) fail('FFmpeg exhaustion did not produce durable FAILED with details')
-  }
-  if (final.events.filter((event) => failureOutcomes.has(event.outcome)).some((event) => event.messageId !== final.events.find((candidate) => candidate.outcome === 'acquired')?.messageId)) fail('Media work is not correlated to the owned message')
-  if (final.dlq.length !== 1 || final.dlq[0]?.jobId !== target.jobId || final.dlq[0]?.videoId !== target.videoId || final.dlq[0]?.sourceKey !== target.sourceKey) fail('Run-owned DLQ message was not correlated exactly')
+/** Covers every processing attempt, retry delay and final redrive observation. */
+export function exhaustionBudget(
+  attempts: number,
+  processingMs: number,
+  retryMs: number,
+  visibilityMs: number,
+  dlqMs: number,
+): number {
+  if (
+    !Number.isSafeInteger(attempts) ||
+    attempts < 1 ||
+    attempts > 10 ||
+    ![processingMs, retryMs, visibilityMs, dlqMs].every(
+      (n) => Number.isSafeInteger(n) && n > 0 && n <= 900000,
+    )
+  )
+    fail('Invalid exhaustion wait budgets')
+  return attempts * processingMs + (attempts - 1) * retryMs + visibilityMs + dlqMs
 }
 
-export async function runFfmpegExhaustion(adapter: ExhaustionAdapter, target: DuplicateTarget): Promise<void> {
+/** Requires encoding and failure on each acquired delivery, without publication. */
+export function validateExhaustionResult(
+  initial: ExhaustionSnapshot,
+  final: ExhaustionSnapshot,
+  target: DuplicateTarget,
+  maximumAttempts: number,
+): void {
+  for (const snapshot of [initial, final]) {
+    if (
+      snapshot.job.status !== 'FAILED' ||
+      snapshot.job.attempt !== maximumAttempts ||
+      maximumAttempts < 1 ||
+      !/^encode HLS: ffmpeg exited with status -?[1-9][0-9]*$/.test(snapshot.job.failure || '')
+    )
+      fail('FFmpeg exhaustion did not produce durable FAILED with encoding details')
+  }
+  if (
+    initial.job.updatedAtMs !== final.job.updatedAtMs ||
+    initial.job.failure !== final.job.failure
+  )
+    fail('Terminal failure changed after exhaustion')
+  if (final.events.some((event) => unexpected.has(event.outcome)))
+    fail('Invalid media unexpectedly encoded or published output')
+  const acquired = final.events.filter((event) => event.outcome === 'acquired')
+  if (
+    acquired.length !== maximumAttempts ||
+    new Set(acquired.map((e) => e.attempt)).size !== maximumAttempts
+  )
+    fail('Missing bounded acquisition evidence')
+  if (final.events.filter((event) => event.outcome === 'encode_started').length !== maximumAttempts)
+    fail('Unexpected encoding count')
+  for (let attempt = 1; attempt <= maximumAttempts; attempt++) {
+    const owner = acquired.find((event) => event.attempt === attempt)
+    if (!owner) return fail('Missing bounded acquisition evidence')
+    const events = final.events.filter(
+      (event) => event.deliveryId === owner.deliveryId && event.messageId === owner.messageId,
+    )
+    const encode = events.find(
+      (event) =>
+        event.outcome === 'encode_started' && event.attempt === attempt && event.at >= owner.at,
+    )
+    if (
+      !encode ||
+      !events.some(
+        (event) =>
+          event.outcome === (attempt === maximumAttempts ? 'final_failed' : 'retry_released') &&
+          event.attempt === attempt &&
+          event.at >= encode.at,
+      )
+    )
+      fail('Missing correlated FFmpeg failure evidence')
+  }
+  const terminal = final.events.find(
+    (event) => event.outcome === 'final_failed' && event.attempt === maximumAttempts,
+  )
+  if (
+    !terminal ||
+    final.events.some(
+      (event) => event.at > terminal.at && ['acquired', 'encode_started'].includes(event.outcome),
+    )
+  )
+    fail('Terminal failure continued processing')
+  if (
+    final.dlq.length !== 1 ||
+    final.dlq[0]?.jobId !== target.jobId ||
+    final.dlq[0]?.videoId !== target.videoId ||
+    final.dlq[0]?.sourceKey !== target.sourceKey
+  )
+    fail('Run-owned DLQ message was not correlated exactly')
+}
+
+/** Retains received DLQ evidence while checking terminal stability independently. */
+export async function runFfmpegExhaustion(
+  adapter: ExhaustionAdapter,
+  target: DuplicateTarget,
+): Promise<void> {
   await adapter.prepare(target)
   await adapter.uploadInvalidMedia()
-  const initial = await adapter.observe()
-  const deadline = adapter.now() + adapter.processingMs
-  let final = initial
-  while (adapter.now() < deadline) {
+  const deadline = adapter.now() + adapter.exhaustionMs
+  const received = new Map<string, DlqCorrelation>()
+  let final: ExhaustionSnapshot
+  while (true) {
     final = await adapter.observe()
-    if (final.job.status === 'FAILED' && final.dlq.length === 1) break
-    await adapter.sleep(250)
+    for (const message of final.dlq) received.set(message.messageId, message)
+    final = { ...final, dlq: [...received.values()] }
+    if (received.size > 1) fail('Multiple run-owned DLQ messages observed')
+    if (await adapter.hasManifest(target)) fail('Failed job exposed a manifest')
+    if (final.job.status === 'FAILED' && received.size === 1) break
+    if (adapter.now() >= deadline)
+      fail('FFmpeg exhaustion or DLQ isolation exceeded its bounded wait')
+    await adapter.sleep(1000)
   }
-  if (final.job.status !== 'FAILED' || final.dlq.length !== 1) fail('FFmpeg exhaustion or DLQ isolation exceeded its bounded wait')
-  if (await adapter.hasManifest(target)) fail('Failed job exposed a manifest')
-  const terminalAttempt = final.job.attempt
-  await adapter.sleep(250)
-  const stable = await adapter.observe()
-  if (stable.job.status !== 'FAILED' || stable.job.attempt !== terminalAttempt) fail('Terminal failure continued processing or acquiring attempts')
-  validateExhaustionResult(stable, stable, target, adapter.attempts)
+  validateExhaustionResult(final, final, target, adapter.attempts)
+  const stableUntil = adapter.now() + adapter.stabilityMs
+  do {
+    await adapter.sleep(Math.min(1000, Math.max(1, stableUntil - adapter.now())))
+    const stable = await adapter.observe(false)
+    validateExhaustionResult(final, { ...stable, dlq: final.dlq }, target, adapter.attempts)
+    if (await adapter.hasManifest(target)) fail('Failed job exposed a manifest')
+  } while (adapter.now() < stableUntil)
 }
