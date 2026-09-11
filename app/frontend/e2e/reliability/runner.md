@@ -29,10 +29,17 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | `duplicate-delivery` | 処理中と完了後の重複配送、単一の有効処理、ack、cleanup | 実装済み。ブラウザ/APIを操作しない |
 | `crash-recovery` | 取得後・永続完了前のWorker停止、可視性とDB lease expiry後の再取得 | 実装済み。停止対象は共通事前確認済みの同一Workerのみ |
 | `long-heartbeat` | 複数heartbeat周期の可視性延長・lease更新、単一owner維持 | 実装済み。短すぎるfixtureは成功扱いにしない |
-| 未登録 | 不正メディア、試行上限、DLQ隔離・アラーム | 追加予定。実行可能なセレクターは未登録 |
+| `ffmpeg-exhaustion` | 不正メディアの実FFmpeg失敗、試行上限、FAILED、manifest非公開、run-owned DLQ隔離 | 実装済み。`--scenario ffmpeg-exhaustion` |
 | 未登録 | Reliabilityシナリオ後のブラウザ再生回帰 | 追加予定。既存ブラウザテストとは別に拡張 |
 
 最新の実装済みセレクターは `--list` で確認する。実環境の受け入れは対象環境で成功した証跡をレビューして判断する。
+
+FFmpeg exhaustion observes the DLQ with `ReceiveMessage` only to correlate the
+run-owned S3 notification bucket/key and canonical IDs. Receiving temporarily changes message
+visibility, so this helper is allowed only inside the gated disposable run.
+It never replays or deletes messages, and it must not delete unrelated messages;
+receipt handles are excluded from evidence. Queue metrics and alarm state are
+reserved for the later queue-observation scenario.
 シナリオ追加時はこの表と、以下の「シナリオ別の追加条件」「実行」「証跡・復旧」を追記する。
 各シナリオは直接Playwrightで選択されても操作前に共通事前確認を呼び、別テストの成功を認可の代用にしない。
 停止を伴うシナリオでは直前にEngine ID・完全なコンテナID・開始時刻を再照合し、同じコンテナを保持して復旧する。
@@ -142,7 +149,7 @@ terraform -chdir=app/infra/terraform-e2e output worker_identity
 terraform -chdir=app/infra/terraform-e2e output runner_policy_arn
 ```
 
-runner policyはホスト側principalへ手動付与する。Terraform適用権限は含まず、queueのReceive/Delete/PurgeやDLQ replay権限も付与しない。
+runner policyはホスト側principalへ手動付与する。専用DLQに限定した `sqs:ReceiveMessage` を含む。source queueのReceive、queueのDelete/Purge、DLQ replay、Terraform適用権限は含まない。既存環境では更新したrunner policyを人手で適用してからFFmpeg exhaustionを実行する。
 CloudWatch DescribeAlarmsは設定生成の一覧取得に必要なため読み取りの `Resource=*` を使用する。
 AWS認証情報は生成ファイル・tfvars・Git管理ファイルに追記しない。WorkerのDATABASE_URLもコピー不要。
 
@@ -306,6 +313,21 @@ load_e2e || echo '設定生成失敗。後続の実行を止めて確認して�
 Worker時間設定は秒単位、`2 × heartbeat <= min(visibility延長, lease)` が必要。
 DLQ予算の共通チェックは1回分のretryをカバーするだけで、全再配送の所要時間はシナリオ側で確保する。
 
+`ffmpeg-exhaustion` の待機予算は `PROCESSING + (attempts − 1) × Worker retry(ms) + VISIBILITY + DLQ`。PROCESSINGは全試行の処理時間に対する合計予算で、試行数倍にはしない。
+DLQ確認後は `VISIBILITY`（実visibilityに観測余裕を加えた値）1回分、DB状態・attempt・更新時刻、追加encodingの不在とmanifest非公開を観測する。到達済みのDLQについてretry予算を再度待つ必要はない。
+Playwrightの上限はこれらにUPLOAD、cleanup用PROCESSING、事前確認等の180秒を加えた値とする。個々の環境変数の900000 ms上限は変更しない。
+通常のFFmpeg検証には専用Terraformの `timing_profile=exhaustion` を推奨する。3試行・retry 10秒・visibility 30秒なので、小さな不正ファイルでは通常2〜3分程度が目安（実環境で要確認）。生成値ではDLQ待機を含む上限420秒、到達後確認60秒。これは通常所要時間ではなく失敗判定用の上限で、setup/upload/cleanupは別枠。
+`standard` は5試行・retry 900秒のままで、長時間設定での確認用。待機上限4,950,000 msとなり、実行は1時間以上かかり得る。シナリオ選択だけではWorker/SQSの設定は変わらない。
+
+FFmpegシナリオでは `E2E_FFMPEG_INVALID_FIXTURE` に非空の不正MP4ファイルの絶対パスを設定する。
+例えば作業ディレクトリで `node -e "require('node:fs').writeFileSync('invalid.mp4', 'not an mp4')"` により作成できる。
+専用環境の共通事前確認後、runデータ作成前にDLQ受信を試して権限を確認する。この受信もvisibilityを変更する。
+各attemptの取得・encode開始・retry/final failureを相関し、最終エラーがFFmpegの非ゼロ終了であることを必須とする。
+同一Workerのログ出現順でイベント順序を検証し、UTC時刻の単調増加は要求しない。UTCは証跡に残す。待機期限は単調増加時計を使い、ホストの時計補正に影響されない。相関エラーには対象attemptと期待順序を記録する。
+途中失敗時の証跡にはtarget ID、収集済みsnapshot、開始状態、失敗段階と秘匿化した理由を残す。
+成功時はrun所有のDB/source/outputのみcleanupし、DLQメッセージは削除せず手動cleanup用に残す。
+自動テスト成功のみでは実環境確認済みとしない。IAM適用後のdisposable live証跡を別途確認する。
+
 </details>
 
 ### シナリオ別の追加条件
@@ -364,14 +386,15 @@ python app/scripts/run_reliability_e2e.py --list
 `status=passed`、`cleanup=complete` を確認する。クラッシュ復旧では `restoration=complete` も必要。
 Slow test警告だけでは失敗ではない。`unverified` / `retained` の場合は下の診断を確認してから再実行する。
 
-### クラッシュ復旧・長時間heartbeatの追加条件
+### 専用環境の時間プロファイルと切り替え
 
 E2E専用Terraformの `timing_profile` で時間設定を選択する。既定は `standard`。
 
-| プロファイル | heartbeat | source visibility / Worker延長 | lease | 用途 |
-| --- | --- | --- | --- | --- |
-| `standard` | 30秒 | 120秒 | 300秒 | 重複配送など通常のE2E |
-| `lifecycle` | 5秒 | 30秒 | 30秒 | 復旧・heartbeat検証の待ち時間短縮 |
+| プロファイル | heartbeat | source visibility / Worker延長 | lease | retry | Worker試行上限 / SQS maxReceiveCount | 用途 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `standard` | 30秒 | 120秒 | 300秒 | 900秒 | 5 / 5 | 既存の標準設定・長時間検証 |
+| `lifecycle` | 5秒 | 30秒 | 30秒 | 900秒 | 5 / 5 | 復旧・heartbeat検証 |
+| `exhaustion` | 5秒 | 30秒 | 30秒 | 10秒 | 3 / 3 | 不正MP4のFFmpeg試行上限・DLQ検証 |
 
 **設定はその専用環境全体に適用される。シナリオ選択による自動切り替え・自動復元は行わない。**
 同時に別シナリオを実行しない。並行実行が必要なら別instance・別state・別Composeプロジェクトを用意する。
@@ -381,6 +404,7 @@ E2E専用Terraformの `timing_profile` で時間設定を選択する。既定�
 
 実行中のテスト・jobと保持リソースを確認し、切り替えてよい状態にしてWorkerを停止する。
 AWS認証は構築用プロファイルを使用する。
+以下は `lifecycle` の例。FFmpeg検証では `timing_profile=exhaustion` とし、planファイル名も `exhaustion.tfplan` に置き換える。
 
 ```text
 docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml stop worker
@@ -401,6 +425,7 @@ docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yam
 
 ホスト認証をrunner用に戻し、E2E設定を再生成・再読込して事前確認と対象シナリオを実行する。
 CLIの `-var` は次回のplanには引き継がれない。継続利用する専用環境なら実値tfvarsで明示する。
+retryや試行上限をホストのE2E環境変数だけで変更してはならない。TerraformのSQS設定、`compose_environment` によるWorker設定、実体から再生成したE2E設定を一致させる。既存メッセージの受信回数はリセットされないため、保持中のrunを解決してから切り替える。
 
 他のE2Eへ戻す前に同じ停止・確認手順を行い、以下で標準設定へ戻す。
 

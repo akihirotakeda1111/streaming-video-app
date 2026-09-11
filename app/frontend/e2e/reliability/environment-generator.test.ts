@@ -9,6 +9,7 @@ import {
   main,
 } from '../../../scripts/generate_reliability_env.mjs'
 import { validateSettings } from './safety.mjs'
+import { DockerFfmpegExhaustionAdapter } from './ffmpeg-exhaustion-adapter.js'
 
 function fixture() {
   const account = '123456789012',
@@ -115,6 +116,31 @@ function fixture() {
 afterEach(() => vi.restoreAllMocks())
 
 describe('read-only environment command generator', () => {
+  it('derives exhaustion budgets from the actual short Worker and queue settings', () => {
+    const f = fixture()
+    Object.assign(f.settings, {
+      WORKER_HEARTBEAT_INTERVAL_SECONDS: '5',
+      WORKER_VISIBILITY_EXTENSION_SECONDS: '30',
+      WORKER_LEASE_DURATION_SECONDS: '30',
+      WORKER_RETRY_DELAY_SECONDS: '10',
+      WORKER_MAXIMUM_ATTEMPTS: '3',
+    })
+    f.state.visibility = '30'
+    const env = discoverEnvironment({ ...f.options, exclusive: true }, f.execute)
+    expect(() => validateSettings(env, true)).not.toThrow()
+    expect(env.E2E_MAX_ATTEMPTS).toBe('3')
+    expect(env.E2E_VISIBILITY_TIMEOUT_MS).toBe('60000')
+    expect(env.E2E_LEASE_TIMEOUT_MS).toBe('60000')
+    expect(env.E2E_DLQ_TIMEOUT_MS).toBe('40000')
+    const adapter = new DockerFfmpegExhaustionAdapter(
+      {
+        workerSettings: { heartbeat: 5, visibility: 30, lease: 30, retry: 10, attempts: 3 },
+      } as ConstructorParameters<typeof DockerFfmpegExhaustionAdapter>[0],
+      { ...env, E2E_FFMPEG_INVALID_FIXTURE: join(tmpdir(), 'invalid.mp4') },
+    )
+    expect(adapter.exhaustionMs).toBe(420000)
+    expect(adapter.stabilityMs).toBe(60000)
+  })
   it('derives the full existing configuration, budgets and repeated identities without secrets', () => {
     const f = fixture()
     const env = discoverEnvironment(

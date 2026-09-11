@@ -22,8 +22,9 @@ provider "aws" {
 
 locals {
   timing_profiles = {
-    standard  = { heartbeat = 30, visibility = 120, lease = 300 }
-    lifecycle = { heartbeat = 5, visibility = 30, lease = 30 }
+    standard   = { heartbeat = 30, visibility = 120, lease = 300, retry = 900, attempts = 5 }
+    lifecycle  = { heartbeat = 5, visibility = 30, lease = 30, retry = 900, attempts = 5 }
+    exhaustion = { heartbeat = 5, visibility = 30, lease = 30, retry = 10, attempts = 3 }
   }
   timing = local.timing_profiles[var.timing_profile]
 
@@ -52,9 +53,9 @@ module "foundation" {
   worker_heartbeat_interval_seconds   = local.timing.heartbeat
   worker_visibility_extension_seconds = local.timing.visibility
   worker_lease_duration_seconds       = local.timing.lease
-  worker_retry_delay_seconds          = 900
-  worker_maximum_attempts             = 5
-  queue_max_receive_count             = 5
+  worker_retry_delay_seconds          = local.timing.retry
+  worker_maximum_attempts             = local.timing.attempts
+  queue_max_receive_count             = local.timing.attempts
 }
 
 data "aws_iam_policy_document" "runner" {
@@ -82,6 +83,11 @@ data "aws_iam_policy_document" "runner" {
     sid       = "InjectSourceDuplicate"
     actions   = ["sqs:SendMessage"]
     resources = ["arn:aws:sqs:${var.aws_region}:${var.aws_account_id}:${local.prefix}-encoding"]
+  }
+  statement {
+    sid       = "ObserveDedicatedDlq"
+    actions   = ["sqs:ReceiveMessage"]
+    resources = ["arn:aws:sqs:${var.aws_region}:${var.aws_account_id}:${local.prefix}-encoding-dlq"]
   }
   # The generator lists alarms and the existing preflight describes them.
   statement {
