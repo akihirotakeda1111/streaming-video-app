@@ -31,6 +31,7 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | `long-heartbeat` | 複数heartbeat周期の可視性延長・lease更新、単一owner維持 | 実装済み。短すぎるfixtureは成功扱いにしない |
 | `ffmpeg-exhaustion` | 不正メディアの実FFmpeg失敗、試行上限、FAILED、manifest非公開、run-owned DLQ隔離 | 実装済み。`--scenario ffmpeg-exhaustion` |
 | `poison-isolation` | malformed/unknown-job poison のDLQ隔離と、同時実行する正常jobの完了 | 実装済み。`--scenario poison-isolation` |
+| `queue-monitoring` | source queue backlog/age、DLQ depth、3つのCloudWatch alarm状態を読み取り、FFmpeg/poison証跡と相関 | 実装済み。`--scenario queue-monitoring`。Receive/Delete/Purge/Replayは行わない |
 | 未登録 | Reliabilityシナリオ後のブラウザ再生回帰 | 追加予定。既存ブラウザテストとは別に拡張 |
 
 最新の実装済みセレクターは `--list` で確認する。実環境の受け入れは対象環境で成功した証跡をレビューして判断する。
