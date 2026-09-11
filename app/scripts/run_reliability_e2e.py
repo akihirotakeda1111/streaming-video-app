@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ SCENARIOS = {
     "long-heartbeat": ("@long-heartbeat", "multiple correlated heartbeat lease and visibility renewals"),
     "ffmpeg-exhaustion": ("@ffmpeg-exhaustion", "invalid media FFmpeg exhaustion and run-owned DLQ isolation"),
     "poison-isolation": ("@poison-isolation", "malformed and unknown-job poison DLQ isolation with a concurrently valid job"),
+    "queue-monitoring": ("@queue-monitoring", "read-only source backlog, DLQ depth, and alarm observation correlated with failure evidence"),
 }
 TOOLS = ("node", "npm", "npx", "ffmpeg", "aws", "docker")
 SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"
@@ -31,6 +33,8 @@ class LiveConfig:
     """The unique evidence destination and selected scenario for one run."""
     evidence_dir: Path
     scenario: str
+    ffmpeg_evidence_run: str | None = None
+    poison_evidence_run: str | None = None
 
 
 def _settings(mode: str) -> dict:
@@ -81,10 +85,11 @@ def _check() -> int:
     return 0
 
 
-def _live_config(scenario: str) -> LiveConfig:
+def _live_config(scenario: str, ffmpeg_evidence_run: str | None = None, poison_evidence_run: str | None = None) -> LiveConfig:
     """Validate settings without observing targets or creating directories."""
     _settings("validate")
-    return LiveConfig(Path(os.environ["E2E_EVIDENCE_DIR"].strip()) / f"e2e-{uuid4()}", scenario)
+    return LiveConfig(Path(os.environ["E2E_EVIDENCE_DIR"].strip()).resolve() / f"e2e-{uuid4()}", scenario,
+                      ffmpeg_evidence_run, poison_evidence_run)
 
 
 def _preflight() -> int:
@@ -108,15 +113,28 @@ def _run(config: LiveConfig) -> int:
         raise ValueError("required local tool missing: node")
     cli = SAFETY_CLI.parents[2] / "node_modules/@playwright/test/cli.js"
     args = [node, str(cli), "test", "--grep", grep]
-    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion", "poison-isolation"):
+    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion", "poison-isolation", "queue-monitoring"):
         args.extend(["--project", "reliability"])
     child_environment = os.environ.copy()
-    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion", "poison-isolation"):
+    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion", "poison-isolation", "queue-monitoring"):
         child_environment["E2E_INCLUDE_RELIABILITY"] = "true"
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
+    # CLI arguments are authoritative; never inherit an earlier run's selection.
+    for name, run_id in (("E2E_FFMPEG_EVIDENCE_RUN", config.ffmpeg_evidence_run),
+                         ("E2E_POISON_EVIDENCE_RUN", config.poison_evidence_run)):
+        child_environment.pop(name, None)
+        if config.scenario == "queue-monitoring" and run_id is not None:
+            child_environment[name] = run_id
     print(json.dumps({"scenario": config.scenario, "evidenceDirectory": str(config.evidence_dir)}), flush=True)
     return subprocess.run(args, cwd=SAFETY_CLI.parents[2], env=child_environment, check=False).returncode
+
+
+def _evidence_run(value: str) -> str:
+    """Accept only generated run directory names, never arbitrary paths."""
+    if not re.fullmatch(r"e2e-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value):
+        raise argparse.ArgumentTypeError("must be an e2e-<UUIDv4> run directory name")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -127,7 +145,12 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--list", action="store_true", help="list implemented scenario selectors")
     modes.add_argument("--live-preflight", action="store_true", help="verify disposable resources without dispatching a scenario")
     parser.add_argument("--scenario", choices=sorted(SCENARIOS), default="preflight")
+    parser.add_argument("--ffmpeg-evidence-run", type=_evidence_run, help="FFmpeg evidence run directory under E2E_EVIDENCE_DIR (queue-monitoring only)")
+    parser.add_argument("--poison-evidence-run", type=_evidence_run, help="poison evidence run directory under E2E_EVIDENCE_DIR (queue-monitoring only)")
     args = parser.parse_args(argv)
+    if (args.ffmpeg_evidence_run is not None or args.poison_evidence_run is not None) and (
+            args.scenario != "queue-monitoring" or args.list or args.check or args.live_preflight):
+        parser.error("evidence run arguments require --scenario queue-monitoring without offline/preflight modes")
     if args.list:
         for selector, (_, description) in SCENARIOS.items():
             print(f"{selector}\t{description}")
@@ -141,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"status": "blocked", "message": str(error) if isinstance(error, ValueError) else "local preflight evidence could not be written", "scenarioStarted": False}), file=sys.stderr)
             return 2
     try:
-        return _run(_live_config(args.scenario))
+        return _run(_live_config(args.scenario, args.ffmpeg_evidence_run, args.poison_evidence_run))
     except (ValueError, OSError) as error:
         # No environment values or unredacted service errors enter this evidence.
         print(json.dumps({"status": "blocked", "scenario": args.scenario,

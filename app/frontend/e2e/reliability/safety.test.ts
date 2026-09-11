@@ -55,6 +55,7 @@ describe('shared reliability safety policy', () => {
     ['E2E_API_URL', 'https://user:private-value@example.test/?credential=private-value'],
     ['E2E_SOURCE_QUEUE', 'secret-private-value'],
     ['E2E_ALARM_IDENTIFIERS', ' , , '],
+    ['E2E_ALARM_IDENTIFIERS', 'alarm,--profile,private-value'],
     ['E2E_EVIDENCE_DIR', '../private-value'],
     ['E2E_MAX_ATTEMPTS', '11'],
     ['E2E_AWS_ACCOUNT_ID', 'private-value'],

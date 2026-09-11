@@ -31,9 +31,28 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | `long-heartbeat` | 複数heartbeat周期の可視性延長・lease更新、単一owner維持 | 実装済み。短すぎるfixtureは成功扱いにしない |
 | `ffmpeg-exhaustion` | 不正メディアの実FFmpeg失敗、試行上限、FAILED、manifest非公開、run-owned DLQ隔離 | 実装済み。`--scenario ffmpeg-exhaustion` |
 | `poison-isolation` | malformed/unknown-job poison のDLQ隔離と、同時実行する正常jobの完了 | 実装済み。`--scenario poison-isolation` |
+| `queue-monitoring` | source queue backlog/age、DLQ depth、3つのCloudWatch alarm状態を読み取り、FFmpeg/poison証跡と相関 | 実装済み。`--scenario queue-monitoring`。Receive/Delete/Purge/Replayは行わない |
 | 未登録 | Reliabilityシナリオ後のブラウザ再生回帰 | 追加予定。既存ブラウザテストとは別に拡張 |
 
 最新の実装済みセレクターは `--list` で確認する。実環境の受け入れは対象環境で成功した証跡をレビューして判断する。
+
+`queue-monitoring` の観測期限はalarm取得を含む全AWS観測に適用する。期限到達時は実行中のCLIを中断し、追加取得せず最後の観測値を残す。SQS属性の件数は `attributeBacklog`、CloudWatchの件数・ageはメトリクス自身の時刻とともに別々に記録する。欠落・不正・遅延したメトリクスや未取得alarmは `outstanding` とし、実際の `INSUFFICIENT_DATA` と区別する。
+
+先行証跡は `--ffmpeg-evidence-run` と `--poison-evidence-run` に各シナリオの証跡ディレクトリ名（`e2e-<UUIDv4>`）を指定して参照する。どちらも `--scenario queue-monitoring` 専用の任意引数であり、パスやファイル名は指定できない。`E2E_EVIDENCE_DIR` は3回の実行を通じて同じ証跡親ディレクトリを設定する。
+
+1. `python app/scripts/run_reliability_e2e.py --scenario ffmpeg-exhaustion` を実行し、表示された `evidenceDirectory` の末尾のrun IDを控える。
+2. `python app/scripts/run_reliability_e2e.py --scenario poison-isolation` を実行し、同様にrun IDを控える。
+3. 実際のrun IDに置き換えて次を実行する（1行のコマンド）。
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario queue-monitoring --ffmpeg-evidence-run e2e-11111111-1111-4111-8111-111111111111 --poison-evidence-run e2e-22222222-2222-4222-8222-222222222222
+```
+
+監視は新しいrun IDへ結果を保存し、先行証跡は読み取りのみで変更しない。入力は `<E2E_EVIDENCE_DIR>/<指定run ID>/ffmpeg-exhaustion-evidence.json` または `poison-isolation-evidence.json` に固定し、symlink/junctionによる別ディレクトリへの転送も拒否する。CLI引数は子プロセスへ内部環境変数で渡すが、以前の環境変数の値は引き継がない。
+
+シナリオ名、指定run IDと証跡内run/targetの整合性、監視と同じ検証済みキュー・AWS account/region、UTC時刻、実際のDLQ相関を確認する。監視run IDと先行run IDが異なることは許容する。報告の `correlatedEvidence` に `requestedRunId`、証跡自身の `runId`、ファイル名、観測時刻、完全性を記録する。両証跡が `passed` かつ完全で、メトリクスとalarmの観測が揃ったときのみ全体を `passed` とする。
+
+指定ファイルの欠落・不整合は `outstanding`。未指定のシナリオは従来どおり監視の証跡ディレクトリ内のみを確認し、他runの自動検索や障害シナリオの再実行はしない。通常の単独実行では、引数未指定分の先行証跡不足が残る。preflight情報のない旧poison証跡も未確認扱いとなる。先行テスト時点の隔離証拠と監視時点の近似メトリクスは別の観測であり、全alarmの強制的な `ALARM` 遷移は完了条件に含めない。
 
 FFmpeg exhaustion observes the DLQ with `ReceiveMessage` only to correlate the
 run-owned S3 notification bucket/key and canonical IDs. Receiving temporarily changes message
@@ -640,3 +659,21 @@ cargo test --manifest-path app/backend/worker/Cargo.toml <テスト名>
 照会時間が長いだけでは失敗しない。許容差を増やす前に数値と実行環境の時計を確認する。
 
 </details>
+
+### CloudWatchメトリクス診断
+
+`queueObservations[].metricRequest` にregion、QueueName、namespace、取得期間、集計周期・方法を記録する。`metricDiagnostics` は各メトリクスのquery ID、メトリクス名、返却ID、StatusCode、値・時刻の件数、最大3点のサンプル、最大5件のAWSメッセージを保持する。文字列は長さを制限し、秘密情報やURLクエリを除去する。
+
+| reason | 意味 |
+| --- | --- |
+| `observed` | 有効な値と時刻を取得 |
+| `no-datapoints` | Complete応答だがデータ点が0件。未配信・非活動・取得条件の不一致のどれかは、この結果だけでは断定しない |
+| `missing-result` / `duplicate-result` | 要求IDが応答にない／重複 |
+| `partial-data` | AWSがPartialDataを返した |
+| `service-error` | AWSがForbiddenまたはInternalErrorを返した |
+| `invalid-status` / `invalid-response` | 状態値や応答構造、配列長が不正 |
+| `invalid-values` / `invalid-timestamps` | 数値またはUTC時刻を解析・検証できない |
+| `outside-window` | データが取得期間外 |
+| `request-error` | CLI失敗、タイムアウト、JSON解析失敗など。errorCodeに固定分類を記録 |
+
+`outstanding` にキュー・query ID・理由を併記する。request-error/service-errorは待機を打ち切り、`metricObservation.status: error` として証跡を保存する。それ以外の未確認は期限まで再観測し、最後の診断を保持する。`metric-delay`だけを根拠にAWSの配信遅延と判断しない。現在の必須メトリクスと成功条件は維持している。

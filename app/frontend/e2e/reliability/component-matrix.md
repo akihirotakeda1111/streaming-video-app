@@ -17,8 +17,15 @@ pending until that Spec supplies an executable selector and redacted evidence.
 | Attempt exhaustion | `ffmpeg-exhaustion.spec.ts` (`@ffmpeg-exhaustion`), `ffmpeg-exhaustion-driver.ts` | `python app/scripts/run_reliability_e2e.py --scenario ffmpeg-exhaustion` | durable FAILED at configured acquisition budget; no further encoding or attempt increment | Implemented — human disposable live verification outstanding |
 | Failed-job DLQ isolation | `ffmpeg-exhaustion.spec.ts` (`@ffmpeg-exhaustion`), `dlq-correlation.ts` | `python app/scripts/run_reliability_e2e.py --scenario ffmpeg-exhaustion` | exact run-owned message/body correlation, no receipt handles, no unrelated deletion or replay | Implemented — human disposable live verification outstanding |
 | Malformed / unknown-job poison input and DLQ isolation | `poison-isolation.spec.ts` (`@poison-isolation`), `poison-isolation-driver.ts`, `poison-isolation-adapter.ts`; offline helper/driver assertions | `python app/scripts/run_reliability_e2e.py --scenario poison-isolation` | exact run-owned malformed and unknown-job DLQ correlation, no job mutation or known-job attempt consumption, concurrent valid-job completion, UTC timestamps; DLQ receive changes visibility and is gated/disposable-only | Implemented — human disposable live verification outstanding |
-| Source backlog/age, DLQ depth and queue/alarm inspection | Spec 47 live observation | successor selector pending | actual metrics and alarm states/reasons, bounded observation times, correlation with Specs 45/46 isolation evidence | Pending — Spec 47 |
+| Source backlog/age, DLQ depth and queue/alarm inspection | `queue-monitoring.spec.ts` (`@queue-monitoring`), `queue-monitoring.ts`; offline helper assertions | `python app/scripts/run_reliability_e2e.py --scenario queue-monitoring` | read-only source/DLQ attributes and CloudWatch metrics, alarm identifiers and actual states/reasons including `INSUFFICIENT_DATA`, bounded observation timestamps, correlation with Specs 45/46 evidence; missing evidence remains outstanding | Implemented — human disposable live verification outstanding |
 | Phase 1 browser playback | Spec 48 live scenario | successor selector pending | API completion, manifest/segment checks, browser playback trace without unsafe artifacts | Pending — Spec 48 |
+
+Queue monitoring can explicitly reuse the two earlier run artifacts with
+`--ffmpeg-evidence-run e2e-<UUIDv4>` and `--poison-evidence-run e2e-<UUIDv4>`;
+keep `E2E_EVIDENCE_DIR` set to the same parent directory for all three runs.
+See `runner.md` for the full command and completion criteria. The monitoring run
+remains distinct; missing or mismatched references are outstanding, and only
+complete passed isolation artifacts plus actual metric/alarm observations pass.
 
 The component suite also proves the required distinction between failure before
 durable completion and acknowledgement failure after it: retryable failures may

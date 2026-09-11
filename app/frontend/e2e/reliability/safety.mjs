@@ -1,5 +1,6 @@
 // @ts-check
 import path from 'node:path'
+import { validateAlarmIdentifiers } from './alarm-identifiers.mjs'
 import { observeLiveBoundary, validateTargetSettings } from './live.mjs'
 
 export const URL_NAMES = ['E2E_FRONTEND_URL', 'E2E_API_URL']
@@ -76,6 +77,7 @@ export function validateSettings(env, live) {
   if (alarms) {
     const items = alarms.split(',').map((item) => item.trim()).filter(Boolean)
     if (!items.length) throw new Error('E2E_ALARM_IDENTIFIERS must contain at least one identifier')
+    validateAlarmIdentifiers(items)
     for (const item of items) identity('E2E_ALARM_IDENTIFIERS', item)
   }
   if (env.E2E_SOURCE_DLQ?.trim() && env.E2E_DLQ?.trim() && env.E2E_SOURCE_DLQ.trim() !== env.E2E_DLQ.trim()) {
