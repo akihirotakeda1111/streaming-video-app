@@ -5,7 +5,10 @@ import { DockerFfmpegExhaustionAdapter } from './ffmpeg-exhaustion-adapter.js'
 import { duplicateTarget } from './duplicate-driver.js'
 
 vi.mock('node:child_process', () => ({ execFileSync: vi.fn() }))
-afterEach(() => vi.resetAllMocks())
+afterEach(() => {
+  vi.resetAllMocks()
+  vi.restoreAllMocks()
+})
 
 const target = duplicateTarget('e2e-11111111-1111-4111-8111-111111111111')
 class FakeAdapter extends DockerFfmpegExhaustionAdapter {
@@ -53,6 +56,13 @@ class FakeAdapter extends DockerFfmpegExhaustionAdapter {
 }
 
 describe('FFmpeg upload through the common transport', () => {
+  it('uses a monotonic wait clock independently of UTC clock corrections', () => {
+    const adapter = new FakeAdapter()
+    const start = adapter.now()
+    vi.spyOn(Date, 'now').mockReturnValue(-1000000)
+    expect(adapter.now()).toBeGreaterThanOrEqual(start)
+    expect(adapter.stabilityMs).toBe(150000)
+  })
   it('uploads the invalid fixture using the configured timeout and host AWS settings', async () => {
     vi.mocked(execFileSync).mockReturnValue('{}')
     await new FakeAdapter().uploadInvalidMedia()

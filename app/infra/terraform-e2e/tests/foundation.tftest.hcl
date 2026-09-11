@@ -7,6 +7,36 @@ mock_provider "aws" {
   }
 }
 
+run "short_exhaustion_foundation" {
+  command = plan
+  module {
+    source = "../terraform"
+  }
+  variables {
+    project_name                        = "streaming-video"
+    environment                         = "e2e-check"
+    aws_region                          = "ap-northeast-1"
+    allowed_account_ids                 = ["123456789012"]
+    video_input_bucket                  = "streaming-video-e2e-check-input"
+    video_output_bucket                 = "streaming-video-e2e-check-output"
+    source_visibility_timeout_seconds   = 30
+    worker_heartbeat_interval_seconds   = 5
+    worker_visibility_extension_seconds = 30
+    worker_lease_duration_seconds       = 30
+    worker_retry_delay_seconds          = 10
+    worker_maximum_attempts             = 3
+    queue_max_receive_count             = 3
+  }
+  assert {
+    condition     = jsondecode(aws_sqs_queue.video_encoding.redrive_policy).maxReceiveCount == output.runtime_configuration.worker_maximum_attempts && output.runtime_configuration.worker_maximum_attempts == 3 && output.runtime_configuration.worker_retry_delay_seconds == 10
+    error_message = "Worker acquisition and source redrive budgets must agree in the short profile."
+  }
+  assert {
+    condition     = 2 * output.runtime_configuration.worker_heartbeat_interval_seconds <= min(aws_sqs_queue.video_encoding.visibility_timeout_seconds, output.runtime_configuration.worker_visibility_extension_seconds, output.runtime_configuration.worker_lease_duration_seconds)
+    error_message = "Short timings must retain the heartbeat safety margin."
+  }
+}
+
 run "foundation_as_root" {
   command = plan
   module {

@@ -44,6 +44,31 @@ const good = {
 }
 
 describe('FFmpeg exhaustion result', () => {
+  it('accepts clock rollback within a delivery without changing the recorded UTC timestamps', () => {
+    const events = good.events.map((event) =>
+      event.attempt === 2 && event.outcome !== 'acquired'
+        ? { ...event, at: event.at - 370 }
+        : { ...event },
+    )
+    const snapshot = { ...good, events }
+    expect(() => validateExhaustionResult(snapshot, snapshot, target, 3)).not.toThrow()
+    expect(events[4]!.at).toBeLessThan(events[3]!.at)
+  })
+  it('rejects reversed log order even when the timestamps appear ordered', () => {
+    const events = [...good.events]
+    ;[events[3], events[4]] = [events[4]!, events[3]!]
+    expect(() => validateExhaustionResult(good, { ...good, events }, target, 3)).toThrow(
+      'attempt 2',
+    )
+  })
+  it('rejects encoding after terminal failure even when its UTC timestamp is earlier', () => {
+    const events = [...good.events]
+    const encode = events.splice(7, 1)[0]!
+    events.push({ ...encode, at: 0 })
+    expect(() => validateExhaustionResult(good, { ...good, events }, target, 3)).toThrow(
+      'attempt 3',
+    )
+  })
   it('rejects missing, pre-encoding and miscorrelated evidence', () => {
     for (const bad of [
       { ...good, events: [] },
@@ -128,6 +153,10 @@ it('bounds missing DLQ observations', async () => {
   expect(fake.now()).toBe(5000)
 })
 it('budgets five attempts with 900-second retry delays', () => {
-  expect(exhaustionBudget(5, 300000, 900000, 150000, 900000)).toBe(6150000)
+  expect(exhaustionBudget(5, 300000, 900000, 150000, 900000)).toBe(4950000)
   expect(() => exhaustionBudget(11, 1, 1, 1, 1)).toThrow('budgets')
+})
+
+it('allows short retries and redrive while retaining a bounded total wait', () => {
+  expect(exhaustionBudget(3, 300000, 10000, 60000, 40000)).toBe(420000)
 })

@@ -38,7 +38,7 @@ const unexpected = new Set([
   'completed',
 ])
 
-/** Covers every processing attempt, retry delay and final redrive observation. */
+/** Shares the processing budget across attempts, then adds retry and redrive waits. */
 export function exhaustionBudget(
   attempts: number,
   processingMs: number,
@@ -55,7 +55,7 @@ export function exhaustionBudget(
     )
   )
     fail('Invalid exhaustion wait budgets')
-  return attempts * processingMs + (attempts - 1) * retryMs + visibilityMs + dlqMs
+  return processingMs + (attempts - 1) * retryMs + visibilityMs + dlqMs
 }
 
 /** Requires encoding and failure on each acquired delivery, without publication. */
@@ -95,29 +95,28 @@ export function validateExhaustionResult(
     const events = final.events.filter(
       (event) => event.deliveryId === owner.deliveryId && event.messageId === owner.messageId,
     )
-    const encode = events.find(
-      (event) =>
-        event.outcome === 'encode_started' && event.attempt === attempt && event.at >= owner.at,
+    // One worker log stream preserves emission order; UTC clocks can move backwards.
+    const ownerIndex = events.indexOf(owner)
+    const encodeIndex = events.findIndex(
+      (event) => event.outcome === 'encode_started' && event.attempt === attempt,
     )
-    if (
-      !encode ||
-      !events.some(
-        (event) =>
-          event.outcome === (attempt === maximumAttempts ? 'final_failed' : 'retry_released') &&
-          event.attempt === attempt &&
-          event.at >= encode.at,
+    const outcome = attempt === maximumAttempts ? 'final_failed' : 'retry_released'
+    const failureIndex = events.findIndex(
+      (event) => event.outcome === outcome && event.attempt === attempt,
+    )
+    if (encodeIndex <= ownerIndex || failureIndex <= encodeIndex)
+      fail(
+        `Missing correlated FFmpeg failure evidence: attempt ${attempt}; expected acquired -> encode_started -> ${outcome} in log order`,
       )
-    )
-      fail('Missing correlated FFmpeg failure evidence')
   }
-  const terminal = final.events.find(
+  const terminalIndex = final.events.findIndex(
     (event) => event.outcome === 'final_failed' && event.attempt === maximumAttempts,
   )
   if (
-    !terminal ||
-    final.events.some(
-      (event) => event.at > terminal.at && ['acquired', 'encode_started'].includes(event.outcome),
-    )
+    terminalIndex < 0 ||
+    final.events
+      .slice(terminalIndex + 1)
+      .some((event) => ['acquired', 'encode_started'].includes(event.outcome))
   )
     fail('Terminal failure continued processing')
   if (

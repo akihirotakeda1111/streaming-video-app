@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { isAbsolute } from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { DockerDuplicateAdapter, duplicateEvents } from './duplicate-adapter.js'
 import type { DuplicateSnapshot, DuplicateTarget } from './duplicate-driver.js'
 import { receiveRunOwnedDlq } from './dlq-correlation.js'
@@ -17,6 +18,7 @@ export class DockerFfmpegExhaustionAdapter
   readonly attempts: number
   readonly exhaustionMs: number
   readonly stabilityMs: number
+  override now = () => performance.now()
   private startedAt = new Date().toISOString()
   protected executeAws(args: string[]): any {
     try {
@@ -51,7 +53,7 @@ export class DockerFfmpegExhaustionAdapter
       E2E_DUPLICATE_FIXTURE: invalidFixture,
     })
     this.attempts = boundary.workerSettings.attempts
-    this.stabilityMs = Number(env.E2E_VISIBILITY_TIMEOUT_MS) + Number(env.E2E_DLQ_TIMEOUT_MS)
+    this.stabilityMs = Number(env.E2E_VISIBILITY_TIMEOUT_MS)
     this.exhaustionMs = exhaustionBudget(
       this.attempts,
       this.processingMs,
