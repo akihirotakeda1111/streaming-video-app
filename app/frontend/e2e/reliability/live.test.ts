@@ -2,6 +2,13 @@ import { resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { describe, expect, it, vi, afterEach } from 'vitest'
 import { verifyLiveBoundary, IDENTITY_NAMES, URL_NAMES, TIMING_NAMES, SCOPE_NAMES } from './safety.mjs'
+import { observeLiveBoundary } from './live.mjs'
+
+it('rejects option-like alarms even when preflight is called directly', () => {
+  const execute = vi.fn()
+  expect(() => observeLiveBoundary({ env: { E2E_ALARM_IDENTIFIERS: 'age,--profile,other' }, execute })).toThrow('E2E_ALARM_IDENTIFIERS')
+  expect(execute).not.toHaveBeenCalled()
+})
 
 function fixture() {
   const account = '123456789012'

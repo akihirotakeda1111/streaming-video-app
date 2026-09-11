@@ -1,5 +1,6 @@
 // @ts-check
 import { execFileSync } from 'node:child_process'
+import { validateAlarmIdentifiers } from './alarm-identifiers.mjs'
 
 /** @param {Record<string, string | undefined>} env @param {boolean} live */
 export function validateTargetSettings(env, live) {
@@ -27,6 +28,7 @@ function integer(value, name, maximum = 43200) {
  * @param {{env?: Record<string, string | undefined>, execute?: typeof execFileSync, now?: () => number}} options
  */
 export function observeLiveBoundary({ env = process.env, execute = execFileSync, now = Date.now } = {}) {
+  validateAlarmIdentifiers((env.E2E_ALARM_IDENTIFIERS || '').split(',').map(value => value.trim()).filter(Boolean))
   validateTargetSettings(env, true)
   const region = env.AWS_REGION?.trim()
   const account = env.E2E_AWS_ACCOUNT_ID?.trim()

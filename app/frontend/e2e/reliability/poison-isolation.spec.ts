@@ -23,7 +23,7 @@ test.describe('@poison-isolation', () => {
       const adapter = new DockerPoisonIsolationAdapter(boundary)
       test.setTimeout(3 * adapter.processingMs + 2 * adapter.deliveryMs + adapter.dlqMs + Number(process.env.E2E_UPLOAD_TIMEOUT_MS) + 180000)
       const result = poisonIsolationReport(target)
-      report = { ...report, liveResourcesVerified: true, runId, target, result, dlqCleanup: 'retained-for-human-cleanup' }
+      report = { ...report, liveResourcesVerified: true, verification: boundary, runId, target, result, dlqCleanup: 'retained-for-human-cleanup' }
       await writeFile(destination, JSON.stringify(safeDiagnostic(report), null, 2) + '\n', { flag: 'wx' })
       evidenceCreated = true
       report.scenarioStarted = true

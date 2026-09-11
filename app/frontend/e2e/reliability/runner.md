@@ -36,6 +36,10 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 
 最新の実装済みセレクターは `--list` で確認する。実環境の受け入れは対象環境で成功した証跡をレビューして判断する。
 
+`queue-monitoring` の観測期限はalarm取得を含む全AWS観測に適用する。期限到達時は実行中のCLIを中断し、追加取得せず最後の観測値を残す。SQS属性の件数は `attributeBacklog`、CloudWatchの件数・ageはメトリクス自身の時刻とともに別々に記録する。欠落・不正・遅延したメトリクスや未取得alarmは `outstanding` とし、実際の `INSUFFICIENT_DATA` と区別する。
+
+先行証跡は現在の証跡ディレクトリ内のみを参照する。シナリオ名、同一run/target、検証済みキュー、UTC時刻、実際のDLQ相関を確認し、不足・不整合は `outstanding` とする。poison証跡にもpreflight結果を保存するため、この情報を持たない旧証跡は未確認扱いとなる。別実行の証跡受け渡し方式は保留中であり、通常の単独実行では先行証跡不足が残る。
+
 FFmpeg exhaustion observes the DLQ with `ReceiveMessage` only to correlate the
 run-owned S3 notification bucket/key and canonical IDs. Receiving temporarily changes message
 visibility, so this helper is allowed only inside the gated disposable run.
