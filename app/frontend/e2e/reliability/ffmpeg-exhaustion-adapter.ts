@@ -17,7 +17,6 @@ export class DockerFfmpegExhaustionAdapter
   readonly attempts: number
   readonly exhaustionMs: number
   readonly stabilityMs: number
-  private readonly invalidFixture: string
   private startedAt = new Date().toISOString()
   protected executeAws(args: string[]): any {
     try {
@@ -60,7 +59,6 @@ export class DockerFfmpegExhaustionAdapter
       Number(env.E2E_VISIBILITY_TIMEOUT_MS),
       Number(env.E2E_DLQ_TIMEOUT_MS),
     )
-    this.invalidFixture = invalidFixture
   }
   async prepare(target: DuplicateTarget): Promise<void> {
     // Exercise the gated DLQ permission before creating any run-owned resources.
@@ -69,25 +67,8 @@ export class DockerFfmpegExhaustionAdapter
     this.startedAt = new Date().toISOString()
   }
   async uploadInvalidMedia(): Promise<void> {
-    this.unchanged()
-    try {
-      this.executeAws([
-        's3api',
-        'put-object',
-        '--bucket',
-        this.env.E2E_SOURCE_BUCKET!,
-        '--key',
-        this.target!.sourceKey,
-        '--body',
-        this.invalidFixture,
-        '--content-type',
-        'video/mp4',
-        '--expected-bucket-owner',
-        this.env.E2E_AWS_ACCOUNT_ID!,
-      ])
-    } catch {
-      throw new Error('Invalid media upload outcome uncertain; retain run resources')
-    }
+    // The constructor supplies the invalid fixture to the common upload transport.
+    await super.upload()
   }
   private receiveDlq(target: DuplicateTarget) {
     return receiveRunOwnedDlq(
