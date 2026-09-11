@@ -74,7 +74,7 @@ Create shared run IDs, canonical resource tracking, bounded observation, secret-
 - Download, partial segment upload, manifest upload, and database update failures map to actual deterministic tests from `phase2-worker-retry-processing`; post-completion delete failure maps to actual tests from `phase2-worker-message-completion`. Record exact test paths/names and commands after inspecting merged code, not invented selectors.
 - Execute the component evidence to prove no false completion, no concurrent unauthorized processing, and no repeat encoding after durable COMPLETED. Allow contract-authorized retries before completion; distinguish failure before durable completion from acknowledgement failure after it.
 - Missing component coverage blocks this work unit and is reported to the owning implementation Spec; do not substitute E2E mocks of an unverified backend or mutate IAM/network infrastructure.
-- Live rows identify the owning successor Spec and are explicitly pending until implemented. Spec 46 must resolve them to real executable scenario selectors; pending rows cannot count as final coverage.
+- Live rows identify the owning successor Spec and are explicitly pending until implemented. Spec 48 must resolve them to real executable scenario selectors; pending rows cannot count as final coverage.
 - Offline helper tests exercise redaction, bounded waits, resource ownership checks, and cleanup after partial failure using local fakes.
 
 ### Validation
