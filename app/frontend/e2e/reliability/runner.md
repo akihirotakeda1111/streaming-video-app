@@ -328,6 +328,7 @@ FFmpegシナリオでは `E2E_FFMPEG_INVALID_FIXTURE` に非空の不正MP4フ�
 途中失敗時の証跡にはtarget ID、収集済みsnapshot、開始状態、失敗段階と秘匿化した理由を残す。
 成功時はrun所有のDB/source/outputのみcleanupし、DLQメッセージは削除せず手動cleanup用に残す。
 `poison-isolation` は malformed と unknown-job の実メッセージをDLQで相関する。DLQの受信は一時的にvisibilityを変更するため、明示的に認可されたdisposable runの中だけで bounded に行う。受信結果を自動replayせず、今回のrunが作成した対象以外のメッセージを削除しない。receipt handleは証跡に出力しない。
+別々のDLQ受信で得た相関はmessage IDごとに保持する。`poison-isolation-evidence.json` の `result` に送信対象のID・本文ハッシュ、UTC観測履歴、失敗段階、cleanup結果を残す。途中失敗でもrun所有資源の安全なcleanupを試みるが、所有権や処理終了を確認できない場合、または送信結果が不確実な場合は資源を保持し、元の失敗理由とは別に `cleanupReason` を記録する。DLQメッセージは引き続き人手確認・cleanup用に残す。
 自動テスト成功のみでは実環境確認済みとしない。IAM適用後のdisposable live証跡を別途確認する。
 
 </details>
