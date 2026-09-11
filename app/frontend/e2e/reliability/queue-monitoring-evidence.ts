@@ -2,10 +2,20 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const messageId = /^[A-Za-z0-9-]{1,128}$/
 const hash = /^[0-9a-f]{64}$/
 
+/** Parse explicit ISO offsets as an absolute UTC instant; reject ambiguous local times. */
 export const utcTime = (value: unknown): number | undefined => {
   if (
     typeof value !== 'string' ||
-    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|\+00:00)$/.test(value)
+    !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(
+      value,
+    )
+  )
+    return undefined
+  // Date.parse normalizes invalid calendar dates such as February 30; reject them.
+  const calendar = Date.parse(value.slice(0, 19) + 'Z')
+  if (
+    !Number.isFinite(calendar) ||
+    new Date(calendar).toISOString().slice(0, 19) !== value.slice(0, 19)
   )
     return undefined
   const time = Date.parse(value)
