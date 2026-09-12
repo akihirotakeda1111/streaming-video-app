@@ -26,6 +26,16 @@ then runs the fresh `@phase1-pipeline` upload. Its redacted `full-suite-*.json`
 report separates declared component checks, live evidence, and unexecuted live
 checks; any failed or unexecuted row makes the suite non-success.
 
+Each successful live row requires its JSON artifact to match the scenario and
+run ID and report `passed`; monitoring also requires an empty `outstanding`
+list. A blocked dispatch preserves completed rows, marks the blocked row, and
+records subsequent checks as unexecuted. Exit codes are 0 for success, 1 for
+failed execution/evidence, and 2 for blocked execution or report-write failure.
+The final Chromium upload runs without retries and saves redacted network,
+pipeline, and browser observations (including video/job IDs and media-time
+advancement) in `phase1-pipeline-evidence.json` under its run directory, also on
+failure. Retain the suite report together with its referenced run directories.
+
 Queue monitoring can explicitly reuse the two earlier run artifacts with
 `--ffmpeg-evidence-run e2e-<UUIDv4>` and `--poison-evidence-run e2e-<UUIDv4>`;
 keep `E2E_EVIDENCE_DIR` set to the same parent directory for all three runs.

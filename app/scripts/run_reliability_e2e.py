@@ -131,6 +131,9 @@ def _dispatch(config: LiveConfig, selector: str, project: str, reliability: bool
         child_environment["E2E_INCLUDE_RELIABILITY"] = "true"
     else:
         child_environment.pop("E2E_INCLUDE_RELIABILITY", None)
+        child_environment["E2E_PROJECT"] = project
+    if config.scenario == "phase1-pipeline":
+        args.extend(["--retries", "0"])
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
     # CLI arguments are authoritative; never inherit an earlier run's selection.
@@ -145,7 +148,26 @@ def _dispatch(config: LiveConfig, selector: str, project: str, reliability: bool
 
 def _run(config: LiveConfig) -> int:
     """Dispatch one registered reliability scenario."""
+    if config.scenario == "preflight":
+        return _dispatch(config, SCENARIOS[config.scenario][0],
+                         os.environ.get("E2E_PROJECT", "").strip() or "chromium", False)
     return _dispatch(config, SCENARIOS[config.scenario][0], "reliability", True)
+
+
+def _validate_evidence(config: LiveConfig, evidence_file: Path) -> None:
+    """Require a completed artifact belonging to this scenario and run."""
+    try:
+        evidence = json.loads(evidence_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError("scenario evidence is missing or unreadable") from None
+    if not isinstance(evidence, dict) or (
+        evidence.get("scenario") != config.scenario
+        or evidence.get("runId") != config.evidence_dir.name
+        or evidence.get("status") != "passed"
+    ):
+        raise ValueError("scenario evidence is incomplete or does not match this run")
+    if config.scenario == "queue-monitoring" and evidence.get("outstanding") != []:
+        raise ValueError("queue monitoring evidence remains outstanding")
 
 
 def _full() -> int:
@@ -159,24 +181,26 @@ def _full() -> int:
     def run_row(name: str, selector: str, project: str, reliability: bool,
                 ffmpeg_evidence_run: str | None = None,
                 poison_evidence_run: str | None = None, **extra: object) -> int:
-        config = _live_config(name, ffmpeg_evidence_run, poison_evidence_run)
-        evidence_file = {
-            "duplicate-delivery": "duplicate-delivery-evidence.json",
-            "crash-recovery": "crash-recovery-evidence.json",
-            "long-heartbeat": "long-heartbeat-evidence.json",
-            "ffmpeg-exhaustion": "ffmpeg-exhaustion-evidence.json",
-            "poison-isolation": "poison-isolation-evidence.json",
-            "queue-monitoring": "queue-monitoring-evidence.json",
-        }.get(name)
         row = {"name": name, "selector": selector, "project": project,
-               "runId": config.evidence_dir.name, "evidenceDirectory": str(config.evidence_dir),
                "status": "unexecuted", **extra}
-        if evidence_file:
-            row["evidenceFile"] = str(config.evidence_dir / evidence_file)
         rows.append(row)
-        code = _dispatch(config, selector, project, reliability)
+        try:
+            config = _live_config(name, ffmpeg_evidence_run, poison_evidence_run)
+            evidence_file = config.evidence_dir / f"{name}-evidence.json"
+            row.update(runId=config.evidence_dir.name, evidenceDirectory=str(config.evidence_dir),
+                       evidenceFile=str(evidence_file))
+            code = _dispatch(config, selector, project, reliability)
+        except (ValueError, OSError):
+            # Do not copy arbitrary process/filesystem diagnostics into the report.
+            row.update(status="blocked", reason="scenario configuration, authorization or dispatch failed")
+            return 2
         row["status"] = "passed" if code == 0 else "failed"
         if code == 0:
+            try:
+                _validate_evidence(config, evidence_file)
+            except ValueError as error:
+                row.update(status="failed", reason=str(error))
+                return 1
             completed[name] = config.evidence_dir.name
         return code
 
@@ -197,8 +221,7 @@ def _full() -> int:
             break
 
     if not failed:
-        run_row("phase1-pipeline", "@phase1-pipeline", "chromium", False,
-                evidence="browser-playback attachment and pipeline-status attachment")
+        run_row("phase1-pipeline", "@phase1-pipeline", "chromium", False)
         failed = rows[-1]["status"] != "passed"
 
     for name in FULL_LIVE_SCENARIOS:
@@ -211,7 +234,7 @@ def _full() -> int:
 
     report = {
         "suite": "phase2-reliability-e2e-playback-regression",
-        "status": "passed" if not failed else "failed",
+        "status": "blocked" if any(row["status"] == "blocked" for row in rows) else "failed" if failed else "passed",
         "componentChecks": [{"command": command, "status": "declared; run by offline validation"}
                             for command in COMPONENT_CHECKS],
         "liveEvidence": rows,
@@ -220,7 +243,7 @@ def _full() -> int:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({"status": report["status"], "report": str(report_path)}, sort_keys=True), flush=True)
-    return 1 if failed else 0
+    return 2 if report["status"] == "blocked" else 1 if failed else 0
 
 
 def _evidence_run(value: str) -> str:
