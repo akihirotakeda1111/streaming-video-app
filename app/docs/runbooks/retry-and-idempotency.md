@@ -61,9 +61,32 @@ evidence; do not poll indefinitely.
 Run from the repository root, in the same shell that loaded generated,
 non-secret E2E settings. The target must be disposable, exclusive to this run,
 and use the validated local Docker worker/database, dedicated buckets, source
-queue, and DLQ. API/Frontend/Chromium and fixtures are additionally required
-for browser scenarios. Do not print credentials, database URLs, full signed
-URLs, query strings, or receipt handles.
+queue, and DLQ. Follow
+[`runner.md`](../../frontend/e2e/reliability/runner.md) for shared tools,
+settings, permissions, and the additional controls required by each scenario.
+Do not print credentials, database URLs, full signed URLs, query strings, or
+receipt handles.
+
+Fixture requirements apply to non-browser scenarios too:
+
+| Scenario | Fixture requirement |
+| --- | --- |
+| `duplicate-delivery`, `crash-recovery`, `long-heartbeat`, `poison-isolation` | `E2E_DUPLICATE_FIXTURE`: a normal MP4 |
+| `ffmpeg-exhaustion` | `E2E_FFMPEG_INVALID_FIXTURE`: an invalid MP4 that fails real FFmpeg processing |
+| `queue-monitoring` | No fixture; complete success requires the earlier FFmpeg and poison evidence |
+| `preflight`, final `@phase1-pipeline` playback | Host FFmpeg generates a fresh temporary MP4 |
+
+Configured fixtures must be readable absolute `.mp4` paths, nonempty and at
+most 1 GiB. Choose a normal fixture whose actual encode time permits busy
+delivery and the required heartbeat observations; file size or playback
+duration alone does not guarantee this. The full suite needs both configured
+fixtures as well as host FFmpeg for the fresh browser fixture.
+
+API/Frontend must be running and the selected browser installed for browser
+preflight and final playback; the full suite finishes with Chromium. The
+non-browser scenarios do not require those services to be running or a browser
+installed, but API/Frontend URL settings remain required by the shared
+configuration contract.
 
 Offline check (does not run a live scenario):
 
@@ -116,11 +139,21 @@ after crash injection and record cleanup outcome.
 Offline component checks and the matrix are not MVP sign-off. Human Terraform
 verification must confirm the plan targets only the disposable E2E resources,
 the queue redrive relationship, timing values, alarms, IAM boundaries, and
-labels before live execution. Then retain a successful full report:
+labels before live execution. Prepare all full-suite prerequisites from
+`runner.md`, including both fixtures and Chromium. Set `E2E_PROJECT=chromium`
+so browser preflight matches the final playback, then run each command
+separately and continue only after it succeeds:
 
 ```text
+python app/scripts/run_reliability_e2e.py --check
+python app/scripts/run_reliability_e2e.py --live-preflight
+python app/scripts/run_reliability_e2e.py --scenario preflight
 python app/scripts/run_reliability_e2e.py --full
 ```
+
+`--live-preflight` verifies the disposable resource boundary and must report
+`status=verified`. `--scenario preflight` checks Frontend, API, browser, and
+host FFmpeg readiness. `--full` does not run that browser preflight itself.
 
 `--full` serially runs the six reliability selectors, correlates the monitoring
 run with the FFmpeg and poison run IDs, and finally runs fresh Chromium

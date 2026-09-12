@@ -9,11 +9,29 @@ the checked-in executable matrix is
 ## Safe observation
 
 First confirm a unique run ID, exact source queue/DLQ identity, disposable
-opt-in, matching account and region, and no unrelated consumer. The supported
-queue-monitoring scenario performs only `sqs:get-queue-attributes`,
+opt-in, matching account and region, and no unrelated consumer. The observation
+phase of queue-monitoring performs only `sqs:get-queue-attributes`,
 `cloudwatch:get-metric-data`, and `cloudwatch:describe-alarms`. It records
 source/DLQ approximate visible count, oldest-message age, and the three
 validated SQS alarm states/reasons (`OK`, `ALARM`, or `INSUFFICIENT_DATA`).
+
+The complete command also runs the shared live-boundary authorization before
+observation. Prepare these AWS reads for the configured disposable resources:
+
+| Phase / API operation | IAM permission or condition |
+| --- | --- |
+| Authorization: STS `GetCallerIdentity` | Valid AWS credentials and STS access; no explicit IAM allow is required for this operation |
+| Authorization: SQS `GetQueueUrl` | `sqs:GetQueueUrl`, when a queue is configured by name rather than URL |
+| Authorization and observation: SQS `GetQueueAttributes` | `sqs:GetQueueAttributes` on source queue and DLQ |
+| Authorization: S3 `HeadBucket` | `s3:ListBucket` on source and output buckets |
+| Authorization: S3 `GetBucketLocation` | `s3:GetBucketLocation` on both buckets |
+| Authorization and observation: CloudWatch `DescribeAlarms` | `cloudwatch:DescribeAlarms` |
+| Observation: CloudWatch `GetMetricData` | `cloudwatch:GetMetricData` |
+
+Authorization also checks the local Docker worker/database boundary. Follow
+[`runner.md`](../../frontend/e2e/reliability/runner.md) for the shared tools,
+settings, and local access prerequisites. Queue monitoring needs no fixture;
+its complete success requires the earlier FFmpeg and poison evidence below.
 
 Offline check:
 
@@ -108,15 +126,25 @@ redacted evidence and human escalation.
 
 ## Final Phase 1 and MVP verification
 
-Human Terraform verification precedes the live run. Then execute the serial
-gated suite:
+Human Terraform verification precedes the live run. Prepare all full-suite
+prerequisites in [`runner.md`](../../frontend/e2e/reliability/runner.md),
+including both fixtures and Chromium. Set `E2E_PROJECT=chromium` so browser
+preflight matches the final playback, then run each command separately and
+continue only after it succeeds:
 
 ```text
+python app/scripts/run_reliability_e2e.py --check
+python app/scripts/run_reliability_e2e.py --live-preflight
+python app/scripts/run_reliability_e2e.py --scenario preflight
 python app/scripts/run_reliability_e2e.py --full
 ```
 
-It runs duplicate delivery, crash recovery, long heartbeat, FFmpeg exhaustion,
-poison isolation, and queue monitoring, then the fresh Chromium
+`--live-preflight` verifies the disposable resource boundary and must report
+`status=verified`. `--scenario preflight` checks Frontend, API, browser, and
+host FFmpeg readiness. `--full` does not run that browser preflight itself.
+
+The full suite runs duplicate delivery, crash recovery, long heartbeat, FFmpeg
+exhaustion, poison isolation, and queue monitoring, then the fresh Chromium
 `@phase1-pipeline` playback regression. The final playback must show direct
 upload, API `COMPLETED`, segments before `index.m3u8`, HLS object and
 network/CORS checks, and positive media-time advancement. Retain the full
