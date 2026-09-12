@@ -24,6 +24,20 @@ SCENARIOS = {
     "poison-isolation": ("@poison-isolation", "malformed and unknown-job poison DLQ isolation with a concurrently valid job"),
     "queue-monitoring": ("@queue-monitoring", "read-only source backlog, DLQ depth, and alarm observation correlated with failure evidence"),
 }
+FULL_LIVE_SCENARIOS = (
+    "duplicate-delivery",
+    "crash-recovery",
+    "long-heartbeat",
+    "ffmpeg-exhaustion",
+    "poison-isolation",
+    "queue-monitoring",
+)
+COMPONENT_CHECKS = (
+    "cargo test --manifest-path app/backend/worker/Cargo.toml each_pipeline_failure_obeys_attempt_budget_and_cleans_up",
+    "cargo test --manifest-path app/backend/worker/Cargo.toml partial_upload_redelivery_reacquires_and_publishes_before_acknowledgement",
+    "cargo test --manifest-path app/backend/worker/Cargo.toml stale_owner_and_database_errors_never_report_terminal_success",
+    "cargo test --manifest-path app/backend/worker/Cargo.toml delete_failure_redelivery_only_retries_acknowledgement",
+)
 TOOLS = ("node", "npm", "npx", "ffmpeg", "aws", "docker")
 SAFETY_CLI = Path(__file__).resolve().parents[1] / "frontend/e2e/reliability/safety-cli.mjs"
 
@@ -103,21 +117,20 @@ def _preflight() -> int:
     return 0
 
 
-def _run(config: LiveConfig) -> int:
+def _dispatch(config: LiveConfig, selector: str, project: str, reliability: bool) -> int:
     """Authorize before creating evidence or dispatching any scenario."""
     _settings("authorize")
     config.evidence_dir.mkdir(parents=True, exist_ok=False)
-    grep, _ = SCENARIOS[config.scenario]
     node = shutil.which("node")
     if node is None:
         raise ValueError("required local tool missing: node")
     cli = SAFETY_CLI.parents[2] / "node_modules/@playwright/test/cli.js"
-    args = [node, str(cli), "test", "--grep", grep]
-    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion", "poison-isolation", "queue-monitoring"):
-        args.extend(["--project", "reliability"])
+    args = [node, str(cli), "test", "--grep", selector, "--project", project]
     child_environment = os.environ.copy()
-    if config.scenario in ("runtime-authorization", "duplicate-delivery", "crash-recovery", "long-heartbeat", "ffmpeg-exhaustion", "poison-isolation", "queue-monitoring"):
+    if reliability:
         child_environment["E2E_INCLUDE_RELIABILITY"] = "true"
+    else:
+        child_environment.pop("E2E_INCLUDE_RELIABILITY", None)
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
     # CLI arguments are authoritative; never inherit an earlier run's selection.
@@ -128,6 +141,86 @@ def _run(config: LiveConfig) -> int:
             child_environment[name] = run_id
     print(json.dumps({"scenario": config.scenario, "evidenceDirectory": str(config.evidence_dir)}), flush=True)
     return subprocess.run(args, cwd=SAFETY_CLI.parents[2], env=child_environment, check=False).returncode
+
+
+def _run(config: LiveConfig) -> int:
+    """Dispatch one registered reliability scenario."""
+    return _dispatch(config, SCENARIOS[config.scenario][0], "reliability", True)
+
+
+def _full() -> int:
+    """Run every live failure scenario serially, then the fresh Phase 1 playback test."""
+    _settings("validate")
+    parent = Path(os.environ["E2E_EVIDENCE_DIR"].strip()).resolve()
+    report_path = parent / f"full-suite-{uuid4()}.json"
+    rows: list[dict[str, object]] = []
+    completed: dict[str, str] = {}
+
+    def run_row(name: str, selector: str, project: str, reliability: bool,
+                ffmpeg_evidence_run: str | None = None,
+                poison_evidence_run: str | None = None, **extra: object) -> int:
+        config = _live_config(name, ffmpeg_evidence_run, poison_evidence_run)
+        evidence_file = {
+            "duplicate-delivery": "duplicate-delivery-evidence.json",
+            "crash-recovery": "crash-recovery-evidence.json",
+            "long-heartbeat": "long-heartbeat-evidence.json",
+            "ffmpeg-exhaustion": "ffmpeg-exhaustion-evidence.json",
+            "poison-isolation": "poison-isolation-evidence.json",
+            "queue-monitoring": "queue-monitoring-evidence.json",
+        }.get(name)
+        row = {"name": name, "selector": selector, "project": project,
+               "runId": config.evidence_dir.name, "evidenceDirectory": str(config.evidence_dir),
+               "status": "unexecuted", **extra}
+        if evidence_file:
+            row["evidenceFile"] = str(config.evidence_dir / evidence_file)
+        rows.append(row)
+        code = _dispatch(config, selector, project, reliability)
+        row["status"] = "passed" if code == 0 else "failed"
+        if code == 0:
+            completed[name] = config.evidence_dir.name
+        return code
+
+    failed = False
+    for name in FULL_LIVE_SCENARIOS:
+        if name == "queue-monitoring":
+            code = run_row(
+                name, SCENARIOS[name][0], "reliability", True,
+                ffmpeg_evidence_run=completed.get("ffmpeg-exhaustion"),
+                poison_evidence_run=completed.get("poison-isolation"),
+                ffmpegEvidenceRun=completed.get("ffmpeg-exhaustion"),
+                poisonEvidenceRun=completed.get("poison-isolation"),
+            )
+        else:
+            code = run_row(name, SCENARIOS[name][0], "reliability", True)
+        if code != 0:
+            failed = True
+            break
+
+    if not failed:
+        run_row("phase1-pipeline", "@phase1-pipeline", "chromium", False,
+                evidence="browser-playback attachment and pipeline-status attachment")
+        failed = rows[-1]["status"] != "passed"
+
+    for name in FULL_LIVE_SCENARIOS:
+        if not any(row["name"] == name for row in rows):
+            rows.append({"name": name, "selector": SCENARIOS[name][0], "project": "reliability",
+                         "status": "unexecuted", "reason": "earlier full-suite scenario failed"})
+    if not any(row["name"] == "phase1-pipeline" for row in rows):
+        rows.append({"name": "phase1-pipeline", "selector": "@phase1-pipeline", "project": "chromium",
+                     "status": "unexecuted", "reason": "failure or missing scenario prevented final upload"})
+
+    report = {
+        "suite": "phase2-reliability-e2e-playback-regression",
+        "status": "passed" if not failed else "failed",
+        "componentChecks": [{"command": command, "status": "declared; run by offline validation"}
+                            for command in COMPONENT_CHECKS],
+        "liveEvidence": rows,
+        "unexecutedLiveChecks": [row["name"] for row in rows if row["status"] == "unexecuted"],
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps({"status": report["status"], "report": str(report_path)}, sort_keys=True), flush=True)
+    return 1 if failed else 0
 
 
 def _evidence_run(value: str) -> str:
@@ -144,12 +237,13 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--check", action="store_true", help="validate local tools and supplied settings only")
     modes.add_argument("--list", action="store_true", help="list implemented scenario selectors")
     modes.add_argument("--live-preflight", action="store_true", help="verify disposable resources without dispatching a scenario")
+    modes.add_argument("--full", "--full-suite", action="store_true", help="run all reliability scenarios serially and finish with Phase 1 playback")
     parser.add_argument("--scenario", choices=sorted(SCENARIOS), default="preflight")
     parser.add_argument("--ffmpeg-evidence-run", type=_evidence_run, help="FFmpeg evidence run directory under E2E_EVIDENCE_DIR (queue-monitoring only)")
     parser.add_argument("--poison-evidence-run", type=_evidence_run, help="poison evidence run directory under E2E_EVIDENCE_DIR (queue-monitoring only)")
     args = parser.parse_args(argv)
     if (args.ffmpeg_evidence_run is not None or args.poison_evidence_run is not None) and (
-            args.scenario != "queue-monitoring" or args.list or args.check or args.live_preflight):
+            args.scenario != "queue-monitoring" or args.list or args.check or args.live_preflight or args.full):
         parser.error("evidence run arguments require --scenario queue-monitoring without offline/preflight modes")
     if args.list:
         for selector, (_, description) in SCENARIOS.items():
@@ -162,6 +256,14 @@ def main(argv: list[str] | None = None) -> int:
             return _preflight()
         except (ValueError, OSError) as error:
             print(json.dumps({"status": "blocked", "message": str(error) if isinstance(error, ValueError) else "local preflight evidence could not be written", "scenarioStarted": False}), file=sys.stderr)
+            return 2
+    if args.full:
+        try:
+            return _full()
+        except (ValueError, OSError) as error:
+            print(json.dumps({"status": "blocked", "suite": "phase2-reliability-e2e-playback-regression",
+                              "message": str(error) if isinstance(error, ValueError) else "full-suite dispatch failed",
+                              "liveResourcesVerified": False}), file=sys.stderr)
             return 2
     try:
         return _run(_live_config(args.scenario, args.ffmpeg_evidence_run, args.poison_evidence_run))
