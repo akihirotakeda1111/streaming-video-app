@@ -144,7 +144,9 @@ class RunnerChecks(unittest.TestCase):
             calls.append(command[2])
             return RUN(command, **kwargs)
 
-        env = {key: value for key, value in os.environ.items() if not key.startswith("E2E_")}
+        # Missing-field cases must not recover values from the caller's live setup.
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("E2E_", "AWS_")) and key not in SETTINGS}
         env.update(settings)
         output = io.StringIO()
         with patch.dict(os.environ, env, clear=True), \
@@ -170,6 +172,15 @@ class RunnerChecks(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertIn(name, output)
                 self.assertEqual(calls, ["validate"])
+
+    def test_missing_region_isolated_from_host_configuration(self):
+        with patch.dict(os.environ, {"AWS_REGION": "ap-northeast-1",
+                                     "AWS_DEFAULT_REGION": "ap-northeast-1"}):
+            settings = {key: value for key, value in SETTINGS.items() if key != "AWS_REGION"}
+            code, output, calls = self.invoke(["--scenario", "runtime-authorization"], settings)
+        self.assertEqual(code, 2)
+        self.assertIn("AWS_REGION", output)
+        self.assertEqual(calls, ["validate"])
 
     def test_offline_status_and_unsafe_scopes(self):
         for name, value, expected in (
