@@ -1,4 +1,7 @@
 mock_provider "aws" {
+  mock_resource "aws_iam_policy" {
+    defaults = { arn = "arn:aws:iam::123456789012:policy/mock-e2e" }
+  }
   mock_data "aws_caller_identity" {
     defaults = { account_id = "123456789012" }
   }
@@ -7,8 +10,9 @@ mock_provider "aws" {
   }
 }
 
-run "short_exhaustion_foundation" {
-  command = plan
+run "fixed_suite_foundation" {
+  # Mock apply resolves the DLQ ARN embedded in redrive_policy; no AWS calls.
+  command = apply
   module {
     source = "../terraform"
   }
@@ -19,21 +23,25 @@ run "short_exhaustion_foundation" {
     allowed_account_ids                 = ["123456789012"]
     video_input_bucket                  = "streaming-video-e2e-check-input"
     video_output_bucket                 = "streaming-video-e2e-check-output"
-    source_visibility_timeout_seconds   = 30
+    source_visibility_timeout_seconds   = 120
     worker_heartbeat_interval_seconds   = 5
-    worker_visibility_extension_seconds = 30
-    worker_lease_duration_seconds       = 30
+    worker_visibility_extension_seconds = 120
+    worker_lease_duration_seconds       = 60
     worker_retry_delay_seconds          = 10
     worker_maximum_attempts             = 3
     queue_max_receive_count             = 3
   }
   assert {
     condition     = jsondecode(aws_sqs_queue.video_encoding.redrive_policy).maxReceiveCount == output.runtime_configuration.worker_maximum_attempts && output.runtime_configuration.worker_maximum_attempts == 3 && output.runtime_configuration.worker_retry_delay_seconds == 10
-    error_message = "Worker acquisition and source redrive budgets must agree in the short profile."
+    error_message = "Worker acquisition and source redrive budgets must agree in the fixed suite configuration."
+  }
+  assert {
+    condition     = aws_sqs_queue.video_encoding.visibility_timeout_seconds == 120 && output.runtime_configuration.worker_visibility_extension_seconds == 120 && output.runtime_configuration.worker_lease_duration_seconds == 60
+    error_message = "Queue visibility and Worker lease must use the full-suite settings."
   }
   assert {
     condition     = 2 * output.runtime_configuration.worker_heartbeat_interval_seconds <= min(aws_sqs_queue.video_encoding.visibility_timeout_seconds, output.runtime_configuration.worker_visibility_extension_seconds, output.runtime_configuration.worker_lease_duration_seconds)
-    error_message = "Short timings must retain the heartbeat safety margin."
+    error_message = "Suite timings must retain the heartbeat safety margin."
   }
 }
 

@@ -21,12 +21,8 @@ provider "aws" {
 }
 
 locals {
-  timing_profiles = {
-    standard   = { heartbeat = 30, visibility = 120, lease = 300, retry = 900, attempts = 5 }
-    lifecycle  = { heartbeat = 5, visibility = 30, lease = 30, retry = 900, attempts = 5 }
-    exhaustion = { heartbeat = 5, visibility = 30, lease = 30, retry = 10, attempts = 3 }
-  }
-  timing = local.timing_profiles[var.timing_profile]
+  # One setting for the entire reliability suite; no mid-run resource changes.
+  timing = { heartbeat = 5, visibility = 120, lease = 60, retry = 10, attempts = 3 }
 
   prefix = "streaming-video-e2e-${var.instance}"
   tags = {

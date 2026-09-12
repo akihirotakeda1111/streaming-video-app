@@ -203,7 +203,7 @@ export async function runLifecycle(
         dbRenewals < requiredRenewals
       )
         return false
-      assertHeartbeats(renewals, requiredRenewals)
+      assertHeartbeats(renewals, requiredRenewals, adapter.clockSkewMs)
       if (
         renewals.filter(
           (e) =>
@@ -244,7 +244,8 @@ export async function runLifecycle(
         leaseExpiresAtMs: stopped.job.leaseMs,
         localBeforeMs: stopped.localBeforeMs,
         localAfterMs: stopped.localAfterMs,
-        visibilityObservedAtMs: visibility.observedAtMs,
+        // A reversed response timestamp must not move the safe restart bound earlier.
+        visibilityObservedAtMs: Math.max(visibility.startedAtMs, visibility.observedAtMs),
         visibilityDurationMs: visibility.durationMs,
         stoppedAtMs: report.stoppedAtMs,
         maximumVisibilityMs: adapter.maximumVisibilityMs,
@@ -292,7 +293,7 @@ export async function runLifecycle(
         adapter.clockSkewMs,
       )
     } else {
-      assertHeartbeats(final.heartbeats, 2)
+      assertHeartbeats(final.heartbeats, 2, adapter.clockSkewMs)
       if (final.job.attempt !== 1 || acquisitions.length !== 1)
         fail('Long heartbeat changed attempt or owner')
     }

@@ -70,7 +70,7 @@ export function lifecycleEvents(
       f.heartbeat_cycle < 1 ||
       !Number.isFinite(f.elapsed_ms) ||
       f.elapsed_ms < 0 ||
-      end < start ||
+      // elapsed_ms is monotonic; wall-clock corrections may make end < start.
       Math.abs(end - start - f.elapsed_ms) > skew ||
       timestamp < end - skew ||
       duration !== 1000 * (f.operation === 'lease_renewal' ? settings.lease : settings.visibility)
@@ -98,7 +98,7 @@ export function lifecycleEvents(
   for (const group of groups.values()) {
     const op = group.lease || group.visibility!
     const owner = owners.get(op.deliveryId)!
-    if (group.lease && group.visibility && group.visibility.startedAtMs < group.lease.observedAtMs)
+    if (group.lease && group.visibility && group.visibility.startedAtMs < group.lease.observedAtMs - skew)
       fail('Heartbeat visibility extension preceded lease renewal')
     heartbeats.push({
       outcome: group.lease && group.visibility ? 'heartbeat_succeeded' : 'heartbeat_incomplete',
@@ -110,10 +110,10 @@ export function lifecycleEvents(
       startedAtMs: op.startedAtMs,
       at: Math.max(group.lease?.observedAtMs || 0, group.visibility?.observedAtMs || 0),
       leaseExpiresAtMs: group.lease
-        ? group.lease.startedAtMs + group.lease.durationMs - skew
+        ? Math.min(group.lease.startedAtMs, group.lease.observedAtMs) + group.lease.durationMs - skew
         : null,
       visibilityExpiresAtMs: group.visibility
-        ? group.visibility.startedAtMs + group.visibility.durationMs - skew
+        ? Math.min(group.visibility.startedAtMs, group.visibility.observedAtMs) + group.visibility.durationMs - skew
         : null,
       visibilityObservedAtMs: group.visibility?.observedAtMs || 0,
     })

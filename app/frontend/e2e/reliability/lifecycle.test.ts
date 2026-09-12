@@ -153,6 +153,14 @@ describe('lifecycle evidence assertions', () => {
       expect(() => assertHeartbeats(events, 2)).toThrow()
     }
   })
+  it('tolerates bounded wall-clock regression while still requiring ordered cycles and live expiry', () => {
+    const first = renewals()[0]!
+    const second = { ...first, cycle: first.cycle + 1, startedAtMs: first.startedAtMs - 10, at: first.at - 10, leaseExpiresAtMs: first.leaseExpiresAtMs! - 10, visibilityExpiresAtMs: first.visibilityExpiresAtMs! - 10 }
+    expect(() => assertHeartbeats([first, second], 2, 10)).not.toThrow()
+    expect(() => assertHeartbeats([first, second], 2, 9)).toThrow()
+    expect(() => assertHeartbeats([first, { ...second, cycle: first.cycle }], 2, 10)).toThrow()
+    expect(() => assertHeartbeats([first, { ...second, leaseExpiresAtMs: second.at }], 2, 10)).toThrow('expired')
+  })
   it.each(['heartbeat_failed', 'ownership_lost', 'heartbeat_incomplete'])(
     'rejects %s after enough successes',
     (outcome) => {

@@ -154,6 +154,11 @@ describe('read-only environment command generator', () => {
     expect(env.E2E_SOURCE_DLQ).toBe(env.E2E_DLQ)
     expect(env.E2E_WORKER_OBSERVATION).toBe(env.E2E_WORKER_PROCESS_CONTROL)
     expect(env.E2E_ALARM_IDENTIFIERS).toBe('age,backlog,dead')
+    expect(env.VIDEO_INPUT_BUCKET).toBe(env.E2E_SOURCE_BUCKET)
+    expect(env.VIDEO_OUTPUT_BUCKET).toBe(env.E2E_OUTPUT_BUCKET)
+    expect(env.OUTPUT_S3_ENDPOINT).toBe('https://output.s3.us-east-1.amazonaws.com')
+    expect(env.FRONTEND_ORIGIN).toBe(new URL(env.E2E_FRONTEND_URL!).origin)
+    expect(env.VITE_API_BASE_URL).toBe(env.E2E_API_URL + '/api/v1')
     const output = renderPowerShell(env)
     expect(output).toContain("$env:AWS_PROFILE = 'test-profile'")
     expect(output).not.toContain('private-')
@@ -168,7 +173,21 @@ describe('read-only environment command generator', () => {
     expect(env.E2E_RELIABILITY_DISPOSABLE).toBe('')
     expect(env.E2E_DUPLICATE_EXCLUSIVE).toBe('')
     expect(env.E2E_DUPLICATE_FIXTURE).toBe('')
+    expect(env.E2E_FFMPEG_INVALID_FIXTURE).toBe('')
+    expect(env.E2E_CLOCK_SKEW_MS).toBe('')
+    expect(env.E2E_PROJECT).toBe('chromium')
     expect(() => validateSettings(env, true)).toThrow('DISPOSABLE')
+  })
+  it('aligns Compose ports, API CORS and frontend API requests with custom test URLs', () => {
+    const f = fixture()
+    const env = discoverEnvironment({ ...f.options, frontendUrl: 'http://localhost:5517/', apiUrl: 'http://localhost:8800/' }, f.execute)
+    expect(env.FRONTEND_PORT).toBe('5517')
+    expect(env.API_PORT).toBe('8800')
+    expect(env.FRONTEND_ORIGIN).toBe('http://localhost:5517')
+    expect(env.VITE_API_BASE_URL).toBe('http://localhost:8800/api/v1')
+    expect(renderPowerShell(env)).toContain("$env:OUTPUT_S3_ENDPOINT = 'https://output.s3.us-east-1.amazonaws.com'")
+    expect(env).not.toHaveProperty('COMPOSE_DATABASE_URL')
+    expect(env).not.toHaveProperty('API_AWS_SECRET_ACCESS_KEY')
   })
   it.each(['account', 'labels', 'redrive', 'attempts', 'budget', 'heartbeat', 'missing-alarm'])(
     'rejects inconsistent %s instead of inventing values',
@@ -215,11 +234,12 @@ describe('read-only environment command generator', () => {
     const f = fixture()
     const root = mkdtempSync(join(tmpdir(), 'e2e-env-generator-'))
     const output = join(root, 'settings.ps1'),
-      mp4 = join(root, 'fixture.mp4')
+      mp4 = join(root, 'fixture.mp4'), invalid = join(root, 'invalid.mp4')
     vi.spyOn(process.stdout, 'write').mockReturnValue(true)
     vi.spyOn(process.stderr, 'write').mockReturnValue(true)
     try {
       writeFileSync(mp4, 'test fixture bytes')
+      writeFileSync(invalid, 'invalid mp4 bytes')
       const args = [
         '--worker',
         'worker',
@@ -227,6 +247,9 @@ describe('read-only environment command generator', () => {
         'database',
         '--fixture',
         mp4,
+        '--invalid-fixture', invalid,
+        '--clock-skew-ms', '100',
+        '--full',
         '--docker-host',
         f.options.dockerHost,
         '--exclusive',
@@ -238,15 +261,39 @@ describe('read-only environment command generator', () => {
       expect(text.startsWith('\ufeff')).toBe(true)
       expect(text).toContain("$env:E2E_RELIABILITY_DISPOSABLE = 'true'")
       expect(text).toContain(mp4)
+      expect(text).toContain(invalid)
+      expect(text).toContain("$env:E2E_CLOCK_SKEW_MS = '100'")
+      expect(text).toContain("$env:E2E_PROJECT = 'chromium'")
       expect(main(args, f.execute)).toBe(2)
       expect(readFileSync(output, 'utf8')).toBe(text)
     } finally {
       unlinkSync(mp4)
+      unlinkSync(invalid)
       try {
         unlinkSync(output)
       } finally {
         rmdirSync(root)
       }
     }
+  })
+
+  it('rejects incomplete full-suite inputs before discovery', () => {
+    const f = fixture()
+    const options = { ...f.options, full: true, exclusive: true, fixture: 'normal.mp4', invalidFixture: 'invalid.mp4', clockSkewMs: '100' }
+    for (const name of ['exclusive', 'fixture', 'invalidFixture', 'clockSkewMs'] as const) {
+      expect(() => discoverEnvironment({ ...options, [name]: undefined }, f.execute)).toThrow('--full requires')
+    }
+    expect(f.execute).not.toHaveBeenCalled()
+  })
+
+  it.each(['0', '5001', '-1', '1.5', 'NaN', 'private-value'])('rejects invalid clock bounds %s without leaking inputs', (clockSkewMs) => {
+    const f = fixture()
+    expect(() => discoverEnvironment({ ...f.options, clockSkewMs }, f.execute)).toThrow('Invalid clock skew bound')
+    expect(f.execute).not.toHaveBeenCalled()
+  })
+
+  it('rejects an unavailable invalid fixture instead of generating a partial setup', () => {
+    const f = fixture()
+    expect(() => discoverEnvironment({ ...f.options, invalidFixture: join(tmpdir(), 'missing-e2e-invalid-file.mp4') }, f.execute)).toThrow('E2E_FFMPEG_INVALID_FIXTURE file unavailable')
   })
 })

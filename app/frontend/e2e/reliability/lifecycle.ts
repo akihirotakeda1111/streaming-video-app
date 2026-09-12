@@ -186,7 +186,12 @@ export const failureOutcomes = new Set([
 export function assertHeartbeats(
   events: readonly HeartbeatObservation[],
   minimumCycles: number,
+  clockSkewMs = 0,
 ): void {
+  if (!Number.isFinite(clockSkewMs) || clockSkewMs < 0) fail('Invalid heartbeat clock tolerance')
+  // Cycle numbers establish order; wall-clock-derived values have bounded uncertainty.
+  const didNotAdvance = (current: number, previous: number) =>
+    clockSkewMs === 0 ? current <= previous : current < previous - clockSkewMs
   if (!Number.isSafeInteger(minimumCycles) || minimumCycles < 1)
     fail('at least one heartbeat cycle is required')
   if (events.some((e) => e.outcome !== 'heartbeat_succeeded'))
@@ -209,19 +214,19 @@ export function assertHeartbeats(
       fail('heartbeat ownership changed during renewal')
     positive(event.at, 'heartbeat time')
     positive(event.startedAtMs, 'heartbeat request time')
-    if (!Number.isSafeInteger(event.cycle) || event.cycle < 1 || event.startedAtMs > event.at)
+    if (!Number.isSafeInteger(event.cycle) || event.cycle < 1 || event.startedAtMs > event.at + clockSkewMs)
       fail('heartbeat cycle or request time is invalid')
     for (const expiry of [event.leaseExpiresAtMs, event.visibilityExpiresAtMs]) {
       if (expiry === null || !Number.isFinite(expiry) || expiry <= event.at)
         fail('heartbeat expiry evidence is incomplete or expired')
     }
     const previous = events[index - 1]
-    if (previous && (event.at <= previous.at || event.cycle <= previous.cycle))
+    if (previous && (didNotAdvance(event.at, previous.at) || event.cycle <= previous.cycle))
       fail('heartbeat timestamps or cycles are not ordered')
     if (
       previous &&
-      (event.leaseExpiresAtMs! <= previous.leaseExpiresAtMs! ||
-        event.visibilityExpiresAtMs! <= previous.visibilityExpiresAtMs!)
+      (didNotAdvance(event.leaseExpiresAtMs!, previous.leaseExpiresAtMs!) ||
+        didNotAdvance(event.visibilityExpiresAtMs!, previous.visibilityExpiresAtMs!))
     )
       fail('heartbeat did not extend expiry')
   }

@@ -95,6 +95,8 @@ function fixture(scenario: Scenario = 'crash-recovery') {
     E2E_DOCKER_HOST: 'unix:///dedicated.sock',
   }
   class TestAdapter extends DockerLifecycleAdapter {
+    override readJob() { return super.readJob() }
+    override readLogs() { return super.readLogs() }
     setTarget() {
       this.target = duplicateTarget('e2e-11111111-1111-4111-8111-111111111111')
     }
@@ -107,6 +109,43 @@ function fixture(scenario: Scenario = 'crash-recovery') {
   return { adapter, boundary, env, execute, state, calls, worker, database }
 }
 describe('controlled Docker worker lifecycle', () => {
+  it.each(['crash-recovery', 'long-heartbeat'] as const)('discards a 14 ms reversal and reobserves %s', async (scenario) => {
+    const { adapter } = fixture(scenario)
+    const job = { status: 'PROCESSING', attempt: 1, workerId: 'worker', leaseMs: 5000, observedAtMs: 1000, updatedAtMs: 900 }
+    const read = vi.spyOn(adapter, 'readJob').mockReturnValueOnce(job)
+      .mockReturnValue({ ...job, observedAtMs: 1105, leaseMs: 6000 })
+    const logs = vi.spyOn(adapter, 'readLogs').mockReturnValue('')
+    adapter.now = vi.fn().mockReturnValueOnce(1020).mockReturnValueOnce(1006)
+      .mockReturnValueOnce(1100).mockReturnValueOnce(1110)
+    const snapshot = await adapter.observe()
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(logs).toHaveBeenCalledTimes(2)
+    expect(snapshot).toMatchObject({ localBeforeMs: 1100, localAfterMs: 1110, job: { observedAtMs: 1105, leaseMs: 6000 } })
+  })
+  it('stops after three reversed observations and retains the last diagnostic', async () => {
+    const { adapter } = fixture()
+    const read = vi.spyOn(adapter, 'readJob').mockReturnValue({ status: 'PROCESSING', attempt: 1, workerId: 'worker', leaseMs: 5000, observedAtMs: 1000, updatedAtMs: 900 })
+    vi.spyOn(adapter, 'readLogs').mockReturnValue('')
+    let call = 0
+    adapter.now = () => call++ % 2 === 0 ? 1020 : 1006
+    await expect(adapter.observe()).rejects.toMatchObject({ clockDiagnostic: { cause: 'local_clock_reversed', excessMs: 14, localBeforeMs: 1020, localAfterMs: 1006 } })
+    expect(read).toHaveBeenCalledTimes(3)
+  })
+  it.each([800, 1200])('does not retry DB clock skew violations (%s)', async (observedAtMs) => {
+    const { adapter } = fixture()
+    const read = vi.spyOn(adapter, 'readJob').mockReturnValue({ status: 'PROCESSING', attempt: 1, workerId: 'worker', leaseMs: 5000, observedAtMs, updatedAtMs: 900 })
+    vi.spyOn(adapter, 'readLogs').mockReturnValue('')
+    adapter.now = () => 1000
+    await expect(adapter.observe()).rejects.toThrow('Database clock is outside')
+    expect(read).toHaveBeenCalledTimes(1)
+  })
+  it('does not retry DB read failures', async () => {
+    const { adapter } = fixture()
+    const read = vi.spyOn(adapter, 'readJob').mockImplementation(() => { throw new Error('DB unavailable') })
+    vi.spyOn(adapter, 'readLogs').mockReturnValue('')
+    await expect(adapter.observe()).rejects.toThrow('DB unavailable')
+    expect(read).toHaveBeenCalledTimes(1)
+  })
   it('stops abruptly and restores only the same verified worker; DB remains running', async () => {
     const f = fixture()
     await f.adapter.stop()

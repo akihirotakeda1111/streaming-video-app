@@ -18,9 +18,16 @@ export class DockerPoisonIsolationAdapter extends DockerDuplicateAdapter {
 
   constructor(boundary: ConstructorParameters<typeof DockerDuplicateAdapter>[0], env = process.env) {
     super(boundary, { ...env, E2E_DUPLICATE_EXCLUSIVE: 'true' })
-    this.dlqMs = Number(env.E2E_DLQ_TIMEOUT_MS)
-    if (!Number.isSafeInteger(this.dlqMs) || this.dlqMs < 1 || this.dlqMs > 900000)
+    const observationMs = Number(env.E2E_DLQ_TIMEOUT_MS)
+    const visibilityMs = Number(env.E2E_VISIBILITY_TIMEOUT_MS)
+    const attempts = boundary.workerSettings.attempts
+    if (![observationMs, visibilityMs].every((n) => Number.isSafeInteger(n) && n >= 1 && n <= 900000)
+      || !Number.isSafeInteger(attempts) || attempts < 1 || attempts > 10)
       throw new Error('Invalid poison DLQ wait budget')
+    // Poison does not schedule Worker retries. Cover every source visibility
+    // cycle using the validated upper bound, then allow DLQ observation time.
+    // The shared preflight checks that attempts equals source maxReceiveCount.
+    this.dlqMs = attempts * visibilityMs + observationMs
   }
 
   async prepare(target: DuplicateTarget): Promise<void> {

@@ -21,6 +21,119 @@ RUN = subprocess.run
 
 
 class RunnerChecks(unittest.TestCase):
+    def full_suite(self, fault=None):
+        """Exercise real dispatch and reporting with only external operations replaced."""
+        with tempfile.TemporaryDirectory() as root:
+            calls = []
+            output = io.StringIO()
+
+            def settings(mode):
+                if fault == "config" and len(calls) == 1 and mode == "validate":
+                    raise ValueError("private-value")
+                if fault == "authorize" and len(calls) == 1 and mode == "authorize":
+                    raise ValueError("private-value")
+                return {"status": "verified"}
+
+            def dispatch(command, **kwargs):
+                env = kwargs["env"]
+                name = command[command.index("--grep") + 1][1:]
+                calls.append((name, env))
+                if fault == "launch" and len(calls) == 2:
+                    raise OSError("private-value")
+                if fault == "exit" and len(calls) == 2:
+                    return subprocess.CompletedProcess(command, 1)
+                evidence = {"scenario": name, "runId": env["E2E_RUN_ID"], "status": "passed"}
+                if name == "queue-monitoring":
+                    evidence["outstanding"] = []
+                    if fault == "outstanding":
+                        evidence.update(status="outstanding", outstanding=["metric delayed"])
+                    if fault == "contradictory":
+                        evidence["outstanding"] = ["metric delayed"]
+                    if fault == "run-mismatch":
+                        evidence["runId"] = "another-run"
+                    if fault == "scenario-mismatch":
+                        evidence["scenario"] = "another-scenario"
+                if name == "phase1-pipeline":
+                    self.assertNotIn("E2E_INCLUDE_RELIABILITY", env)
+                    self.assertEqual(env["E2E_PROJECT"], "chromium")
+                    self.assertEqual(command[-2:], ["--retries", "0"])
+                path = Path(env["E2E_EVIDENCE_DIR"]) / f"{name}-evidence.json"
+                if not ((name == "queue-monitoring" and fault == "missing")
+                        or (name == "phase1-pipeline" and fault == "playback-missing")):
+                    path.write_text("invalid" if name == "queue-monitoring" and fault == "invalid"
+                                    else json.dumps(evidence), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0)
+
+            with patch.dict(os.environ, {"E2E_EVIDENCE_DIR": root, "E2E_PROJECT": "firefox",
+                                         "E2E_INCLUDE_RELIABILITY": "true"}), \
+                    patch.dict(GLOBALS, {"_settings": settings}), \
+                    patch("shutil.which", return_value="node-test"), \
+                    patch("subprocess.run", side_effect=dispatch), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                code = MODULE["main"](["--full"])
+            self.assertNotIn("private-value", output.getvalue())
+            paths = list(Path(root).glob("full-suite-*.json"))
+            self.assertEqual(len(paths), 1)
+            report = json.loads(paths[0].read_text())
+            if code == 0:
+                self.assertTrue(all(Path(row["evidenceFile"]).is_file() for row in report["liveEvidence"]))
+            return code, report, calls
+
+    def test_full_suite_order_correlation_and_playback_evidence(self):
+        code, report, calls = self.full_suite()
+        self.assertEqual(code, 0)
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual([name for name, _ in calls], [*MODULE["FULL_LIVE_SCENARIOS"], "phase1-pipeline"])
+        self.assertEqual(len({env["E2E_RUN_ID"] for _, env in calls}), 7)
+        monitoring = calls[5][1]
+        self.assertEqual(monitoring["E2E_FFMPEG_EVIDENCE_RUN"], calls[3][1]["E2E_RUN_ID"])
+        self.assertEqual(monitoring["E2E_POISON_EVIDENCE_RUN"], calls[4][1]["E2E_RUN_ID"])
+        self.assertEqual(report["unexecutedLiveChecks"], [])
+
+    def test_full_suite_rejects_incomplete_evidence_before_playback(self):
+        for fault in ("outstanding", "contradictory", "missing", "invalid", "run-mismatch", "scenario-mismatch"):
+            with self.subTest(fault=fault):
+                code, report, calls = self.full_suite(fault)
+                self.assertEqual(code, 1)
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(report["liveEvidence"][5]["status"], "failed")
+                self.assertEqual(report["unexecutedLiveChecks"], ["phase1-pipeline"])
+                self.assertEqual(len(calls), 6)
+
+    def test_full_suite_requires_playback_artifact(self):
+        code, report, calls = self.full_suite("playback-missing")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["liveEvidence"][-1]["status"], "failed")
+
+    def test_full_suite_preserves_partial_report_on_errors(self):
+        for fault in ("config", "authorize", "launch", "exit"):
+            with self.subTest(fault=fault):
+                code, report, _ = self.full_suite(fault)
+                blocked = fault != "exit"
+                self.assertEqual(code, 2 if blocked else 1)
+                self.assertEqual(report["status"], "blocked" if blocked else "failed")
+                self.assertEqual(report["liveEvidence"][0]["status"], "passed")
+                self.assertEqual(report["liveEvidence"][1]["status"], "blocked" if blocked else "failed")
+                self.assertEqual(report["unexecutedLiveChecks"],
+                                 [*MODULE["FULL_LIVE_SCENARIOS"][2:], "phase1-pipeline"])
+
+    def test_preflight_selects_browser_project(self):
+        for project in ("", "firefox"):
+            for args in ([], ["--scenario", "preflight"]):
+                with self.subTest(project=project, args=args), tempfile.TemporaryDirectory() as root, \
+                        patch.dict(os.environ, {"E2E_EVIDENCE_DIR": root, "E2E_PROJECT": project,
+                                                "E2E_INCLUDE_RELIABILITY": "true"}), \
+                        patch.dict(GLOBALS, {"_settings": lambda mode: {}}), \
+                        patch("shutil.which", return_value="node-test"), \
+                        patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(MODULE["main"](args), 0)
+                    self.assertEqual(run.call_args.args[0][-4:],
+                                     ["--grep", "@preflight", "--project", project or "chromium"])
+                    self.assertNotIn("E2E_INCLUDE_RELIABILITY", run.call_args.kwargs["env"])
+
     def invoke(self, args, settings):
         calls = []
 

@@ -6,7 +6,7 @@ import {
 import type { DuplicateTarget } from './duplicate-driver.js'
 import { verifyLiveBoundary } from './safety.mjs'
 import { lifecycleEvents } from './lifecycle-events.js'
-import { assertDatabaseClock, fail } from './lifecycle.js'
+import { assertDatabaseClock, DatabaseClockError, fail } from './lifecycle.js'
 import type { LifecycleAdapter, LifecycleSnapshot, Scenario } from './lifecycle-driver.js'
 
 /** Only the exact preflight-verified worker can be stopped and restored. */
@@ -83,6 +83,21 @@ export class DockerLifecycleAdapter extends DockerDuplicateAdapter implements Li
     await super.prepare(target)
   }
   override async observe(): Promise<LifecycleSnapshot> {
+    // Discard a reversed wall-clock sample, including its logs and DB state.
+    // Retry observations only; never repeat upload or worker control operations.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return this.observeOnce()
+      } catch (error) {
+        if (
+          !(error instanceof DatabaseClockError) ||
+          error.clockDiagnostic.cause !== 'local_clock_reversed' ||
+          attempt >= 2
+        ) throw error
+      }
+    }
+  }
+  private observeOnce(): LifecycleSnapshot {
     this.unchanged()
     const raw = this.readLogs()
     const localBeforeMs = this.now()

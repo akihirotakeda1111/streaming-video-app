@@ -32,35 +32,13 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | `ffmpeg-exhaustion` | 不正メディアの実FFmpeg失敗、試行上限、FAILED、manifest非公開、run-owned DLQ隔離 | 実装済み。`--scenario ffmpeg-exhaustion` |
 | `poison-isolation` | malformed/unknown-job poison のDLQ隔離と、同時実行する正常jobの完了 | 実装済み。`--scenario poison-isolation` |
 | `queue-monitoring` | source queue backlog/age、DLQ depth、3つのCloudWatch alarm状態を読み取り、FFmpeg/poison証跡と相関 | 実装済み。`--scenario queue-monitoring`。Receive/Delete/Purge/Replayは行わない |
-| 未登録 | Reliabilityシナリオ後のブラウザ再生回帰 | 追加予定。既存ブラウザテストとは別に拡張 |
+| `--full` / `--full-suite` | 6つのReliabilityシナリオ後に新規アップロード・実ブラウザ再生 | 実装済み。最後に既存 `@phase1-pipeline` をChromiumで実行。単独の `--scenario phase1-pipeline` はない |
 
 最新の実装済みセレクターは `--list` で確認する。実環境の受け入れは対象環境で成功した証跡をレビューして判断する。
 
-`queue-monitoring` の観測期限はalarm取得を含む全AWS観測に適用する。期限到達時は実行中のCLIを中断し、追加取得せず最後の観測値を残す。SQS属性の件数は `attributeBacklog`、CloudWatchの件数・ageはメトリクス自身の時刻とともに別々に記録する。欠落・不正・遅延したメトリクスや未取得alarmは `outstanding` とし、実際の `INSUFFICIENT_DATA` と区別する。
+個別の追加設定・実行コマンド・成功判定は、後述の「シナリオ別の前提条件と実行手順」を参照する。
 
-先行証跡は `--ffmpeg-evidence-run` と `--poison-evidence-run` に各シナリオの証跡ディレクトリ名（`e2e-<UUIDv4>`）を指定して参照する。どちらも `--scenario queue-monitoring` 専用の任意引数であり、パスやファイル名は指定できない。`E2E_EVIDENCE_DIR` は3回の実行を通じて同じ証跡親ディレクトリを設定する。
-
-1. `python app/scripts/run_reliability_e2e.py --scenario ffmpeg-exhaustion` を実行し、表示された `evidenceDirectory` の末尾のrun IDを控える。
-2. `python app/scripts/run_reliability_e2e.py --scenario poison-isolation` を実行し、同様にrun IDを控える。
-3. 実際のrun IDに置き換えて次を実行する（1行のコマンド）。
-
-```text
-python app/scripts/run_reliability_e2e.py --scenario queue-monitoring --ffmpeg-evidence-run e2e-11111111-1111-4111-8111-111111111111 --poison-evidence-run e2e-22222222-2222-4222-8222-222222222222
-```
-
-監視は新しいrun IDへ結果を保存し、先行証跡は読み取りのみで変更しない。入力は `<E2E_EVIDENCE_DIR>/<指定run ID>/ffmpeg-exhaustion-evidence.json` または `poison-isolation-evidence.json` に固定し、symlink/junctionによる別ディレクトリへの転送も拒否する。CLI引数は子プロセスへ内部環境変数で渡すが、以前の環境変数の値は引き継がない。
-
-シナリオ名、指定run IDと証跡内run/targetの整合性、監視と同じ検証済みキュー・AWS account/region、UTC時刻、実際のDLQ相関を確認する。監視run IDと先行run IDが異なることは許容する。報告の `correlatedEvidence` に `requestedRunId`、証跡自身の `runId`、ファイル名、観測時刻、完全性を記録する。両証跡が `passed` かつ完全で、メトリクスとalarmの観測が揃ったときのみ全体を `passed` とする。
-
-指定ファイルの欠落・不整合は `outstanding`。未指定のシナリオは従来どおり監視の証跡ディレクトリ内のみを確認し、他runの自動検索や障害シナリオの再実行はしない。通常の単独実行では、引数未指定分の先行証跡不足が残る。preflight情報のない旧poison証跡も未確認扱いとなる。先行テスト時点の隔離証拠と監視時点の近似メトリクスは別の観測であり、全alarmの強制的な `ALARM` 遷移は完了条件に含めない。
-
-FFmpeg exhaustion observes the DLQ with `ReceiveMessage` only to correlate the
-run-owned S3 notification bucket/key and canonical IDs. Receiving temporarily changes message
-visibility, so this helper is allowed only inside the gated disposable run.
-It never replays or deletes messages, and it must not delete unrelated messages;
-receipt handles are excluded from evidence. Queue metrics and alarm state are
-reserved for the later queue-observation scenario.
-シナリオ追加時はこの表と、以下の「シナリオ別の追加条件」「実行」「証跡・復旧」を追記する。
+シナリオ追加時はこの表と「シナリオ別の前提条件と実行手順」「時間設定・検証詳細・復旧」を更新する。
 各シナリオは直接Playwrightで選択されても操作前に共通事前確認を呼び、別テストの成功を認可の代用にしない。
 停止を伴うシナリオでは直前にEngine ID・完全なコンテナID・開始時刻を再照合し、同じコンテナを保持して復旧する。
 再作成・Compose全体の停止・プロセス名での選択を障害注入に使わない。
@@ -237,12 +215,15 @@ IDが変わるためE2E設定を再生成・再読込する。`VIDEO_ENCODING_QU
 <details>
 <summary>Windows / PowerShell：設定生成・読み込み</summary>
 
-PowerShellの例（アカウントとfixtureを実値へ置換）:
+フル実行向けの生成例。正常MP4と、非空の不正 `.mp4` を別々に用意する。時計ずれはホスト・Worker・DBの時刻同期を確認して上限を指定する（以下の100 msは例）。
+`--full` は環境設定生成の入力を検証するオプションで、テストを実行しない。
+
+PowerShellの例（アカウント・両fixture・時計ずれ・URLを実環境に合わせる）:
 
 ```powershell
 $workerId = docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q worker
 $dbId = docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q postgres
-node app/scripts/generate_reliability_env.mjs --worker $workerId --database $dbId --account 123456789012 --fixture C:/e2e/long.mp4 --exclusive --output ./reliability-env.local.ps1
+node app/scripts/generate_reliability_env.mjs --worker $workerId --database $dbId --account 123456789012 --fixture C:/e2e/long.mp4 --invalid-fixture C:/e2e/invalid.mp4 --clock-skew-ms 100 --frontend-url http://localhost:5173 --api-url http://localhost:8080 --exclusive --full --output ./reliability-env.local.ps1
 # 成功を確認し、内容をレビューしてから同じシェルに読み込む
 Get-Content ./reliability-env.local.ps1
 . ./reliability-env.local.ps1
@@ -263,13 +244,13 @@ db_id=$(docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose
 # 専用・破棄可能環境であることを確認してから実行。アカウントとfixtureを実値へ置換
 load_e2e() {
   local settings entries entry
-  settings=$(node --input-type=module - "$worker_id" "$db_id" '123456789012' "$HOME/e2e/fixtures/test.mp4" <<'JS'
+  settings=$(node --input-type=module - "$worker_id" "$db_id" '123456789012' "$HOME/e2e/fixtures/test.mp4" "$HOME/e2e/fixtures/invalid.mp4" '100' <<'JS'
 import { discoverEnvironment } from './app/scripts/generate_reliability_env.mjs'
-const [worker, database, account, fixture] = process.argv.slice(2)
+const [worker, database, account, fixture, invalidFixture, clockSkewMs] = process.argv.slice(2)
 try {
-  const env = discoverEnvironment({ worker, database, account, fixture, exclusive: true })
+  const env = discoverEnvironment({ worker, database, account, fixture, invalidFixture, clockSkewMs, exclusive: true, full: true, frontendUrl: 'http://localhost:5173', apiUrl: 'http://localhost:8080' })
   console.log(JSON.stringify(env))
-} catch { console.error('E2E設定生成失敗。認証・接続先・ラベル・アラームを確認してください'); process.exitCode = 2 }
+} catch { console.error('E2E設定生成失敗。認証・接続先・ラベル・アラーム・fixture・時計ずれの入力を確認してください'); process.exitCode = 2 }
 JS
   ) || return 1
   entries=$(printf '%s' "$settings" | jq -r 'to_entries[] | "\(.key)=\(.value)"') || return 1
@@ -279,6 +260,12 @@ load_e2e || echo '設定生成失敗。後続の実行を止めて確認して�
 ```
 
 </details>
+
+フル実行用に生成すると、正常・不正fixture、時計ずれ、`E2E_PROJECT=chromium`、全共通設定が同じファイル/JSONに揃う。
+`.ps1`またはBashの生成JSONを読み込んだ後、これらを個別にexportし直す必要はない。
+fixture検査はファイル形式・サイズの条件のみで、正常動画としての再生可否・encode時間や、実FFmpegでの失敗は保証しない。
+API/Frontend用のバケット、出力S3 endpoint、許可origin、API接続先、公開ポートも生成する。API/Frontendの起動・認証とS3 CORS、ホストFFmpeg、Chromiumのインストールは引き続き別途必要。秘密情報は生成ファイルへ含めない。
+`E2E_RUN_ID` と監視の先行run IDはフルrunnerが設定するため、生成設定には含めない。
 
 生成JSON・コマンドはいずれも非機密設定だけだが、環境固有の値なのでGitにはコミットしない。
 認証を別シェルで使う場合は、そのシェルでも既存AWS CLIログイン・認証変数を手動設定する。
@@ -291,7 +278,10 @@ load_e2e || echo '設定生成失敗。後続の実行を止めて確認して�
 | `--docker-host` | DOCKER_HOST、なければOS別ローカルソケット |
 | `--frontend-url` / `--api-url` | 既定は `http://127.0.0.1:5173` / `http://127.0.0.1:8000`。自動検出・稼働確認ではない |
 | `--evidence-dir` | カレントディレクトリの `artifacts/reliability-e2e` を絶対パス化 |
-| `--fixture` | 絶対パスへ変換し存在・拡張子・サイズを検査。省略時は空欄を手動補完 |
+| `--fixture` | `E2E_DUPLICATE_FIXTURE`。正常MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
+| `--invalid-fixture` | `E2E_FFMPEG_INVALID_FIXTURE`。不正MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
+| `--clock-skew-ms` | `E2E_CLOCK_SKEW_MS`。1〜5000 msの整数を明示。lease/visibilityとの余裕も確認 |
+| `--full` | `--exclusive` と上記3引数を必須にする。正常・不正fixtureに同じパスを指定した場合もエラー。省略時は不足値を空欄として生成 |
 | `--exclusive` | 専用・破棄可能環境であるという利用者の宣言。省略時はdisposable/exclusiveが空欄 |
 | `--alarms A,B,C` | 候補が重複・多数ある場合に実際の3アラーム名を指定 |
 
@@ -336,163 +326,321 @@ DLQ予算の共通チェックは1回分のretryをカバーするだけで、�
 `ffmpeg-exhaustion` の待機予算は `PROCESSING + (attempts − 1) × Worker retry(ms) + VISIBILITY + DLQ`。PROCESSINGは全試行の処理時間に対する合計予算で、試行数倍にはしない。
 DLQ確認後は `VISIBILITY`（実visibilityに観測余裕を加えた値）1回分、DB状態・attempt・更新時刻、追加encodingの不在とmanifest非公開を観測する。到達済みのDLQについてretry予算を再度待つ必要はない。
 Playwrightの上限はこれらにUPLOAD、cleanup用PROCESSING、事前確認等の180秒を加えた値とする。個々の環境変数の900000 ms上限は変更しない。
-通常のFFmpeg検証には専用Terraformの `timing_profile=exhaustion` を推奨する。3試行・retry 10秒・visibility 30秒なので、小さな不正ファイルでは通常2〜3分程度が目安（実環境で要確認）。生成値ではDLQ待機を含む上限420秒、到達後確認60秒。これは通常所要時間ではなく失敗判定用の上限で、setup/upload/cleanupは別枠。
-`standard` は5試行・retry 900秒のままで、長時間設定での確認用。待機上限4,950,000 msとなり、実行は1時間以上かかり得る。シナリオ選択だけではWorker/SQSの設定は変わらない。
+専用Terraformは全シナリオ共通で3試行・retry 10秒・visibility 120秒とする。生成値ではFFmpegのDLQ待機を含む上限510秒、到達後確認150秒。通常所要時間ではなく失敗判定用の上限で、setup/upload/cleanupは別枠。
+poisonはWorkerのretry delayを使わず、sourceのvisibility期限切れを繰り返す。adapterは `試行上限 × E2E_VISIBILITY_TIMEOUT_MS + E2E_DLQ_TIMEOUT_MS` をpoison専用のDLQ予算として計算する。VISIBILITYは共通事前確認でsourceの実visibility以上と検証された余裕込みの値。固定設定の生成値では `3 × 150秒 + 40秒 = 490秒`。1回のDLQ受信操作の予算とFFmpegの計算にはこの増分を適用しない。
 
-FFmpegシナリオでは `E2E_FFMPEG_INVALID_FIXTURE` に非空の不正MP4ファイルの絶対パスを設定する。
-例えば作業ディレクトリで `node -e "require('node:fs').writeFileSync('invalid.mp4', 'not an mp4')"` により作成できる。
-専用環境の共通事前確認後、runデータ作成前にDLQ受信を試して権限を確認する。この受信もvisibilityを変更する。
-各attemptの取得・encode開始・retry/final failureを相関し、最終エラーがFFmpegの非ゼロ終了であることを必須とする。
-同一Workerのログ出現順でイベント順序を検証し、UTC時刻の単調増加は要求しない。UTCは証跡に残す。待機期限は単調増加時計を使い、ホストの時計補正に影響されない。相関エラーには対象attemptと期待順序を記録する。
-途中失敗時の証跡にはtarget ID、収集済みsnapshot、開始状態、失敗段階と秘匿化した理由を残す。
-成功時はrun所有のDB/source/outputのみcleanupし、DLQメッセージは削除せず手動cleanup用に残す。
-`poison-isolation` は malformed と unknown-job の実メッセージをDLQで相関する。DLQの受信は一時的にvisibilityを変更するため、明示的に認可されたdisposable runの中だけで bounded に行う。受信結果を自動replayせず、今回のrunが作成した対象以外のメッセージを削除しない。receipt handleは証跡に出力しない。
-別々のDLQ受信で得た相関はmessage IDごとに保持する。`poison-isolation-evidence.json` の `result` に送信対象のID・本文ハッシュ、UTC観測履歴、失敗段階、cleanup結果を残す。途中失敗でもrun所有資源の安全なcleanupを試みるが、所有権や処理終了を確認できない場合、または送信結果が不確実な場合は資源を保持し、元の失敗理由とは別に `cleanupReason` を記録する。DLQメッセージは引き続き人手確認・cleanup用に残す。
-自動テスト成功のみでは実環境確認済みとしない。IAM適用後のdisposable live証跡を別途確認する。
+fixtureの設定、DLQ受信権限、実行コマンド、成功条件は後述の `ffmpeg-exhaustion` / `poison-isolation` の個別手順を参照する。
+FFmpegイベントは同一Workerのログ出現順で検証し、UTC時刻の単調増加は要求しない。待機期限は単調時計を使う。
+poisonの相関はmessage IDごとに保持し、証跡に本文ハッシュ・UTC観測・cleanup結果を残す。
 
 </details>
 
-### シナリオ別の追加条件
+## 共通事前確認
 
-| シナリオ | 条件 |
-| --- | --- |
-| 重複配送 | 他のテスト・consumerと対象を共有せず `E2E_DUPLICATE_EXCLUSIVE=true`。DB内のUPLOADING/QUEUED/PROCESSINGが0件 |
-| 重複配送 | `E2E_DUPLICATE_FIXTURE` は有効なMP4の絶対パス、非空、1 GiB以下。WSLでは `/home/.../test.mp4` 形式 |
-| 重複配送 | encode中にbusy配送を観測できる処理時間が必要。短すぎればunverified、長すぎてredrive上限に達しても失敗 |
-| 重複配送 | 非versionedバケット。Enabled/Suspendedは不可。Standardキューに単一の直接S3通知、他のSNS/Lambda/EventBridge通知なし |
-| 重複配送 | 通知フィルタが `videos/<video UUID>/jobs/<job UUID>/source.mp4` に一致。通常prefix `videos/`、suffix `/source.mp4`。フィルタ名の大小文字は吸収するが値は厳密比較 |
-| 重複配送 | Worker起動ログに `duplicate_observation_schema=1`。起動以降の末尾2000行から確認できること |
-
-ホストには共通のSTS、S3 HeadBucket/GetBucketLocation、SQS GetQueueUrl/GetQueueAttributes、CloudWatch DescribeAlarmsの読み取りが必要。
-重複配送ではさらにsource SendMessage、S3通知/versioning/list、source PutObject、output HeadObject、runオブジェクトDeleteObjectを使う。
-HeadBucketのIAM権限はListBucket、HeadObjectはGetObject。DBロールには対象video/jobの作成・参照・削除が必要で、DB名・ユーザー名は英数字とunderscoreのみ対応。
-
-## 実行手順
-
-事前準備でコンテナを起動し、E2E設定と認証を読み込んだ**同じシェル**で実行する。
-以下のコマンドはWindows（PowerShell）・WSL（Bash）共通。
-
-### 1. 事前確認
+事前準備でコンテナを起動し、E2E設定と認証を読み込んだ**同じシェル・リポジトリルート**で実行する。
 
 ```text
 python app/scripts/run_reliability_e2e.py --check
 python app/scripts/run_reliability_e2e.py --live-preflight
 ```
 
-`--check` が `configured; live resources not verified`、`--live-preflight` が `status=verified` になったら次へ進む。
-`not configured` / `blocked` の場合は設定を確認する。
-実環境の事前確認は読み取りだけを行い、結果を `preflight-<UUID>/live-preflight.json` に保存する。
-シナリオ固有のfixture・通知・DB等の条件は実行時にも確認する。
+`--check` が `configured; live resources not verified`、`--live-preflight` が `status=verified` になったら個別手順へ進む。
+`not configured` / `blocked` の場合は設定を確認する。`--check` は外部ツールの存在と設定形式の確認であり、各権限・fixture・API・ブラウザの動作保証ではない。
+`--live-preflight` は読み取りによる実体確認を行い、`preflight-<UUID>/live-preflight.json` を保存する。後述の `--scenario preflight` とは役割が異なる。
 
-### 2. シナリオ実行
+各シナリオも実行直前に共通事前確認を行う。`E2E_EVIDENCE_DIR` は証跡の**親ディレクトリ**のまま保持し、runnerが表示する子ディレクトリへシェル設定を変更しない。
+`E2E_RUN_ID` はrunnerに生成させる。シナリオを並行実行しない。Workerの再作成・実環境の設定変更後は設定を再生成・再読込し、この確認からやり直す。
+
+## シナリオ別の前提条件と実行手順
+
+### 選択早見表
+
+下表の条件は共通事前準備に**追加**する。URL設定は全シナリオの共通契約で必須だが、API・Frontendの稼働とブラウザインストールが必要なのはブラウザを使う行だけ。
+
+| 実行対象 | 追加するもの | 先行する障害シナリオ | 主な証跡 |
+| --- | --- | --- | --- |
+| `preflight` | API・Frontend、対象ブラウザ、ホストFFmpeg | なし | Playwright結果・失敗時の診断添付 |
+| `runtime-authorization` | 共通設定のみ | なし | Playwright結果・失敗時の認可診断 |
+| `duplicate-delivery` | 下記「データ作成シナリオ共通条件」、長めの正常MP4、exclusive宣言 | なし | `duplicate-delivery-evidence.json` |
+| `crash-recovery` | 同共通条件、正常MP4、時計ずれ設定、heartbeatログ、停止・再開可能なWorker | なし | `crash-recovery-evidence.json` |
+| `long-heartbeat` | 同共通条件、複数heartbeatを観測できる正常MP4、時計ずれ設定、heartbeatログ | なし | `long-heartbeat-evidence.json` |
+| `ffmpeg-exhaustion` | 同共通条件、不正MP4、DLQ受信権限、全再試行を待つ予算 | なし | `ffmpeg-exhaustion-evidence.json` |
+| `poison-isolation` | 同共通条件、正常MP4、DLQ受信権限、poisonのredriveを待つ予算 | なし | `poison-isolation-evidence.json` |
+| `queue-monitoring` | メトリクス取得権限、同じ環境のFFmpeg・poison成功証跡 | 完全な成功判定にはFFmpeg・poisonの両方 | `queue-monitoring-evidence.json` |
+| `--full` | 上記すべてとChromium再生環境。正常・不正の両fixture | runnerが6シナリオを順番に実行 | `full-suite-*.json` と各runのJSON、`phase1-pipeline-evidence.json` |
+
+### データ作成シナリオ共通条件
+
+`duplicate-delivery`、`crash-recovery`、`long-heartbeat`、`ffmpeg-exhaustion`、`poison-isolation` は同じ基底adapterを使うため、次の条件が必要。
+
+- 他テスト・consumerと共有しない専用Worker/DB/S3/SQS。実行前のDBに `UPLOADING` / `QUEUED` / `PROCESSING` がないこと。過去runの残存データは証跡と照合して解決する。
+- 非versionedバケット（Enabled/Suspendedは不可）、Standardキュー。sourceバケットに単一の直接S3通知があり、他のSNS/Lambda/EventBridge通知がないこと。
+- 通知フィルタが `videos/<video UUID>/jobs/<job UUID>/source.mp4` に一致すること。通常prefixは `videos/`、suffixは `/source.mp4`。
+- Worker起動ログの `duplicate_observation_schema=1` を、起動以降の末尾2000行から確認できること。
+- fixtureは実行ホストから読める絶対パスの `.mp4`、非空、1 GiB以下。Windows側のパスをWSLへそのまま渡さない。
+- ホストprincipalに共通の読み取りに加えて、sourceへの `sqs:SendMessage`、S3通知/versioning/list取得、source PutObject、output HeadObject、runオブジェクトのDeleteObject権限があること。HeadBucketはListBucket、HeadObjectはGetObjectに対応する。
+- DBロールが対象video/jobの作成・参照・削除を行えること。DB名・ユーザー名は英数字とunderscoreのみ対応。
+
+重複配送・ライフサイクルでは `E2E_DUPLICATE_EXCLUSIVE=true` が必須。FFmpeg・poisonのadapterはこの値を内部設定するが、実リソースを専有してよいことの確認は同様に必要。
+正常MP4の内容・処理時間は利用者が用意する。MP4の再生時間やファイル容量だけでは、Workerのencode所要時間を保証できない。
+
+### ブラウザ使用シナリオの追加準備
+
+`preflight` と最終 `@phase1-pipeline` には、Worker/DBに加えてAPI・Frontendを起動する。フル実行では開始前に準備する。
+
+1. API用principalの認証を `API_AWS_ACCESS_KEY_ID` / `API_AWS_SECRET_ACCESS_KEY`、一時認証なら `API_AWS_SESSION_TOKEN` に設定する。Worker用・ホスト用の認証設定だけではAPIに渡らない。APIは同じDB、`VIDEO_INPUT_BUCKET` / `VIDEO_OUTPUT_BUCKET`、regionを参照させる。
+2. 生成設定を読み込む。`--frontend-url` / `--api-url` からComposeの公開ポートも生成する。生成器のAPI URL既定は8000なので、8080で公開する場合は `--api-url http://localhost:8080` を指定する。ComposeはHTTPで配信するため、HTTPSのURLを使う場合は別途proxyの設定が必要。
+3. APIの `FRONTEND_ORIGIN`、Terraformの `frontend_origin` によるS3 CORS、ブラウザが開くFrontend originを一致させる。`localhost` と `127.0.0.1` は別origin。必要なAWS変更は共通準備のplan確認手順で行う。
+
+生成設定には次の起動用変数が含まれるため、個別設定は不要。既存専用環境のS3 CORSと異なる場合は、その環境のoriginを生成時に指定する。
+
+| 変数 | 生成元・値 |
+| --- | --- |
+| `AWS_REGION` | Workerのリージョン |
+| `VIDEO_INPUT_BUCKET` / `VIDEO_OUTPUT_BUCKET` | Workerと同じ入力・出力バケット |
+| `OUTPUT_S3_ENDPOINT` | `https://<出力バケット>.s3.<リージョン>.amazonaws.com` |
+| `FRONTEND_ORIGIN` | `--frontend-url` のorigin |
+| `VITE_API_BASE_URL` | `--api-url` に `/api/v1` を追加 |
+| `API_PORT` / `FRONTEND_PORT` | 指定URLのポート（省略時はHTTP 80 / HTTPS 443） |
+
+API必須の `HTTP_ADDR` と既定の `DATABASE_URL` はComposeが設定する。DB設定を変更している場合は既存DBに合う `COMPOSE_DATABASE_URL` を別途設定する。APIのAWS認証情報は上記1のとおり手動設定する。
+
+```text
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up --build -d api frontend
+docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps
+node app/frontend/node_modules/@playwright/test/cli.js install chromium
+```
+
+API・Frontendがhealthyになり、同じ専用Worker/DBが維持されていることを確認する。再生成時も `--frontend-url http://localhost:5173 --api-url http://localhost:8080` を指定してURLの不一致を戻さない。
+ホストFFmpegは `libx264` を利用可能にする。`FFMPEG_PATH` を指定する場合はホストで実行できるパスを使い、Workerコンテナ内パスを流用しない。
+通常はブラウザを表示するため、WSL等では表示環境も必要。`CI` 設定時はheadlessになる。
+最終再生では公開HTTPSのHLS manifest/segmentをブラウザから取得でき、適切なContent-TypeとCORS応答が必要。
+
+### preflight：ブラウザ・APIの準備確認
+
+**追加条件：** 上記ブラウザ準備。既定ブラウザはChromium。`E2E_PROJECT` をfirefox/webkitにする場合は対象ブラウザを別途インストールする。
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario preflight
+```
+
+**成功判定：** Frontend到達、ブラウザ操作、APIの `/api/v1/health`、ホストFFmpegによるfixture生成がすべて成功すること。video/jobのアップロードや再生成功は検証しない。失敗時のPlaywright診断添付を保存する。
+引数省略時もこのシナリオになる。`preflight-*/live-preflight.json` を作成する `--live-preflight` と混同しない。
+
+### runtime-authorization：共通実行境界の確認
+
+**追加条件：** 共通事前準備のみ。API・Frontendの起動、ブラウザ、fixtureの追加準備は不要。
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario runtime-authorization
+```
+
+**成功判定：** Playwrightの認可テストが成功すること。失敗時は `reliability-preflight-blocked` 添付を確認する。この成功は後続シナリオの認可・検証を省略する根拠にはならない。
+
+### duplicate-delivery：処理中・完了後の重複配送
+
+**追加条件：** データ作成シナリオ共通条件に加え、正常なMP4でencode中のbusy配送を観測できること。
+
+| 設定 | PowerShellの例 | Bashの例 |
+| --- | --- | --- |
+| 専有宣言 | `$env:E2E_DUPLICATE_EXCLUSIVE = 'true'` | `export E2E_DUPLICATE_EXCLUSIVE='true'` |
+| 正常fixture | `$env:E2E_DUPLICATE_FIXTURE = 'C:/e2e/long.mp4'` | `export E2E_DUPLICATE_FIXTURE='/home/user/e2e/long.mp4'` |
+
+生成済み設定に正しい値が入っていれば再設定は不要。
 
 ```text
 python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery
+```
+
+**成功判定：** `duplicate-delivery-evidence.json` の `status=passed`、`cleanup=complete`。単一owner/attempt、処理の重複なし、元通知・busy通知のack、完了後の再配送で再encodeせずDB状態不変を確認する。
+短すぎるfixtureでbusy配送を観測できない場合は未検証。長すぎてredrive上限に達する場合も失敗であり、対象Workerでの実測に合わせて調整する。
+
+### crash-recovery：停止後の再取得・復旧
+
+**追加条件：** 重複配送と同じ正常fixture・exclusive宣言・データ作成条件に、以下を加える。
+
+- encode中に1回のheartbeat成功とDB lease更新を観測できるfixture。
+- 起動ログに `heartbeat_observation_schema=1`。
+- 時刻同期を確認し、`E2E_CLOCK_SKEW_MS` を1〜5000の整数で明示する。許容差の2倍がWorkerのlease/visibility期間より小さいこと。
+- `E2E_PROCESSING_TIMEOUT_MS > 2 × heartbeat間隔(ms)`、`E2E_MAX_ATTEMPTS >= 2`。
+- 保持される同一Workerコンテナをstop/startできること。restart policyは `no`。DBは停止しない。
+
+| 設定例（実測した上限に置換） | PowerShell | Bash |
+| --- | --- | --- |
+| 時計ずれ上限100 ms | `$env:E2E_CLOCK_SKEW_MS = '100'` | `export E2E_CLOCK_SKEW_MS='100'` |
+
+```text
 python app/scripts/run_reliability_e2e.py --scenario crash-recovery
+```
+
+**成功判定：** `crash-recovery-evidence.json` の `status=passed`、`restoration=complete`、`cleanup=complete`。期限切れを待って同一コンテナを再開し、元messageの別delivery/owner・attempt 2で再取得して完了・ackすること。
+利用者が途中でWorkerを再作成しない。復元失敗時は後続テストへ進まず、証跡の完全IDを使って同じWorkerの状態を確認する。
+時間設定は後述の全シナリオ共通値を使う。個別の切り替えは不要。
+
+### long-heartbeat：複数周期のlease・visibility更新
+
+**追加条件：** crash-recoveryと同じ正常fixture・exclusive宣言・ログschema・時計ずれ条件。ただし停止を注入せず、2回以上の完全なheartbeat周期をencode中に観測できる長さが必要。
+`E2E_PROCESSING_TIMEOUT_MS > 3 × heartbeat間隔(ms)` とする。試行上限2以上という追加制約はこの単独シナリオにはない。
+
+```text
 python app/scripts/run_reliability_e2e.py --scenario long-heartbeat
 ```
 
-`duplicate-delivery` は実行対象に置き換える。選択肢は次で確認できる。
+**成功判定：** `long-heartbeat-evidence.json` の `status=passed`、`cleanup=complete`。同じmessage/delivery/cycleに対するlease renewalとvisibility extensionの両方、期限前進、単一owner/attempt、最後の完了・ackを確認する。
+片側の更新しか観測できない周期や短すぎるfixtureは未検証扱い。再生時間ではなく実encode時間を基準にfixtureを選ぶ。
+
+### ffmpeg-exhaustion：実FFmpeg失敗・試行上限・DLQ隔離
+
+**追加条件：** データ作成シナリオ共通条件と、専用DLQの `sqs:ReceiveMessage` 権限。不正MP4を `E2E_FFMPEG_INVALID_FIXTURE` に指定する。正常な `E2E_DUPLICATE_FIXTURE` はこのシナリオでは使わない。
+
+新しい不正fixtureを作る例（既存ファイルは上書きしない）:
 
 ```text
-python app/scripts/run_reliability_e2e.py --list
+node -e "require('node:fs').writeFileSync('invalid.mp4', 'not an mp4', {flag:'wx'})"
 ```
 
-実行時にも共通事前確認を行い、runごとに新しい証跡ディレクトリを作成する。自動再試行は行わない。
+| 設定 | PowerShell | Bash |
+| --- | --- | --- |
+| 不正fixtureの絶対パス | `$env:E2E_FFMPEG_INVALID_FIXTURE = (Resolve-Path ./invalid.mp4).Path` | `export E2E_FFMPEG_INVALID_FIXTURE="$(pwd)/invalid.mp4"` |
 
-### 3. 結果確認
+Workerとsourceキューの試行上限・retry設定を一致させ、全試行・DLQ到達・到達後の安定観測を待てる予算にする。
+全シナリオ共通のretry 10秒・試行上限3回を使う。旧環境のretry 900秒が残っている場合は、後述の固定設定への移行を先に行う。
 
-終了コード0とテストの `passed` を確認し、表示された `evidenceDirectory` 内のシナリオ証跡を開く。
-重複配送では `duplicate-delivery-evidence.json` の **`status=passed`、`cleanup=complete`** が成功条件。
-クラッシュ復旧・長時間heartbeatは、それぞれ `crash-recovery-evidence.json` / `long-heartbeat-evidence.json` の
-`status=passed`、`cleanup=complete` を確認する。クラッシュ復旧では `restoration=complete` も必要。
-Slow test警告だけでは失敗ではない。`unverified` / `retained` の場合は下の診断を確認してから再実行する。
+```text
+python app/scripts/run_reliability_e2e.py --scenario ffmpeg-exhaustion
+```
 
-### 専用環境の時間プロファイルと切り替え
+**成功判定：** `ffmpeg-exhaustion-evidence.json` の `status=passed`、各attemptのFFmpeg非ゼロ終了、試行上限での永続FAILED、manifest非公開、run所有のDLQ通知との相関。
+`cleanup=retained-dlq-message-visible-for-human-run-cleanup` はこのシナリオの正常な終了状態。DB/source/outputはrun単位でcleanupし、DLQメッセージは人手確認用に残す。
+DLQ受信は事前権限確認時もvisibilityを変える。メッセージは自動削除・replayしない。後続の監視に使うrun IDを控える。
 
-E2E専用Terraformの `timing_profile` で時間設定を選択する。既定は `standard`。
+### poison-isolation：不正通知と正常jobの分離
 
-| プロファイル | heartbeat | source visibility / Worker延長 | lease | retry | Worker試行上限 / SQS maxReceiveCount | 用途 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `standard` | 30秒 | 120秒 | 300秒 | 900秒 | 5 / 5 | 既存の標準設定・長時間検証 |
-| `lifecycle` | 5秒 | 30秒 | 30秒 | 900秒 | 5 / 5 | 復旧・heartbeat検証 |
-| `exhaustion` | 5秒 | 30秒 | 30秒 | 10秒 | 3 / 3 | 不正MP4のFFmpeg試行上限・DLQ検証 |
+**追加条件：** データ作成シナリオ共通条件、専用DLQ受信権限、**正常な** `E2E_DUPLICATE_FIXTURE`。
+malformed本文と存在しないjobの通知はテストが生成するため、手動送信も不正fixture指定も不要。
+正常jobの完了とpoisonの全redriveを `PROCESSING + VISIBILITY + NAVIGATION + poison専用DLQ予算` の範囲で待つ。固定設定の生成値では合計970秒（約16分10秒）。全段階が遅延した場合の上限であり、通常所要時間は15分以内を目標とする。poison専用DLQ予算はadapterが計算するため、シェルでDLQ変数を長くする必要はない。
 
-**設定はその専用環境全体に適用される。シナリオ選択による自動切り替え・自動復元は行わない。**
-同時に別シナリオを実行しない。並行実行が必要なら別instance・別state・別Composeプロジェクトを用意する。
+```text
+python app/scripts/run_reliability_e2e.py --scenario poison-isolation
+```
 
-<details>
-<summary>短い時間設定への切り替え・元に戻す手順（Windows・WSL共通）</summary>
+**成功判定：** `poison-isolation-evidence.json` の `status=passed`、`result.cleanup=complete`、malformed/unknown-jobの2種類のDLQ相関、`result.unknownJobCount=0`、正常jobがattempt 1でCOMPLETEDになること。
+`dlqCleanup=retained-for-human-cleanup` は想定どおり。DLQメッセージを人手確認用に残し、run IDを控える。
+失敗時に `result.cleanup=retained` なら `cleanupReason` を確認し、対象runだけを復旧する。
 
-実行中のテスト・jobと保持リソースを確認し、切り替えてよい状態にしてWorkerを停止する。
-AWS認証は構築用プロファイルを使用する。
-以下は `lifecycle` の例。FFmpeg検証では `timing_profile=exhaustion` とし、planファイル名も `exhaustion.tfplan` に置き換える。
+### queue-monitoring：メトリクス・アラームと先行証跡の相関
+
+**追加条件：** ホストに `cloudwatch:GetMetricData` と共通のSQS属性・alarm読み取り権限。fixtureは不要。
+同じAWS account/region・source/DLQで成功したFFmpegとpoisonのJSONを、同じ証跡親ディレクトリに保持する。
+
+`queue-monitoring` の観測期限はalarm取得を含む全AWS観測に適用する。期限到達時は実行中のCLIを中断し、追加取得せず最後の観測値を残す。SQS属性の件数は `attributeBacklog`、CloudWatchの件数・ageはメトリクス自身の時刻とともに別々に記録する。欠落・不正・遅延したメトリクスや未取得alarmは `outstanding` とし、実際の `INSUFFICIENT_DATA` と区別する。
+
+先行証跡は `--ffmpeg-evidence-run` と `--poison-evidence-run` に各シナリオの証跡ディレクトリ名（`e2e-<UUIDv4>`）を指定して参照する。どちらも `--scenario queue-monitoring` 専用の任意引数であり、パスやファイル名は指定できない。`E2E_EVIDENCE_DIR` は3回の実行を通じて同じ証跡親ディレクトリを設定する。
+
+1. `python app/scripts/run_reliability_e2e.py --scenario ffmpeg-exhaustion` を実行し、表示された `evidenceDirectory` の末尾のrun IDを控える。
+2. `python app/scripts/run_reliability_e2e.py --scenario poison-isolation` を実行し、同様にrun IDを控える。
+3. 実際のrun IDに置き換えて次を実行する（1行のコマンド）。
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario queue-monitoring --ffmpeg-evidence-run e2e-11111111-1111-4111-8111-111111111111 --poison-evidence-run e2e-22222222-2222-4222-8222-222222222222
+```
+
+監視は新しいrun IDへ結果を保存し、先行証跡は読み取りのみで変更しない。入力は `<E2E_EVIDENCE_DIR>/<指定run ID>/ffmpeg-exhaustion-evidence.json` または `poison-isolation-evidence.json` に固定し、symlink/junctionによる別ディレクトリへの転送も拒否する。CLI引数は子プロセスへ内部環境変数で渡すが、以前の環境変数の値は引き継がない。
+
+シナリオ名、指定run IDと証跡内run/targetの整合性、監視と同じ検証済みキュー・AWS account/region、UTC時刻、実際のDLQ相関を確認する。監視run IDと先行run IDが異なることは許容する。報告の `correlatedEvidence` に `requestedRunId`、証跡自身の `runId`、ファイル名、観測時刻、完全性を記録する。両証跡が `passed` かつ完全で、メトリクスとalarmの観測が揃ったときのみ全体を `passed` とする。
+
+指定ファイルの欠落・不整合は `outstanding`。未指定のシナリオは従来どおり監視の証跡ディレクトリ内のみを確認し、他runの自動検索や障害シナリオの再実行はしない。通常の単独実行では、引数未指定分の先行証跡不足が残る。preflight情報のない旧poison証跡も未確認扱いとなる。先行テスト時点の隔離証拠と監視時点の近似メトリクスは別の観測であり、全alarmの強制的な `ALARM` 遷移は完了条件に含めない。
+
+**成功判定：** `queue-monitoring-evidence.json` の `status=passed`、`outstanding=[]`、両先行証跡の完全性とメトリクス・alarm観測を確認する。
+**単独実行は `outstanding` でもPlaywright終了コード0になることがあるため、終了コードだけで完了としない。** `--full` はこの状態を失敗として最終再生を止める。
+現在のAWS観測期限はシナリオ内の300000 ms。`E2E_DLQ_TIMEOUT_MS` の変更では延びない。
+メトリクス欠落時は下の「CloudWatchメトリクス診断」を確認し、原因を解決して監視だけを新しいrunで再実行できる。source/DLQのReceive・Delete・Purge・Replayは行わない。
+
+### フル実行：全障害シナリオから最終ブラウザ再生まで
+
+**追加条件：** 個別条件すべて。長めの正常MP4と不正MP4の両パス、exclusive宣言、時計ずれ、DLQ/メトリクス権限、Chromium・API・Frontendを**開始前に**揃える。`preflight` を先に実行してブラウザ側の準備も確認する。
+フル実行は個別条件すべてを開始前に検証するわけではなく、後半の条件不足でも途中停止し得る。
+
+正常fixtureは重複配送と両ライフサイクルで十分なencode時間があり、poisonの正常jobとしても完了できるものを選ぶ。
+全シナリオに同じ固定時間設定を使う。実fixtureでの観測可能性は別途確認する。途中で設定変更やWorker再作成を行わない。完全コンテナIDが変わると再認可できなくなる。
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario preflight
+python app/scripts/run_reliability_e2e.py --full
+```
+
+順序は **duplicate-delivery → crash-recovery → long-heartbeat → ffmpeg-exhaustion → poison-isolation → queue-monitoring → 新規アップロード・Chromium再生**。
+`--full-suite` は同義。監視への先行run IDの受け渡しは自動で行う。`--ffmpeg-evidence-run` / `--poison-evidence-run` はフル実行には指定しない。
+`--full` は `runtime-authorization` / `preflight` を独立テストとしては実行しないが、各dispatchは共通の認可を再実行する。
+
+最後の `@phase1-pipeline` はホストFFmpegで短い正常MP4を新規生成し、UIから1回アップロードする。正常・不正の指定fixtureを流用せず、自動再試行も行わない。
+APIのCOMPLETED、HLS取得・Content-Type/CORS、player/networkの失敗不在、正の再生時間増分を検証する。単独の `--scenario phase1-pipeline` は登録されていない。
+
+**成功判定：** 親ディレクトリの `full-suite-*.json` が `status=passed`、7行すべて `passed`、`unexecutedLiveChecks=[]`。
+各行の `evidenceFile` を開き、シナリオ・run IDが一致する成功証跡を確認する。最終行は `phase1-pipeline-evidence.json` でvideo/job ID、ネットワーク、状態、再生時間の観測を保存する。失敗時も取得できた途中観測を残す。
+
+| フル実行の終了コード | 意味・対応 |
+| --- | --- |
+| 0 | 全7行が成功し、対応する証跡も検証済み |
+| 1 | テスト失敗、証跡の欠落・不整合・未完了。失敗行を確認し、後続の `unexecuted` を実施済みと扱わない |
+| 2 | 設定・再認可・起動がblocked、または集約レポートを保存できない。標準エラーも確認する |
+
+途中のblockedでも保存可能なら実行済み行と残りの未実行一覧を保持する。初期設定検証や保存先自体の失敗では集約JSONが存在しない場合がある。
+`componentChecks` は別途実行するオフライン検証コマンドの宣言であり、このフル実行がコンポーネントテストを実施した意味ではない。
+レポートだけでなく、参照される各runディレクトリを一緒に保存する。
+最終Phase 1テストは一時fixtureを削除するが、アップロードしたDB/S3資源の自動cleanupは行わない。証跡のvideo/job IDで残存資源を確認する。
+前半のDLQ保持分も含め、当該runの範囲で人手確認・cleanupを行う。
+
+## 時間設定・検証詳細・復旧
+
+### 専用環境の固定時間設定
+
+E2E専用Terraformは次の1組を使う。シナリオごとの設定選択・切り替えは不要。
+通常環境のTerraform既定値は変更しない。
+
+| heartbeat | source visibility / Worker延長 | lease | retry | Worker試行上限 / SQS maxReceiveCount |
+| --- | --- | --- | --- | --- |
+| 5秒 | 120秒 / 120秒 | 60秒 | 10秒 | 3 / 3 |
+
+通常は1シナリオ15分以内を目標とする。30分の厳密な上限や全体watchdogは追加しない。
+既存の段階別タイムアウトと、復旧・cleanupを含む余裕のあるPlaywrightタイムアウトを維持する。
+異常時は通常所要時間より長く待つ場合がある。タイムアウトを短くするだけでWorker復旧を中断しない。
+
+正常fixtureはencode約25〜40秒を初期目安とし、アップロード・segment/manifest公開を含む正常処理が概ね3分以内となるものを実測して選ぶ。
+重複通知の初回受信から完了までの時間は、通常の配送を前提に `(受信上限 − 1) × visibility`（固定値では240秒）を十分下回るようにする。
+最後の受信枠を完了後のackに残すためであり、SQSの配送時刻を保証する式ではない。
+長時間heartbeatを観測できるencode時間を維持しつつ、出力segment数・転送時間を抑える。今回のようにencode後のS3公開が長い場合も処理時間に含める。
+
+#### 旧設定からの移行（環境ごとに一度）
+
+`timing_profile` 変数は廃止した。実値tfvarsの該当行、`TF_VAR_timing_profile`、実行スクリプトの `-var=timing_profile=...` を削除する。
+テスト・jobが稼働していないことと残存runを確認し、構築用AWS認証で専用環境の変更planを確認する。
 
 ```text
 docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml stop worker
-terraform -chdir=app/infra/terraform-e2e plan -var="timing_profile=lifecycle" -out=lifecycle.tfplan
+terraform -chdir=app/infra/terraform-e2e plan -out=e2e.tfplan
 ```
 
-対象が専用環境であることをplanで確認して適用する。
+対象が当該専用環境だけであることを確認して適用する。
 
 ```text
-terraform -chdir=app/infra/terraform-e2e apply lifecycle.tfplan
+terraform -chdir=app/infra/terraform-e2e apply e2e.tfplan
 ```
 
-`compose_environment` を再読込し、Worker用認証を設定した同じシェルで再作成する。
+共通準備の手順で `compose_environment` を再読込し、Worker認証を設定したシェルでWorkerを再作成する。
 
 ```text
 docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up -d --no-deps --force-recreate worker
 ```
 
-ホスト認証をrunner用に戻し、E2E設定を再生成・再読込して事前確認と対象シナリオを実行する。
-CLIの `-var` は次回のplanには引き継がれない。継続利用する専用環境なら実値tfvarsで明示する。
-retryや試行上限をホストのE2E環境変数だけで変更してはならない。TerraformのSQS設定、`compose_environment` によるWorker設定、実体から再生成したE2E設定を一致させる。既存メッセージの受信回数はリセットされないため、保持中のrunを解決してから切り替える。
-
-他のE2Eへ戻す前に同じ停止・確認手順を行い、以下で標準設定へ戻す。
-
-```text
-terraform -chdir=app/infra/terraform-e2e plan -var="timing_profile=standard" -out=standard.tfplan
-```
-
-planを確認後に適用する。
-
-```text
-terraform -chdir=app/infra/terraform-e2e apply standard.tfplan
-```
-
-戻す場合もCompose出力再読込・Worker再作成・E2E設定再生成が必要。tfvarsで変更した場合も `standard` に戻す。
-以前の一律短縮設定を適用済みの環境にも、この標準設定への復元手順を使用する。
-通常環境のTerraformと復旧後の完了・ack検証は変更しない。
-
-</details>
+ホスト認証をrunner用に戻し、E2E設定を再生成・再読込して共通事前確認を行う。
+ファイルを更新しただけではSQSや起動済みWorkerの設定は変わらない。ホストのE2E変数だけを変更して整合を取らない。
+既存通知の受信回数もリセットされないため、保持runは証跡のIDで確認する。queue purgeやDLQ自動replayは行わない。
 
 タイムアウトは `encode readiness`（開始・更新待ち）、`lease and visibility expiry`（期限切れ待ち）、
 `completion and acknowledgement`（完了・ack待ち）と待機予算を表示する。
 
-両シナリオは上記の共通事前確認と同じ専用Worker/DB/S3/SQSを使用する。
-`E2E_DUPLICATE_EXCLUSIVE=true` と `E2E_DUPLICATE_FIXTURE` の絶対MP4パスも共通で使用する。
-クラッシュ復旧はencode中に1回のheartbeat成功とDB leaseの前進を確認して停止する。
-長時間heartbeatは2回以上の更新を観測できるfixtureを使う。容量ではなく実際の処理時間で判断する。
-短いfixture、観測不足、失敗イベントは `unverified` となり、skipや成功にはしない。
-
-- Workerには `heartbeat_observation_schema=1` と `duplicate_observation_schema=1` が必要。
-- `E2E_CLOCK_SKEW_MS` を1〜5000の整数で明示する。実行ホスト・Worker・DBの時計ずれの上限であり、
-  時刻同期を確認した上で設定する。DB時計は各観測の要求〜応答区間とこの許容幅で照合する。
-  heartbeat要求・応答の時刻差と単調時計によるelapsedも照合する。
-- `E2E_PROCESSING_TIMEOUT_MS` はクラッシュ復旧ではheartbeat間隔の2倍、長時間heartbeatでは3倍より大きくする。
-  時計ずれの許容幅の2倍はlease/visibility期間より小さい必要がある。
-- クラッシュ復旧には残り試行回数が必要で、`E2E_MAX_ATTEMPTS >= 2` とする。
-  Workerは保持される専用コンテナーで、restart policyが `no` であることが必要。
-  設定が合わなければ停止せずに失敗する。シナリオ自身はrestart policyを変更しない。
-
-```text
-# 共通設定に加えて、確認した時計ずれ上限を設定する例
-E2E_CLOCK_SKEW_MS=100
-
-python app/scripts/run_reliability_e2e.py --scenario crash-recovery
-python app/scripts/run_reliability_e2e.py --scenario long-heartbeat
-```
+追加条件とコマンドは前述の `crash-recovery` / `long-heartbeat` の手順を使用する。以下は観測・復旧の詳細。
 
 クラッシュ復旧はencode開始・1回のheartbeat成功・DB lease更新を確認後、共通事前確認済みのWorkerを
 `docker container stop --signal SIGKILL --timeout 0` で停止する。DBは停止しない。
@@ -581,7 +729,7 @@ FROM jobs WHERE status IN ('UPLOADING', 'QUEUED', 'PROCESSING') ORDER BY updated
 証跡の正確なID、DB状態、S3状態、未処理通知を照合し、対象runだけを手動復旧してから再実行する。
 全件DELETE、状態の強制変更、queue purge、DLQ自動replayで通してはいけない。
 通常cleanupは完了と既知メッセージの最新配送のackを待ち、削除対象全体を検査してsource/HLSと所有確認済みvideoを削除する（jobsはCASCADE）。
-テスト自体はReceiveMessage/DeleteMessageを使わない。SQSの後発再配送が永久にないことまでは保証しない。
+重複配送・ライフサイクルのテスト自体はReceiveMessage/DeleteMessageを使わない（FFmpeg・poisonのDLQ受信は前述のとおり）。SQSの後発再配送が永久にないことまでは保証しない。
 
 </details>
 
@@ -655,6 +803,8 @@ cargo test --manifest-path app/backend/worker/Cargo.toml <テスト名>
 `allowedSkewMs` は設定した許容差、`observationElapsedMs` は照会前後の時間差。
 `cause=db_behind` / `db_ahead` の `excessMs` は許容範囲からの超過量。
 `local_clock_reversed` は実行側の時計が逆行したことを示し、`excessMs` は逆行量。
+Workerのheartbeatログは `abs((応答時刻 − 開始時刻) − elapsed_ms) <= E2E_CLOCK_SKEW_MS` で時計変動を判定する。`elapsed_ms` は単調時計による処理時間で、応答時刻が開始時刻より前という理由だけでは失敗させない。lease更新とvisibility延長の間、およびcycle間の時刻比較にも許容差を適用するが、cycle番号・所有者・操作成功・期限切れの検証は維持する。更新期限の保守的な下限には開始・応答の早い方を使って許容差を引き、再開待機用のvisibility期限には遅い方を使って許容差を加える。既存の停止時刻からの待機下限も維持する。
+ローカル時計が逆行した観測はログ・DB値を含めて破棄し、最大2回再取得する（初回を含め3回）。正常な観測だけを復旧時刻の計算に使う。3回続けて逆行した場合は最後の診断を保存して失敗する。`allowedSkewMs` はDBとの時計差の許容値であり、逆行の許容値ではない。DBとの時計差が許容範囲を超えた場合やDB照会エラーは再試行しない。
 この診断は時計差の観測であり、OS時刻同期やスリープ復帰などの根本原因を断定しない。
 照会時間が長いだけでは失敗しない。許容差を増やす前に数値と実行環境の時計を確認する。
 
