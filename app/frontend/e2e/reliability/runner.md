@@ -803,6 +803,7 @@ cargo test --manifest-path app/backend/worker/Cargo.toml <テスト名>
 `allowedSkewMs` は設定した許容差、`observationElapsedMs` は照会前後の時間差。
 `cause=db_behind` / `db_ahead` の `excessMs` は許容範囲からの超過量。
 `local_clock_reversed` は実行側の時計が逆行したことを示し、`excessMs` は逆行量。
+Workerのheartbeatログは `abs((応答時刻 − 開始時刻) − elapsed_ms) <= E2E_CLOCK_SKEW_MS` で時計変動を判定する。`elapsed_ms` は単調時計による処理時間で、応答時刻が開始時刻より前という理由だけでは失敗させない。lease更新とvisibility延長の間、およびcycle間の時刻比較にも許容差を適用するが、cycle番号・所有者・操作成功・期限切れの検証は維持する。更新期限の保守的な下限には開始・応答の早い方を使って許容差を引き、再開待機用のvisibility期限には遅い方を使って許容差を加える。既存の停止時刻からの待機下限も維持する。
 ローカル時計が逆行した観測はログ・DB値を含めて破棄し、最大2回再取得する（初回を含め3回）。正常な観測だけを復旧時刻の計算に使う。3回続けて逆行した場合は最後の診断を保存して失敗する。`allowedSkewMs` はDBとの時計差の許容値であり、逆行の許容値ではない。DBとの時計差が許容範囲を超えた場合やDB照会エラーは再試行しない。
 この診断は時計差の観測であり、OS時刻同期やスリープ復帰などの根本原因を断定しない。
 照会時間が長いだけでは失敗しない。許容差を増やす前に数値と実行環境の時計を確認する。
