@@ -117,11 +117,33 @@ class OfflinePoisonAdapter extends DockerPoisonIsolationAdapter {
   }
 }
 function offlineAdapter() {
-  return new OfflinePoisonAdapter({} as ConstructorParameters<typeof DockerPoisonIsolationAdapter>[0], {
+  return new OfflinePoisonAdapter({ workerSettings: { attempts: 3 } } as ConstructorParameters<typeof DockerPoisonIsolationAdapter>[0], {
     E2E_PROCESSING_TIMEOUT_MS: '1000', E2E_VISIBILITY_TIMEOUT_MS: '1000', E2E_NAVIGATION_TIMEOUT_MS: '1000', E2E_DLQ_TIMEOUT_MS: '1000',
   })
 }
 describe('poison adapter database and recovery evidence', () => {
+  it('allows all visibility cycles even with a short Worker retry budget', async () => {
+    const live = new OfflinePoisonAdapter({ workerSettings: { attempts: 3 } } as ConstructorParameters<typeof DockerPoisonIsolationAdapter>[0], {
+      E2E_PROCESSING_TIMEOUT_MS: '300000', E2E_VISIBILITY_TIMEOUT_MS: '150000',
+      E2E_NAVIGATION_TIMEOUT_MS: '30000', E2E_DLQ_TIMEOUT_MS: '40000',
+    })
+    expect(live.dlqMs).toBe(490000)
+    const { adapter, report } = fixture()
+    adapter.processingMs = 300000
+    adapter.deliveryMs = 180000
+    adapter.dlqMs = live.dlqMs
+    adapter.observeWithPoison.mockImplementation(async () => snapshot({}, adapter.now() >= 600000 ? poison : []))
+    await runPoisonIsolation(adapter, target, report)
+    expect(report.cleanup).toBe('complete')
+    expect(adapter.now()).toBe(600000)
+  })
+
+  it.each([0, 11, 1.5, NaN])('rejects invalid receive budgets %s', (attempts) => {
+    expect(() => new OfflinePoisonAdapter({ workerSettings: { attempts } } as ConstructorParameters<typeof DockerPoisonIsolationAdapter>[0], {
+      E2E_PROCESSING_TIMEOUT_MS: '300000', E2E_VISIBILITY_TIMEOUT_MS: '150000',
+      E2E_NAVIGATION_TIMEOUT_MS: '30000', E2E_DLQ_TIMEOUT_MS: '40000',
+    })).toThrow('Invalid poison DLQ wait budget')
+  })
   it('reads zero and nonzero counts using the shared SQL response contract', () => {
     const adapter = offlineAdapter()
     adapter.sendPoison()

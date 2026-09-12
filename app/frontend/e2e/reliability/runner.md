@@ -314,8 +314,8 @@ DLQ予算の共通チェックは1回分のretryをカバーするだけで、�
 `ffmpeg-exhaustion` の待機予算は `PROCESSING + (attempts − 1) × Worker retry(ms) + VISIBILITY + DLQ`。PROCESSINGは全試行の処理時間に対する合計予算で、試行数倍にはしない。
 DLQ確認後は `VISIBILITY`（実visibilityに観測余裕を加えた値）1回分、DB状態・attempt・更新時刻、追加encodingの不在とmanifest非公開を観測する。到達済みのDLQについてretry予算を再度待つ必要はない。
 Playwrightの上限はこれらにUPLOAD、cleanup用PROCESSING、事前確認等の180秒を加えた値とする。個々の環境変数の900000 ms上限は変更しない。
-通常のFFmpeg検証には専用Terraformの `timing_profile=exhaustion` を推奨する。3試行・retry 10秒・visibility 30秒なので、小さな不正ファイルでは通常2〜3分程度が目安（実環境で要確認）。生成値ではDLQ待機を含む上限420秒、到達後確認60秒。これは通常所要時間ではなく失敗判定用の上限で、setup/upload/cleanupは別枠。
-`standard` は5試行・retry 900秒のままで、長時間設定での確認用。待機上限4,950,000 msとなり、実行は1時間以上かかり得る。シナリオ選択だけではWorker/SQSの設定は変わらない。
+専用Terraformは全シナリオ共通で3試行・retry 10秒・visibility 120秒とする。生成値ではFFmpegのDLQ待機を含む上限510秒、到達後確認150秒。通常所要時間ではなく失敗判定用の上限で、setup/upload/cleanupは別枠。
+poisonはWorkerのretry delayを使わず、sourceのvisibility期限切れを繰り返す。adapterは `試行上限 × E2E_VISIBILITY_TIMEOUT_MS + E2E_DLQ_TIMEOUT_MS` をpoison専用のDLQ予算として計算する。VISIBILITYは共通事前確認でsourceの実visibility以上と検証された余裕込みの値。固定設定の生成値では `3 × 150秒 + 40秒 = 490秒`。1回のDLQ受信操作の予算とFFmpegの計算にはこの増分を適用しない。
 
 fixtureの設定、DLQ受信権限、実行コマンド、成功条件は後述の `ffmpeg-exhaustion` / `poison-isolation` の個別手順を参照する。
 FFmpegイベントは同一Workerのログ出現順で検証し、UTC時刻の単調増加は要求しない。待機期限は単調時計を使う。
@@ -337,7 +337,7 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 `--live-preflight` は読み取りによる実体確認を行い、`preflight-<UUID>/live-preflight.json` を保存する。後述の `--scenario preflight` とは役割が異なる。
 
 各シナリオも実行直前に共通事前確認を行う。`E2E_EVIDENCE_DIR` は証跡の**親ディレクトリ**のまま保持し、runnerが表示する子ディレクトリへシェル設定を変更しない。
-`E2E_RUN_ID` はrunnerに生成させる。シナリオを並行実行しない。Workerの再作成・時間プロファイル変更後は設定を再生成・再読込し、この確認からやり直す。
+`E2E_RUN_ID` はrunnerに生成させる。シナリオを並行実行しない。Workerの再作成・実環境の設定変更後は設定を再生成・再読込し、この確認からやり直す。
 
 ## シナリオ別の前提条件と実行手順
 
@@ -461,7 +461,7 @@ python app/scripts/run_reliability_e2e.py --scenario crash-recovery
 
 **成功判定：** `crash-recovery-evidence.json` の `status=passed`、`restoration=complete`、`cleanup=complete`。期限切れを待って同一コンテナを再開し、元messageの別delivery/owner・attempt 2で再取得して完了・ackすること。
 利用者が途中でWorkerを再作成しない。復元失敗時は後続テストへ進まず、証跡の完全IDを使って同じWorkerの状態を確認する。
-時間短縮には後述の `lifecycle` プロファイルを利用できるが、実行前の手動切り替え・再生成が必要。
+時間設定は後述の全シナリオ共通値を使う。個別の切り替えは不要。
 
 ### long-heartbeat：複数周期のlease・visibility更新
 
@@ -490,7 +490,7 @@ node -e "require('node:fs').writeFileSync('invalid.mp4', 'not an mp4', {flag:'wx
 | 不正fixtureの絶対パス | `$env:E2E_FFMPEG_INVALID_FIXTURE = (Resolve-Path ./invalid.mp4).Path` | `export E2E_FFMPEG_INVALID_FIXTURE="$(pwd)/invalid.mp4"` |
 
 Workerとsourceキューの試行上限・retry設定を一致させ、全試行・DLQ到達・到達後の安定観測を待てる予算にする。
-通常は `exhaustion` プロファイルを使う。`standard` のretry 900秒では1時間以上かかり得るため、選択前に後述の予算を確認する。
+全シナリオ共通のretry 10秒・試行上限3回を使う。旧環境のretry 900秒が残っている場合は、後述の固定設定への移行を先に行う。
 
 ```text
 python app/scripts/run_reliability_e2e.py --scenario ffmpeg-exhaustion
@@ -504,7 +504,7 @@ DLQ受信は事前権限確認時もvisibilityを変える。メッセージは�
 
 **追加条件：** データ作成シナリオ共通条件、専用DLQ受信権限、**正常な** `E2E_DUPLICATE_FIXTURE`。
 malformed本文と存在しないjobの通知はテストが生成するため、手動送信も不正fixture指定も不要。
-正常jobの完了とpoisonの全redriveが `PROCESSING + VISIBILITY + NAVIGATION + DLQ` の待機予算に収まる設定にする。予算はWorker/SQSの実設定と整合させる。
+正常jobの完了とpoisonの全redriveを `PROCESSING + VISIBILITY + NAVIGATION + poison専用DLQ予算` の範囲で待つ。固定設定の生成値では合計970秒（約16分10秒）。全段階が遅延した場合の上限であり、通常所要時間は15分以内を目標とする。poison専用DLQ予算はadapterが計算するため、シェルでDLQ変数を長くする必要はない。
 
 ```text
 python app/scripts/run_reliability_e2e.py --scenario poison-isolation
@@ -548,8 +548,7 @@ python app/scripts/run_reliability_e2e.py --scenario queue-monitoring --ffmpeg-e
 フル実行は個別条件すべてを開始前に検証するわけではなく、後半の条件不足でも途中停止し得る。
 
 正常fixtureは重複配送と両ライフサイクルで十分なencode時間があり、poisonの正常jobとしても完了できるものを選ぶ。
-時間プロファイルは一つの設定で全シナリオを通せるようにする。例として `exhaustion` はheartbeat 5秒・試行上限3でライフサイクルの最低条件も満たすが、実fixtureでの観測可能性は別途確認する。
-途中でプロファイルやWorkerを再作成しない。生成時の完全コンテナID・起動時刻が古くなり、認可で停止する。
+全シナリオに同じ固定時間設定を使う。実fixtureでの観測可能性は別途確認する。途中で設定変更やWorker再作成を行わない。完全コンテナIDが変わると再認可できなくなる。
 
 ```text
 python app/scripts/run_reliability_e2e.py --scenario preflight
@@ -580,64 +579,49 @@ APIのCOMPLETED、HLS取得・Content-Type/CORS、player/networkの失敗不在�
 
 ## 時間設定・検証詳細・復旧
 
-### 専用環境の時間プロファイルと切り替え
+### 専用環境の固定時間設定
 
-E2E専用Terraformの `timing_profile` で時間設定を選択する。既定は `standard`。
+E2E専用Terraformは次の1組を使う。シナリオごとの設定選択・切り替えは不要。
+通常環境のTerraform既定値は変更しない。
 
-| プロファイル | heartbeat | source visibility / Worker延長 | lease | retry | Worker試行上限 / SQS maxReceiveCount | 用途 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `standard` | 30秒 | 120秒 | 300秒 | 900秒 | 5 / 5 | 既存の標準設定・長時間検証 |
-| `lifecycle` | 5秒 | 30秒 | 30秒 | 900秒 | 5 / 5 | 復旧・heartbeat検証 |
-| `exhaustion` | 5秒 | 30秒 | 30秒 | 10秒 | 3 / 3 | 不正MP4のFFmpeg試行上限・DLQ検証 |
+| heartbeat | source visibility / Worker延長 | lease | retry | Worker試行上限 / SQS maxReceiveCount |
+| --- | --- | --- | --- | --- |
+| 5秒 | 120秒 / 120秒 | 60秒 | 10秒 | 3 / 3 |
 
-**設定はその専用環境全体に適用される。シナリオ選択による自動切り替え・自動復元は行わない。**
-同時に別シナリオを実行しない。並行実行が必要なら別instance・別state・別Composeプロジェクトを用意する。
+通常は1シナリオ15分以内を目標とする。30分の厳密な上限や全体watchdogは追加しない。
+既存の段階別タイムアウトと、復旧・cleanupを含む余裕のあるPlaywrightタイムアウトを維持する。
+異常時は通常所要時間より長く待つ場合がある。タイムアウトを短くするだけでWorker復旧を中断しない。
 
-<details>
-<summary>短い時間設定への切り替え・元に戻す手順（Windows・WSL共通）</summary>
+正常fixtureはencode約25〜40秒を初期目安とし、アップロード・segment/manifest公開を含む正常処理が概ね3分以内となるものを実測して選ぶ。
+重複通知の初回受信から完了までの時間は、通常の配送を前提に `(受信上限 − 1) × visibility`（固定値では240秒）を十分下回るようにする。
+最後の受信枠を完了後のackに残すためであり、SQSの配送時刻を保証する式ではない。
+長時間heartbeatを観測できるencode時間を維持しつつ、出力segment数・転送時間を抑える。今回のようにencode後のS3公開が長い場合も処理時間に含める。
 
-実行中のテスト・jobと保持リソースを確認し、切り替えてよい状態にしてWorkerを停止する。
-AWS認証は構築用プロファイルを使用する。
-以下は `lifecycle` の例。FFmpeg検証では `timing_profile=exhaustion` とし、planファイル名も `exhaustion.tfplan` に置き換える。
+#### 旧設定からの移行（環境ごとに一度）
+
+`timing_profile` 変数は廃止した。実値tfvarsの該当行、`TF_VAR_timing_profile`、実行スクリプトの `-var=timing_profile=...` を削除する。
+テスト・jobが稼働していないことと残存runを確認し、構築用AWS認証で専用環境の変更planを確認する。
 
 ```text
 docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml stop worker
-terraform -chdir=app/infra/terraform-e2e plan -var="timing_profile=lifecycle" -out=lifecycle.tfplan
+terraform -chdir=app/infra/terraform-e2e plan -out=e2e.tfplan
 ```
 
-対象が専用環境であることをplanで確認して適用する。
+対象が当該専用環境だけであることを確認して適用する。
 
 ```text
-terraform -chdir=app/infra/terraform-e2e apply lifecycle.tfplan
+terraform -chdir=app/infra/terraform-e2e apply e2e.tfplan
 ```
 
-`compose_environment` を再読込し、Worker用認証を設定した同じシェルで再作成する。
+共通準備の手順で `compose_environment` を再読込し、Worker認証を設定したシェルでWorkerを再作成する。
 
 ```text
 docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up -d --no-deps --force-recreate worker
 ```
 
-ホスト認証をrunner用に戻し、E2E設定を再生成・再読込して事前確認と対象シナリオを実行する。
-CLIの `-var` は次回のplanには引き継がれない。継続利用する専用環境なら実値tfvarsで明示する。
-retryや試行上限をホストのE2E環境変数だけで変更してはならない。TerraformのSQS設定、`compose_environment` によるWorker設定、実体から再生成したE2E設定を一致させる。既存メッセージの受信回数はリセットされないため、保持中のrunを解決してから切り替える。
-
-他のE2Eへ戻す前に同じ停止・確認手順を行い、以下で標準設定へ戻す。
-
-```text
-terraform -chdir=app/infra/terraform-e2e plan -var="timing_profile=standard" -out=standard.tfplan
-```
-
-planを確認後に適用する。
-
-```text
-terraform -chdir=app/infra/terraform-e2e apply standard.tfplan
-```
-
-戻す場合もCompose出力再読込・Worker再作成・E2E設定再生成が必要。tfvarsで変更した場合も `standard` に戻す。
-以前の一律短縮設定を適用済みの環境にも、この標準設定への復元手順を使用する。
-通常環境のTerraformと復旧後の完了・ack検証は変更しない。
-
-</details>
+ホスト認証をrunner用に戻し、E2E設定を再生成・再読込して共通事前確認を行う。
+ファイルを更新しただけではSQSや起動済みWorkerの設定は変わらない。ホストのE2E変数だけを変更して整合を取らない。
+既存通知の受信回数もリセットされないため、保持runは証跡のIDで確認する。queue purgeやDLQ自動replayは行わない。
 
 タイムアウトは `encode readiness`（開始・更新待ち）、`lease and visibility expiry`（期限切れ待ち）、
 `completion and acknowledgement`（完了・ack待ち）と待機予算を表示する。
