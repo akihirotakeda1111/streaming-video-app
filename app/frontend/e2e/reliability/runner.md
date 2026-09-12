@@ -215,12 +215,15 @@ IDが変わるためE2E設定を再生成・再読込する。`VIDEO_ENCODING_QU
 <details>
 <summary>Windows / PowerShell：設定生成・読み込み</summary>
 
-PowerShellの例（アカウントとfixtureを実値へ置換）:
+フル実行向けの生成例。正常MP4と、非空の不正 `.mp4` を別々に用意する。時計ずれはホスト・Worker・DBの時刻同期を確認して上限を指定する（以下の100 msは例）。
+`--full` は環境設定生成の入力を検証するオプションで、テストを実行しない。
+
+PowerShellの例（アカウント・両fixture・時計ずれ・URLを実環境に合わせる）:
 
 ```powershell
 $workerId = docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q worker
 $dbId = docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q postgres
-node app/scripts/generate_reliability_env.mjs --worker $workerId --database $dbId --account 123456789012 --fixture C:/e2e/long.mp4 --exclusive --output ./reliability-env.local.ps1
+node app/scripts/generate_reliability_env.mjs --worker $workerId --database $dbId --account 123456789012 --fixture C:/e2e/long.mp4 --invalid-fixture C:/e2e/invalid.mp4 --clock-skew-ms 100 --frontend-url http://localhost:5173 --api-url http://localhost:8080 --exclusive --full --output ./reliability-env.local.ps1
 # 成功を確認し、内容をレビューしてから同じシェルに読み込む
 Get-Content ./reliability-env.local.ps1
 . ./reliability-env.local.ps1
@@ -241,13 +244,13 @@ db_id=$(docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose
 # 専用・破棄可能環境であることを確認してから実行。アカウントとfixtureを実値へ置換
 load_e2e() {
   local settings entries entry
-  settings=$(node --input-type=module - "$worker_id" "$db_id" '123456789012' "$HOME/e2e/fixtures/test.mp4" <<'JS'
+  settings=$(node --input-type=module - "$worker_id" "$db_id" '123456789012' "$HOME/e2e/fixtures/test.mp4" "$HOME/e2e/fixtures/invalid.mp4" '100' <<'JS'
 import { discoverEnvironment } from './app/scripts/generate_reliability_env.mjs'
-const [worker, database, account, fixture] = process.argv.slice(2)
+const [worker, database, account, fixture, invalidFixture, clockSkewMs] = process.argv.slice(2)
 try {
-  const env = discoverEnvironment({ worker, database, account, fixture, exclusive: true })
+  const env = discoverEnvironment({ worker, database, account, fixture, invalidFixture, clockSkewMs, exclusive: true, full: true, frontendUrl: 'http://localhost:5173', apiUrl: 'http://localhost:8080' })
   console.log(JSON.stringify(env))
-} catch { console.error('E2E設定生成失敗。認証・接続先・ラベル・アラームを確認してください'); process.exitCode = 2 }
+} catch { console.error('E2E設定生成失敗。認証・接続先・ラベル・アラーム・fixture・時計ずれの入力を確認してください'); process.exitCode = 2 }
 JS
   ) || return 1
   entries=$(printf '%s' "$settings" | jq -r 'to_entries[] | "\(.key)=\(.value)"') || return 1
@@ -257,6 +260,12 @@ load_e2e || echo '設定生成失敗。後続の実行を止めて確認して�
 ```
 
 </details>
+
+フル実行用に生成すると、正常・不正fixture、時計ずれ、`E2E_PROJECT=chromium`、全共通設定が同じファイル/JSONに揃う。
+`.ps1`またはBashの生成JSONを読み込んだ後、これらを個別にexportし直す必要はない。
+fixture検査はファイル形式・サイズの条件のみで、正常動画としての再生可否・encode時間や、実FFmpegでの失敗は保証しない。
+API/Frontend用のバケット、出力S3 endpoint、許可origin、API接続先、公開ポートも生成する。API/Frontendの起動・認証とS3 CORS、ホストFFmpeg、Chromiumのインストールは引き続き別途必要。秘密情報は生成ファイルへ含めない。
+`E2E_RUN_ID` と監視の先行run IDはフルrunnerが設定するため、生成設定には含めない。
 
 生成JSON・コマンドはいずれも非機密設定だけだが、環境固有の値なのでGitにはコミットしない。
 認証を別シェルで使う場合は、そのシェルでも既存AWS CLIログイン・認証変数を手動設定する。
@@ -269,7 +278,10 @@ load_e2e || echo '設定生成失敗。後続の実行を止めて確認して�
 | `--docker-host` | DOCKER_HOST、なければOS別ローカルソケット |
 | `--frontend-url` / `--api-url` | 既定は `http://127.0.0.1:5173` / `http://127.0.0.1:8000`。自動検出・稼働確認ではない |
 | `--evidence-dir` | カレントディレクトリの `artifacts/reliability-e2e` を絶対パス化 |
-| `--fixture` | 絶対パスへ変換し存在・拡張子・サイズを検査。省略時は空欄を手動補完 |
+| `--fixture` | `E2E_DUPLICATE_FIXTURE`。正常MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
+| `--invalid-fixture` | `E2E_FFMPEG_INVALID_FIXTURE`。不正MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
+| `--clock-skew-ms` | `E2E_CLOCK_SKEW_MS`。1〜5000 msの整数を明示。lease/visibilityとの余裕も確認 |
+| `--full` | `--exclusive` と上記3引数を必須にする。正常・不正fixtureに同じパスを指定した場合もエラー。省略時は不足値を空欄として生成 |
 | `--exclusive` | 専用・破棄可能環境であるという利用者の宣言。省略時はdisposable/exclusiveが空欄 |
 | `--alarms A,B,C` | 候補が重複・多数ある場合に実際の3アラーム名を指定 |
 
@@ -377,19 +389,21 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 `preflight` と最終 `@phase1-pipeline` には、Worker/DBに加えてAPI・Frontendを起動する。フル実行では開始前に準備する。
 
 1. API用principalの認証を `API_AWS_ACCESS_KEY_ID` / `API_AWS_SECRET_ACCESS_KEY`、一時認証なら `API_AWS_SESSION_TOKEN` に設定する。Worker用・ホスト用の認証設定だけではAPIに渡らない。APIは同じDB、`VIDEO_INPUT_BUCKET` / `VIDEO_OUTPUT_BUCKET`、regionを参照させる。
-2. 公開ポートとURLを合わせる。ComposeのAPI既定は8080だが、設定生成のAPI URL既定は8000なので、必ず実際のポートを明示する。
+2. 生成設定を読み込む。`--frontend-url` / `--api-url` からComposeの公開ポートも生成する。生成器のAPI URL既定は8000なので、8080で公開する場合は `--api-url http://localhost:8080` を指定する。ComposeはHTTPで配信するため、HTTPSのURLを使う場合は別途proxyの設定が必要。
 3. APIの `FRONTEND_ORIGIN`、Terraformの `frontend_origin` によるS3 CORS、ブラウザが開くFrontend originを一致させる。`localhost` と `127.0.0.1` は別origin。必要なAWS変更は共通準備のplan確認手順で行う。
 
-以下はFrontendを `http://localhost:5173`、APIを `http://localhost:8080` に揃える例。既存専用環境のCORSと異なる場合は、その環境のoriginに合わせて全項目を読み替える。
+生成設定には次の起動用変数が含まれるため、個別設定は不要。既存専用環境のS3 CORSと異なる場合は、その環境のoriginを生成時に指定する。
 
-| 変数 | PowerShell | Bash |
-| --- | --- | --- |
-| API公開ポート | `$env:API_PORT = '8080'` | `export API_PORT='8080'` |
-| Frontend公開ポート | `$env:FRONTEND_PORT = '5173'` | `export FRONTEND_PORT='5173'` |
-| APIの許可origin | `$env:FRONTEND_ORIGIN = 'http://localhost:5173'` | `export FRONTEND_ORIGIN='http://localhost:5173'` |
-| FrontendのAPI接続先 | `$env:VITE_API_BASE_URL = 'http://localhost:8080/api/v1'` | `export VITE_API_BASE_URL='http://localhost:8080/api/v1'` |
-| テストのFrontend URL | `$env:E2E_FRONTEND_URL = 'http://localhost:5173'` | `export E2E_FRONTEND_URL='http://localhost:5173'` |
-| テストのAPI URL | `$env:E2E_API_URL = 'http://localhost:8080'` | `export E2E_API_URL='http://localhost:8080'` |
+| 変数 | 生成元・値 |
+| --- | --- |
+| `AWS_REGION` | Workerのリージョン |
+| `VIDEO_INPUT_BUCKET` / `VIDEO_OUTPUT_BUCKET` | Workerと同じ入力・出力バケット |
+| `OUTPUT_S3_ENDPOINT` | `https://<出力バケット>.s3.<リージョン>.amazonaws.com` |
+| `FRONTEND_ORIGIN` | `--frontend-url` のorigin |
+| `VITE_API_BASE_URL` | `--api-url` に `/api/v1` を追加 |
+| `API_PORT` / `FRONTEND_PORT` | 指定URLのポート（省略時はHTTP 80 / HTTPS 443） |
+
+API必須の `HTTP_ADDR` と既定の `DATABASE_URL` はComposeが設定する。DB設定を変更している場合は既存DBに合う `COMPOSE_DATABASE_URL` を別途設定する。APIのAWS認証情報は上記1のとおり手動設定する。
 
 ```text
 docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up --build -d api frontend

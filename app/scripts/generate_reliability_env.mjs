@@ -15,6 +15,7 @@ import {
 
 /** @typedef {{worker: string, database: string, dockerHost?: string, account?: string,
  * profile?: string, frontendUrl?: string, apiUrl?: string, fixture?: string,
+ * invalidFixture?: string, clockSkewMs?: string, full?: boolean,
  * evidenceDir?: string, alarms?: string, exclusive?: boolean}} Options */
 class ConfigurationError extends Error {}
 /** @param {string} message @returns {never} */
@@ -38,6 +39,16 @@ const OUTPUT_NAMES = new Set([
   "E2E_EVIDENCE_DIR",
   "E2E_DUPLICATE_EXCLUSIVE",
   "E2E_DUPLICATE_FIXTURE",
+  "E2E_FFMPEG_INVALID_FIXTURE",
+  "E2E_CLOCK_SKEW_MS",
+  "E2E_PROJECT",
+  "VIDEO_INPUT_BUCKET",
+  "VIDEO_OUTPUT_BUCKET",
+  "OUTPUT_S3_ENDPOINT",
+  "FRONTEND_ORIGIN",
+  "VITE_API_BASE_URL",
+  "API_PORT",
+  "FRONTEND_PORT",
 ]);
 const safeName = (/** @type {unknown} */ value) =>
   typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value);
@@ -54,6 +65,10 @@ function positive(value, label, max = 43200) {
  * @returns {Record<string, string>}
  */
 export function discoverEnvironment(options, execute = execFileSync) {
+  if (options.full && (!options.exclusive || !options.fixture || !options.invalidFixture || !options.clockSkewMs))
+    fail("--full requires --exclusive, --fixture, --invalid-fixture and --clock-skew-ms");
+  const clockSkewMs = options.clockSkewMs === undefined
+    ? "" : String(positive(options.clockSkewMs, "clock skew bound", 5000));
   if (!safeName(options.worker) || !safeName(options.database))
     fail("Worker and database names or IDs are required");
   const host =
@@ -327,15 +342,22 @@ export function discoverEnvironment(options, execute = execFileSync) {
     ),
     E2E_DUPLICATE_EXCLUSIVE: options.exclusive ? "true" : "",
     E2E_DUPLICATE_FIXTURE: "",
+    E2E_FFMPEG_INVALID_FIXTURE: "",
+    E2E_CLOCK_SKEW_MS: clockSkewMs,
+    E2E_PROJECT: "chromium",
   };
   if (options.profile) env.AWS_PROFILE = options.profile;
-  if (options.fixture) {
-    const path = resolve(options.fixture);
+  for (const [name, fixture] of Object.entries({
+    E2E_DUPLICATE_FIXTURE: options.fixture,
+    E2E_FFMPEG_INVALID_FIXTURE: options.invalidFixture,
+  })) {
+    if (!fixture) continue;
+    const path = resolve(fixture);
     let stat;
     try {
       stat = statSync(path);
     } catch {
-      fail("Fixture file unavailable");
+      fail(`${name} file unavailable`);
     }
     if (
       !path.toLowerCase().endsWith(".mp4") ||
@@ -343,9 +365,15 @@ export function discoverEnvironment(options, execute = execFileSync) {
       !stat.size ||
       stat.size > 1024 ** 3
     )
-      fail("Fixture must be a nonempty MP4 file of at most 1 GiB");
-    env.E2E_DUPLICATE_FIXTURE = path;
+      fail(`${name} must be a nonempty .mp4 file of at most 1 GiB`);
+    env[name] = path;
   }
+  if (options.full && env.E2E_DUPLICATE_FIXTURE === env.E2E_FFMPEG_INVALID_FIXTURE)
+    fail("Normal and invalid fixtures must use different files");
+  if (clockSkewMs && Number(clockSkewMs) * 2 >= Math.min(extension, lease) * 1000)
+    fail("Clock skew bound is too large for observed lease and visibility");
+  if (options.full && (attempts < 2 || Number(env.E2E_PROCESSING_TIMEOUT_MS) <= 3 * heartbeat * 1000))
+    fail("Observed Worker settings cannot support full-suite lifecycle checks");
   try {
     validateSettings(env, false);
   } catch {
@@ -354,6 +382,19 @@ export function discoverEnvironment(options, execute = execFileSync) {
       "Generated settings do not satisfy the common validator; check URLs, names and scopes",
     );
   }
+  // Compose startup values must point to the same resources and browser URLs
+  // as the tests. Credentials and database connection strings remain manual.
+  const frontend = new URL(env.E2E_FRONTEND_URL);
+  const api = new URL(env.E2E_API_URL);
+  Object.assign(env, {
+    VIDEO_INPUT_BUCKET: env.E2E_SOURCE_BUCKET,
+    VIDEO_OUTPUT_BUCKET: env.E2E_OUTPUT_BUCKET,
+    OUTPUT_S3_ENDPOINT: `https://${env.E2E_OUTPUT_BUCKET}.s3.${region}.amazonaws.com`,
+    FRONTEND_ORIGIN: frontend.origin,
+    VITE_API_BASE_URL: env.E2E_API_URL.replace(/\/$/, "") + "/api/v1",
+    API_PORT: api.port || (api.protocol === "https:" ? "443" : "80"),
+    FRONTEND_PORT: frontend.port || (frontend.protocol === "https:" ? "443" : "80"),
+  });
   return env;
 }
 
@@ -362,10 +403,15 @@ export function renderPowerShell(env) {
   const lines = [
     "# Generated configuration only; this is not successful live preflight evidence.",
     "# Review account, resource identities, local URL defaults and workload budgets.",
-    "# Secrets are deliberately omitted. Configure your AWS CLI login/credentials manually.",
+    "# Secrets are deliberately omitted. Configure host AWS login and API_AWS_* credentials manually.",
     "# DATABASE_URL and Worker credentials remain in their existing containers; do not copy them here.",
     "# Empty disposable/exclusive values require confirmation; then set both to true.",
     "# Empty E2E_DUPLICATE_FIXTURE requires an absolute MP4 path.",
+    "# Full suite also requires E2E_FFMPEG_INVALID_FIXTURE and a measured E2E_CLOCK_SKEW_MS bound.",
+    "# Fixture checks cover path/size only; verify normal media and invalid media contents separately.",
+    "# Start API/frontend with matching URLs and CORS; install Chromium and host FFmpeg.",
+    "# API_PORT/FRONTEND_PORT follow the URLs. Compose serves HTTP; HTTPS requires a separately configured proxy.",
+    "# HTTP_ADDR and default DATABASE_URL are supplied by Compose. Keep custom DB credentials aligned separately.",
   ];
   for (const [name, value] of Object.entries(env)) {
     if (!OUTPUT_NAMES.has(name) || /[\r\n\0]/.test(value))
@@ -375,6 +421,7 @@ export function renderPowerShell(env) {
   lines.push(
     "# Next: python app/scripts/run_reliability_e2e.py --check",
     "# Then: python app/scripts/run_reliability_e2e.py --live-preflight",
+    "# After browser readiness and all settings are complete: python app/scripts/run_reliability_e2e.py --full",
   );
   return lines.join("\n") + "\n";
 }
@@ -387,6 +434,9 @@ Usage: node app/scripts/generate_reliability_env.mjs --worker NAME --database NA
   --frontend-url URL    Default http://127.0.0.1:5173; set the actual URL if different
   --api-url URL         Default http://127.0.0.1:8000; set the actual URL if different
   --fixture PATH        Existing MP4; otherwise emit an empty setting for manual completion
+  --invalid-fixture PATH Existing nonempty invalid .mp4 for FFmpeg exhaustion
+  --clock-skew-ms MS     Explicit clock skew upper bound, 1..5000; otherwise emit empty
+  --full                Require all full-suite inputs; does not execute tests or verify media contents
   --evidence-dir PATH   Default artifacts/reliability-e2e under the current directory
   --alarms A,B,C        Select exactly three matching alarms when discovery is ambiguous
   --exclusive           Confirm these resources are disposable and exclusive to this test
@@ -409,6 +459,9 @@ export function main(args = process.argv.slice(2), execute = execFileSync) {
         "frontend-url": { type: "string" },
         "api-url": { type: "string" },
         fixture: { type: "string" },
+        "invalid-fixture": { type: "string" },
+        "clock-skew-ms": { type: "string" },
+        full: { type: "boolean" },
         "evidence-dir": { type: "string" },
         alarms: { type: "string" },
         exclusive: { type: "boolean" },
@@ -432,6 +485,9 @@ export function main(args = process.argv.slice(2), execute = execFileSync) {
         frontendUrl: values["frontend-url"],
         apiUrl: values["api-url"],
         fixture: values.fixture,
+        invalidFixture: values["invalid-fixture"],
+        clockSkewMs: values["clock-skew-ms"],
+        full: values.full,
         evidenceDir: values["evidence-dir"],
         alarms: values.alarms,
         exclusive: values.exclusive,
