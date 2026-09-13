@@ -81,12 +81,12 @@ impl Config {
                 "must not exceed 43200 seconds",
             ));
         }
-        if heartbeat_interval_seconds >= visibility_extension_seconds
-            || heartbeat_interval_seconds >= lease_duration_seconds
+        if heartbeat_interval_seconds > visibility_extension_seconds / 2
+            || heartbeat_interval_seconds > lease_duration_seconds / 2
         {
             return Err(ConfigError::invalid(
                 HEARTBEAT_INTERVAL_SECONDS,
-                "must be shorter than lease duration and visibility extension",
+                "must be at most half the lease duration and visibility extension",
             ));
         }
         if retry_delay_seconds > 43_200 {
@@ -365,6 +365,22 @@ mod tests {
     }
 
     #[test]
+    fn startup_requires_half_duration_heartbeat_margin() {
+        for variable in [LEASE_DURATION_SECONDS, VISIBILITY_EXTENSION_SECONDS] {
+            for (duration, accepted) in [(59, false), (60, true), (61, true)] {
+                let mut values = valid();
+                values.insert(variable, duration.to_string());
+                assert_eq!(load(&values).is_ok(), accepted);
+            }
+        }
+        let mut values = valid();
+        values.insert(HEARTBEAT_INTERVAL_SECONDS, "119".into());
+        values.insert(LEASE_DURATION_SECONDS, "120".into());
+        values.insert(VISIBILITY_EXTENSION_SECONDS, "120".into());
+        assert!(load(&values).is_err());
+    }
+
+    #[test]
     fn validates_heartbeat_configuration_without_exposing_values() {
         for variable in [
             HEARTBEAT_INTERVAL_SECONDS,
@@ -388,12 +404,12 @@ mod tests {
                 assert!(!format!("{error:?}").contains("password"));
             }
         }
-        for lease in ["31", "43200"] {
+        for lease in ["60", "43200"] {
             let mut values = valid();
             values.insert(LEASE_DURATION_SECONDS, lease.into());
             load(&values).unwrap();
         }
-        for lease in ["30", "43201"] {
+        for lease in ["30", "31", "59", "43201"] {
             let mut values = valid();
             values.insert(LEASE_DURATION_SECONDS, lease.into());
             assert!(load(&values).is_err());

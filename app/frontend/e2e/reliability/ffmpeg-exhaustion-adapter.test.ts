@@ -22,8 +22,8 @@ class FakeAdapter extends DockerFfmpegExhaustionAdapter {
         typeof DockerFfmpegExhaustionAdapter
       >[0],
       {
-        E2E_FFMPEG_INVALID_FIXTURE: resolve('invalid.mp4'),
-        E2E_DUPLICATE_FIXTURE: resolve('valid.mp4'),
+        E2E_INVALID_FIXTURE: resolve('invalid.mp4'),
+        E2E_VALID_FIXTURE: resolve('valid.mp4'),
         E2E_UPLOAD_TIMEOUT_MS: '123000',
         AWS_REGION: 'us-east-1',
         E2E_PROCESSING_TIMEOUT_MS: '300000',

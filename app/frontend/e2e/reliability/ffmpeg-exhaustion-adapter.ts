@@ -44,13 +44,12 @@ export class DockerFfmpegExhaustionAdapter
     }
   }
   constructor(boundary: Boundary, env: NodeJS.ProcessEnv = process.env) {
-    const invalidFixture = env.E2E_FFMPEG_INVALID_FIXTURE?.trim() || ''
+    const invalidFixture = env.E2E_INVALID_FIXTURE?.trim() || ''
     if (!isAbsolute(invalidFixture) || !invalidFixture.toLowerCase().endsWith('.mp4'))
-      throw new Error('E2E_FFMPEG_INVALID_FIXTURE must be an absolute MP4 path')
+      throw new Error('E2E_INVALID_FIXTURE must be an absolute MP4 path')
     super(boundary, {
       ...env,
-      E2E_DUPLICATE_EXCLUSIVE: 'true',
-      E2E_DUPLICATE_FIXTURE: invalidFixture,
+      E2E_VALID_FIXTURE: invalidFixture,
     })
     this.attempts = boundary.workerSettings.attempts
     this.stabilityMs = Number(env.E2E_VISIBILITY_TIMEOUT_MS)

@@ -71,3 +71,72 @@ run "foundation_as_root" {
     error_message = "Alarms must observe this environment's queues."
   }
 }
+
+run "heartbeat_boundary" {
+  command = plan
+  module {
+    source = "../terraform"
+  }
+  variables {
+    worker_heartbeat_interval_seconds   = 60
+    worker_lease_duration_seconds       = 120
+    worker_visibility_extension_seconds = 120
+    source_visibility_timeout_seconds   = 120
+  }
+}
+
+run "heartbeat_lease_margin" {
+  command = plan
+  module {
+    source = "../terraform"
+  }
+  variables {
+    worker_heartbeat_interval_seconds   = 61
+    worker_lease_duration_seconds       = 120
+    worker_visibility_extension_seconds = 300
+    source_visibility_timeout_seconds   = 300
+  }
+  expect_failures = [aws_sqs_queue.video_encoding]
+}
+
+run "heartbeat_extension_margin" {
+  command = plan
+  module {
+    source = "../terraform"
+  }
+  variables {
+    worker_heartbeat_interval_seconds   = 61
+    worker_lease_duration_seconds       = 300
+    worker_visibility_extension_seconds = 120
+    source_visibility_timeout_seconds   = 300
+  }
+  expect_failures = [aws_sqs_queue.video_encoding]
+}
+
+run "heartbeat_source_margin" {
+  command = plan
+  module {
+    source = "../terraform"
+  }
+  variables {
+    worker_heartbeat_interval_seconds   = 61
+    worker_lease_duration_seconds       = 300
+    worker_visibility_extension_seconds = 300
+    source_visibility_timeout_seconds   = 120
+  }
+  expect_failures = [aws_sqs_queue.video_encoding]
+}
+
+run "heartbeat_near_expiry" {
+  command = plan
+  module {
+    source = "../terraform"
+  }
+  variables {
+    worker_heartbeat_interval_seconds   = 119
+    worker_lease_duration_seconds       = 120
+    worker_visibility_extension_seconds = 120
+    source_visibility_timeout_seconds   = 120
+  }
+  expect_failures = [aws_sqs_queue.video_encoding]
+}

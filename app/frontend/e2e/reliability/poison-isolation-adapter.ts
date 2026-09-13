@@ -17,7 +17,7 @@ export class DockerPoisonIsolationAdapter extends DockerDuplicateAdapter {
   now = () => performance.now()
 
   constructor(boundary: ConstructorParameters<typeof DockerDuplicateAdapter>[0], env = process.env) {
-    super(boundary, { ...env, E2E_DUPLICATE_EXCLUSIVE: 'true' })
+    super(boundary, env)
     const observationMs = Number(env.E2E_DLQ_TIMEOUT_MS)
     const visibilityMs = Number(env.E2E_VISIBILITY_TIMEOUT_MS)
     const attempts = boundary.workerSettings.attempts

@@ -82,6 +82,7 @@ impl Database for Client {
 
 pub struct PostgresJobState<D = Client> {
     database: D,
+    connection_stopped: tokio::sync::watch::Receiver<bool>,
 }
 
 impl PostgresJobState<Client> {
@@ -89,19 +90,42 @@ impl PostgresJobState<Client> {
         let (database, connection) = tokio_postgres::connect(database_url, NoTls)
             .await
             .map_err(map_error)?;
+        let (stopped, connection_stopped) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::error!(%error, "postgres connection stopped");
             }
+            let _ = stopped.send(true);
         });
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            connection_stopped,
+        })
+    }
+}
+
+impl<D> PostgresJobState<D> {
+    /// Resolves on any driver termination, including a panic or clean closure.
+    /// The monitor owns its receiver so it can supervise a running processor.
+    pub fn connection_stopped(&self) -> impl Future<Output = ()> + Send + use<D> {
+        let mut stopped = self.connection_stopped.clone();
+        async move {
+            while !*stopped.borrow_and_update() {
+                if stopped.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 impl<D> PostgresJobState<D> {
     fn new(database: D) -> Self {
-        Self { database }
+        Self {
+            database,
+            connection_stopped: tokio::sync::watch::channel(false).1,
+        }
     }
 }
 
@@ -382,6 +406,25 @@ mod tests {
 
     fn jobs() -> PostgresJobState<FakeDatabase> {
         PostgresJobState::new(FakeDatabase::default())
+    }
+
+    #[tokio::test]
+    async fn monitor_observes_prior_termination_and_driver_task_loss() {
+        for notify in [true, false] {
+            let (stopped, connection_stopped) = tokio::sync::watch::channel(false);
+            let jobs = PostgresJobState {
+                database: FakeDatabase::default(),
+                connection_stopped,
+            };
+            if notify {
+                stopped.send(true).unwrap();
+            } else {
+                drop(stopped);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), jobs.connection_stopped())
+                .await
+                .expect("termination must not be lost before supervision starts");
+        }
     }
 
     #[test]

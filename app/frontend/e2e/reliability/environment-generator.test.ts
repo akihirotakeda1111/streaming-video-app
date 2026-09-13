@@ -126,7 +126,7 @@ describe('read-only environment command generator', () => {
       WORKER_MAXIMUM_ATTEMPTS: '3',
     })
     f.state.visibility = '30'
-    const env = discoverEnvironment({ ...f.options, exclusive: true }, f.execute)
+    const env = discoverEnvironment({ ...f.options, disposable: true }, f.execute)
     expect(() => validateSettings(env, true)).not.toThrow()
     expect(env.E2E_MAX_ATTEMPTS).toBe('3')
     expect(env.E2E_VISIBILITY_TIMEOUT_MS).toBe('60000')
@@ -136,7 +136,7 @@ describe('read-only environment command generator', () => {
       {
         workerSettings: { heartbeat: 5, visibility: 30, lease: 30, retry: 10, attempts: 3 },
       } as ConstructorParameters<typeof DockerFfmpegExhaustionAdapter>[0],
-      { ...env, E2E_FFMPEG_INVALID_FIXTURE: join(tmpdir(), 'invalid.mp4') },
+      { ...env, E2E_INVALID_FIXTURE: join(tmpdir(), 'invalid.mp4') },
     )
     expect(adapter.exhaustionMs).toBe(420000)
     expect(adapter.stabilityMs).toBe(60000)
@@ -144,7 +144,7 @@ describe('read-only environment command generator', () => {
   it('derives the full existing configuration, budgets and repeated identities without secrets', () => {
     const f = fixture()
     const env = discoverEnvironment(
-      { ...f.options, exclusive: true, profile: 'test-profile' },
+      { ...f.options, disposable: true, profile: 'test-profile' },
       f.execute,
     )
     expect(() => validateSettings(env, true)).not.toThrow()
@@ -171,10 +171,9 @@ describe('read-only environment command generator', () => {
     const f = fixture()
     const env = discoverEnvironment(f.options, f.execute)
     expect(env.E2E_RELIABILITY_DISPOSABLE).toBe('')
-    expect(env.E2E_DUPLICATE_EXCLUSIVE).toBe('')
-    expect(env.E2E_DUPLICATE_FIXTURE).toBe('')
-    expect(env.E2E_FFMPEG_INVALID_FIXTURE).toBe('')
-    expect(env.E2E_CLOCK_SKEW_MS).toBe('')
+    expect(env.E2E_VALID_FIXTURE).toBe('')
+    expect(env.E2E_INVALID_FIXTURE).toBe('')
+    expect(env.E2E_CLOCK_SKEW_MS).toBe('1000')
     expect(env.E2E_PROJECT).toBe('chromium')
     expect(() => validateSettings(env, true)).toThrow('DISPOSABLE')
   })
@@ -189,6 +188,20 @@ describe('read-only environment command generator', () => {
     expect(env).not.toHaveProperty('COMPOSE_DATABASE_URL')
     expect(env).not.toHaveProperty('API_AWS_SECRET_ACCESS_KEY')
   })
+  it.each(['WORKER_LEASE_DURATION_SECONDS', 'WORKER_VISIBILITY_EXTENSION_SECONDS', 'queue'])(
+    'requires half-duration heartbeat margin for %s',
+    (duration) => {
+      for (const [seconds, accepted] of [['59', false], ['60', true], ['61', true]] as const) {
+        const f = fixture()
+        if (duration === 'queue') f.state.visibility = seconds
+        else f.settings[duration] = seconds
+        const discover = () => discoverEnvironment(f.options, f.execute)
+        if (accepted) expect(discover).not.toThrow()
+        else expect(discover).toThrow('heartbeat safety margin')
+      }
+    },
+  )
+
   it.each(['account', 'labels', 'redrive', 'attempts', 'budget', 'heartbeat', 'missing-alarm'])(
     'rejects inconsistent %s instead of inventing values',
     (mode) => {
@@ -252,7 +265,7 @@ describe('read-only environment command generator', () => {
         '--full',
         '--docker-host',
         f.options.dockerHost,
-        '--exclusive',
+        '--disposable',
         '--output',
         output,
       ]
@@ -279,8 +292,8 @@ describe('read-only environment command generator', () => {
 
   it('rejects incomplete full-suite inputs before discovery', () => {
     const f = fixture()
-    const options = { ...f.options, full: true, exclusive: true, fixture: 'normal.mp4', invalidFixture: 'invalid.mp4', clockSkewMs: '100' }
-    for (const name of ['exclusive', 'fixture', 'invalidFixture', 'clockSkewMs'] as const) {
+    const options = { ...f.options, full: true, disposable: true, fixture: 'normal.mp4', invalidFixture: 'invalid.mp4', clockSkewMs: '100' }
+    for (const name of ['fixture', 'invalidFixture'] as const) {
       expect(() => discoverEnvironment({ ...options, [name]: undefined }, f.execute)).toThrow('--full requires')
     }
     expect(f.execute).not.toHaveBeenCalled()
@@ -294,6 +307,6 @@ describe('read-only environment command generator', () => {
 
   it('rejects an unavailable invalid fixture instead of generating a partial setup', () => {
     const f = fixture()
-    expect(() => discoverEnvironment({ ...f.options, invalidFixture: join(tmpdir(), 'missing-e2e-invalid-file.mp4') }, f.execute)).toThrow('E2E_FFMPEG_INVALID_FIXTURE file unavailable')
+    expect(() => discoverEnvironment({ ...f.options, invalidFixture: join(tmpdir(), 'missing-e2e-invalid-file.mp4') }, f.execute)).toThrow('E2E_INVALID_FIXTURE file unavailable')
   })
 })

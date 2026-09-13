@@ -16,7 +16,7 @@ import {
 /** @typedef {{worker: string, database: string, dockerHost?: string, account?: string,
  * profile?: string, frontendUrl?: string, apiUrl?: string, fixture?: string,
  * invalidFixture?: string, clockSkewMs?: string, full?: boolean,
- * evidenceDir?: string, alarms?: string, exclusive?: boolean}} Options */
+ * evidenceDir?: string, alarms?: string, disposable?: boolean}} Options */
 class ConfigurationError extends Error {}
 /** @param {string} message @returns {never} */
 function fail(message) {
@@ -37,9 +37,8 @@ const OUTPUT_NAMES = new Set([
   "E2E_ALARM_IDENTIFIERS",
   "E2E_SOURCE_DLQ_RELATIONSHIP",
   "E2E_EVIDENCE_DIR",
-  "E2E_DUPLICATE_EXCLUSIVE",
-  "E2E_DUPLICATE_FIXTURE",
-  "E2E_FFMPEG_INVALID_FIXTURE",
+  "E2E_VALID_FIXTURE",
+  "E2E_INVALID_FIXTURE",
   "E2E_CLOCK_SKEW_MS",
   "E2E_PROJECT",
   "VIDEO_INPUT_BUCKET",
@@ -59,16 +58,18 @@ function positive(value, label, max = 43200) {
   return Number(value);
 }
 
+/** @typedef {(tool: string, args: readonly string[], options: import('node:child_process').ExecFileSyncOptionsWithStringEncoding) => string} CommandExecutor */
+
 /** Only the command transport is replaceable; no shell commands or remote mutations.
  * @param {Options} options
- * @param {typeof execFileSync} [execute]
+ * @param {CommandExecutor} [execute]
  * @returns {Record<string, string>}
  */
 export function discoverEnvironment(options, execute = execFileSync) {
-  if (options.full && (!options.exclusive || !options.fixture || !options.invalidFixture || !options.clockSkewMs))
-    fail("--full requires --exclusive, --fixture, --invalid-fixture and --clock-skew-ms");
+  if (options.full && (!options.fixture || !options.invalidFixture))
+    fail("--full requires --fixture and --invalid-fixture");
   const clockSkewMs = options.clockSkewMs === undefined
-    ? "" : String(positive(options.clockSkewMs, "clock skew bound", 5000));
+    ? "1000" : String(positive(options.clockSkewMs, "clock skew bound", 5000));
   if (!safeName(options.worker) || !safeName(options.database))
     fail("Worker and database names or IDs are required");
   const host =
@@ -254,7 +255,7 @@ export function discoverEnvironment(options, execute = execFileSync) {
   );
   const retry = positive(settings.WORKER_RETRY_DELAY_SECONDS, "worker retry");
   const visibility = positive(source.VisibilityTimeout, "queue visibility");
-  if (2 * heartbeat > Math.min(extension, lease))
+  if (2 * heartbeat > Math.min(visibility, extension, lease))
     fail("Worker heartbeat safety margin is insufficient");
   // Add polling margin where possible without exceeding the existing validator's limit.
   const budget = (/** @type {number} */ seconds) => {
@@ -308,7 +309,7 @@ export function discoverEnvironment(options, execute = execFileSync) {
   /** @type {Record<string, string>} */
   const env = {
     E2E_ENVIRONMENT: "disposable",
-    E2E_RELIABILITY_DISPOSABLE: options.exclusive ? "true" : "",
+    E2E_RELIABILITY_DISPOSABLE: options.disposable ? "true" : "",
     AWS_REGION: region,
     E2E_AWS_ACCOUNT_ID: account,
     E2E_DOCKER_HOST: host,
@@ -340,16 +341,15 @@ export function discoverEnvironment(options, execute = execFileSync) {
     E2E_EVIDENCE_DIR: resolve(
       options.evidenceDir || "artifacts/reliability-e2e",
     ),
-    E2E_DUPLICATE_EXCLUSIVE: options.exclusive ? "true" : "",
-    E2E_DUPLICATE_FIXTURE: "",
-    E2E_FFMPEG_INVALID_FIXTURE: "",
+    E2E_VALID_FIXTURE: "",
+    E2E_INVALID_FIXTURE: "",
     E2E_CLOCK_SKEW_MS: clockSkewMs,
     E2E_PROJECT: "chromium",
   };
   if (options.profile) env.AWS_PROFILE = options.profile;
   for (const [name, fixture] of Object.entries({
-    E2E_DUPLICATE_FIXTURE: options.fixture,
-    E2E_FFMPEG_INVALID_FIXTURE: options.invalidFixture,
+    E2E_VALID_FIXTURE: options.fixture,
+    E2E_INVALID_FIXTURE: options.invalidFixture,
   })) {
     if (!fixture) continue;
     const path = resolve(fixture);
@@ -368,7 +368,7 @@ export function discoverEnvironment(options, execute = execFileSync) {
       fail(`${name} must be a nonempty .mp4 file of at most 1 GiB`);
     env[name] = path;
   }
-  if (options.full && env.E2E_DUPLICATE_FIXTURE === env.E2E_FFMPEG_INVALID_FIXTURE)
+  if (options.full && env.E2E_VALID_FIXTURE === env.E2E_INVALID_FIXTURE)
     fail("Normal and invalid fixtures must use different files");
   if (clockSkewMs && Number(clockSkewMs) * 2 >= Math.min(extension, lease) * 1000)
     fail("Clock skew bound is too large for observed lease and visibility");
@@ -399,23 +399,30 @@ export function discoverEnvironment(options, execute = execFileSync) {
 }
 
 /** @param {Record<string, string>} env */
+export function validateGeneratedEnvironment(env) {
+  for (const [name, value] of Object.entries(env)) {
+    if (!OUTPUT_NAMES.has(name) || typeof value !== "string" || /[\r\n\0]/.test(value))
+      fail("Unsupported generated setting");
+  }
+}
+
+/** @param {Record<string, string>} env */
 export function renderPowerShell(env) {
+  validateGeneratedEnvironment(env);
   const lines = [
     "# Generated configuration only; this is not successful live preflight evidence.",
     "# Review account, resource identities, local URL defaults and workload budgets.",
     "# Secrets are deliberately omitted. Configure host AWS login and API_AWS_* credentials manually.",
     "# DATABASE_URL and Worker credentials remain in their existing containers; do not copy them here.",
-    "# Empty disposable/exclusive values require confirmation; then set both to true.",
-    "# Empty E2E_DUPLICATE_FIXTURE requires an absolute MP4 path.",
-    "# Full suite also requires E2E_FFMPEG_INVALID_FIXTURE and a measured E2E_CLOCK_SKEW_MS bound.",
+    "# Empty E2E_RELIABILITY_DISPOSABLE requires confirmation; then set it to true.",
+    "# Empty E2E_VALID_FIXTURE requires an absolute MP4 path.",
+    "# Full suite also requires E2E_INVALID_FIXTURE. Verify the E2E_CLOCK_SKEW_MS bound (default 1000 ms).",
     "# Fixture checks cover path/size only; verify normal media and invalid media contents separately.",
     "# Start API/frontend with matching URLs and CORS; install Chromium and host FFmpeg.",
     "# API_PORT/FRONTEND_PORT follow the URLs. Compose serves HTTP; HTTPS requires a separately configured proxy.",
     "# HTTP_ADDR and default DATABASE_URL are supplied by Compose. Keep custom DB credentials aligned separately.",
   ];
   for (const [name, value] of Object.entries(env)) {
-    if (!OUTPUT_NAMES.has(name) || /[\r\n\0]/.test(value))
-      fail("Unsupported generated setting");
     lines.push(`$env:${name} = '${value.replaceAll("'", "''")}'`);
   }
   lines.push(
@@ -435,11 +442,11 @@ Usage: node app/scripts/generate_reliability_env.mjs --worker NAME --database NA
   --api-url URL         Default http://127.0.0.1:8000; set the actual URL if different
   --fixture PATH        Existing MP4; otherwise emit an empty setting for manual completion
   --invalid-fixture PATH Existing nonempty invalid .mp4 for FFmpeg exhaustion
-  --clock-skew-ms MS     Explicit clock skew upper bound, 1..5000; otherwise emit empty
+  --clock-skew-ms MS     Clock skew upper bound, 1..5000; default 1000 ms
   --full                Require all full-suite inputs; does not execute tests or verify media contents
   --evidence-dir PATH   Default artifacts/reliability-e2e under the current directory
   --alarms A,B,C        Select exactly three matching alarms when discovery is ambiguous
-  --exclusive           Confirm these resources are disposable and exclusive to this test
+  --disposable          Confirm these resources are disposable
   --output PATH         Create a new .ps1 file; default stdout; never overwrite an existing file
   --help                Show this help without contacting services
 No infrastructure creation, Terraform, SQL, process control or scenario execution is performed.
@@ -464,7 +471,7 @@ export function main(args = process.argv.slice(2), execute = execFileSync) {
         full: { type: "boolean" },
         "evidence-dir": { type: "string" },
         alarms: { type: "string" },
-        exclusive: { type: "boolean" },
+        disposable: { type: "boolean" },
         output: { type: "string" },
         help: { type: "boolean" },
       },
@@ -490,7 +497,7 @@ export function main(args = process.argv.slice(2), execute = execFileSync) {
         full: values.full,
         evidenceDir: values["evidence-dir"],
         alarms: values.alarms,
-        exclusive: values.exclusive,
+        disposable: values.disposable,
       },
       execute,
     );

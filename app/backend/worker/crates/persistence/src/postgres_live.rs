@@ -201,6 +201,65 @@ async fn expire_lease(admin: &Client, job_id: &str) {
 }
 
 #[tokio::test]
+async fn terminated_connection_notifies_supervisor_and_replacement_completes_job() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = PostgresJobState::connect(&live.url).await.unwrap();
+    jobs.database
+        .batch_execute(&format!("SET search_path TO {}", live.schema))
+        .await
+        .unwrap();
+    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    let pid: i32 = jobs
+        .database
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let stopped = jobs.connection_stopped();
+    live.admin
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), stopped)
+        .await
+        .expect("connection loss must wake the worker even without another message");
+    assert!(
+        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+            .await
+            .is_err()
+    );
+
+    // A restarted worker establishes a fresh connection and processes the pending job.
+    let mut replacement = PostgresJobState::connect(&live.url).await.unwrap();
+    replacement
+        .database
+        .batch_execute(&format!("SET search_path TO {}", live.schema))
+        .await
+        .unwrap();
+    assert_eq!(
+        acquired_attempt(
+            replacement
+                .acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        replacement
+            .complete(JOB_ID, VIDEO_ID, WORKER_B)
+            .await
+            .unwrap(),
+        JobOperationOutcome::Applied
+    );
+    assert_eq!(job_status(&live.admin, JOB_ID).await, "COMPLETED");
+    live.cleanup().await;
+}
+
+#[tokio::test]
 async fn production_connector_is_safe_inside_the_worker_runtime() {
     let (url, required) = live_postgres_url();
     match PostgresJobState::connect(&url).await {

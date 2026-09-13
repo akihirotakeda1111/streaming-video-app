@@ -910,7 +910,7 @@ def check_reliability(
 
     greater_than: dict[str, set[str]] = {}
     for left, right in re.findall(
-        r"var\.([A-Za-z_][A-Za-z0-9_-]*)\s*<\s*var\.([A-Za-z_][A-Za-z0-9_-]*)",
+        r"2\s*\*\s*var\.([A-Za-z_][A-Za-z0-9_-]*)\s*<=\s*var\.([A-Za-z_][A-Za-z0-9_-]*)",
         source_body,
     ):
         greater_than.setdefault(left, set()).add(right)
@@ -926,7 +926,7 @@ def check_reliability(
 
     checks.require(
         heartbeat_var is not None and len(duration_vars) == 2,
-        "worker heartbeat must be shorter than visibility extension, lease duration, and source timeout",
+        "twice the worker heartbeat must not exceed visibility extension, lease duration, or source timeout",
     )
 
     excluded = {heartbeat_var, visibility_var, receive_var, attempts_var, *duration_vars}
@@ -947,8 +947,8 @@ def check_reliability(
         and visibility is not None
         and retry is not None
         and all(value is not None for value in durations)
-        and 0 < heartbeat < min(value for value in durations if value is not None)
-        and 0 < heartbeat < visibility
+        and 0 < 2 * heartbeat <= min(value for value in durations if value is not None)
+        and 0 < 2 * heartbeat <= visibility
         and 0 < retry <= 43200,
         "worker heartbeat, visibility extension, lease, and retry settings violate reliability timing bounds",
     )

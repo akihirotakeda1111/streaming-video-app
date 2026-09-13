@@ -34,8 +34,7 @@ function fixture() {
     verifiedAt: 'now',
   }
   const env: NodeJS.ProcessEnv = {
-    E2E_DUPLICATE_EXCLUSIVE: 'true',
-    E2E_DUPLICATE_FIXTURE: resolve('fixture.mp4'),
+    E2E_VALID_FIXTURE: resolve('fixture.mp4'),
     E2E_PROCESSING_TIMEOUT_MS: '1000',
     E2E_VISIBILITY_TIMEOUT_MS: '1000',
     E2E_NAVIGATION_TIMEOUT_MS: '1000',
@@ -332,7 +331,7 @@ describe('dedicated duplicate service adapter', () => {
       ),
     ).toBe(false)
   })
-  it.each(['startup', 'versioned', 'active', 'changed', 'exclusive'])(
+  it.each(['startup', 'versioned', 'active', 'changed'])(
     'rejects unsupported %s before resource creation',
     async (field) => {
       const f = fixture()
@@ -340,7 +339,6 @@ describe('dedicated duplicate service adapter', () => {
       if (field === 'versioned') f.state.versioned = true
       if (field === 'active') f.state.active = 1
       if (field === 'changed') f.state.changed = true
-      if (field === 'exclusive') delete f.env.E2E_DUPLICATE_EXCLUSIVE
       await expect(f.adapter.prepare(f.target)).rejects.toThrow()
       expect(f.calls.some((c) => c.input?.includes('INSERT INTO'))).toBe(false)
     },
