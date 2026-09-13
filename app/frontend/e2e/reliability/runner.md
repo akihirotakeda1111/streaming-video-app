@@ -11,7 +11,7 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | --- | --- | --- |
 | AWS環境 | `app/infra/terraform-e2e/` | 既存Terraformを再利用し、専用S3・SQS/DLQ・通知・3アラーム・IAMを作成 |
 | ローカル実行環境 | `app/compose.yaml` + `app/compose.e2e.yaml` | 専用プロジェクト・DB volume・ラベル。Worker、DB、migrationは既存定義を再利用 |
-| 設定統合（Bash） | `app/scripts/setup_reliability_env.sh` + `.mjs` | Terraform出力を読み込み、必要ならWorkerを起動してE2E設定を現在のシェルへ反映 |
+| 設定統合（Bash） | `app/scripts/setup_reliability_env.sh` + `.mjs` | Terraform出力を読み込み、必要ならWorker・API・Frontendを起動してE2E設定を現在のシェルへ反映 |
 | 設定生成 | `app/scripts/generate_reliability_env.mjs` | AWS/Docker実効値から非機密の環境設定を生成。秘密情報は出力しない |
 | 共通事前確認 | `safety.mjs`、`live.mjs` | 設定形式とAWS/Dockerの実体・所有範囲を確認。プロセス操作やリモート書き込みは行わない |
 | 実行入口 | `app/scripts/run_reliability_e2e.py` | 検証、証跡ディレクトリ作成、実装済みシナリオ選択、Playwright起動 |
@@ -112,7 +112,7 @@ state・plan・実値tfvarsはコミットせず、provider lockファイルは�
 
 `app/scripts/setup_reliability_env.sh` を **E2Eを実行するBashでsource** すると、「Terraform出力の読み込み」と「設定生成・読み込み」が1回で完了する。
 Linux版Node.js、Terraform、AWS CLI、Docker Composeを使用する。統合スクリプトではjqは不要。
-AWS環境、ホスト・Worker認証、正常MP4、不正MP4は事前に用意する。
+AWS環境、ホスト・Worker・API認証、正常MP4、不正MP4は事前に用意する。APIには `API_AWS_ACCESS_KEY_ID` / `API_AWS_SECRET_ACCESS_KEY`、一時認証なら `API_AWS_SESSION_TOKEN` を設定する。
 時計ずれ上限の既定値は1000 ms。実環境に合わせて `--clock-skew-ms` で変更できる。使い捨てのE2E環境で実行する。
 
 リポジトリルートからの初回実行例:
@@ -123,19 +123,20 @@ source app/scripts/setup_reliability_env.sh \
   --fixture "$HOME/e2e/long.mp4" \
   --invalid-fixture "$HOME/e2e/invalid.mp4" \
   --clock-skew-ms 1000 \
-  --start-worker
+  --start-services
 ```
 
-実行順はTerraform `compose_environment` 取得 → 子プロセスへの設定 → Compose検査・Worker/DB起動 → コンテナID取得 → Worker実効値とTerraform出力の照合 → E2E設定生成 → 現在のBashへ一括反映。
+実行順はTerraform `compose_environment` 取得 → 子プロセスへの設定 → Compose検査・Worker/DB起動 → コンテナID取得 → Worker実効値とTerraform出力の照合 → E2E設定生成 → 生成設定でAPI・Frontend起動 → ヘルスチェック完了待ち（最大120秒） → 現在のBashへ一括反映。
 成功後は以下の手動のTerraform読み込み・Worker起動・設定生成を重ねて行わず、「実行手順」へ進む。
 
-Worker/DBが既に起動済みなら `--start-worker` を省略する。接続先や時間設定がTerraform出力と異なる場合は停止する。
-`--start-worker` は `docker compose up --build -d worker` を行うため、変更内容によって既存Workerが再作成される場合がある。E2E実行中は使用しない。
+全サービスが既に正しい設定で起動済みなら `--start-services` を省略して設定だけ読み込める。接続先や時間設定がTerraform出力と異なる場合は停止する。
+`--start-services` はビルド・起動を行うため、変更内容によって既存コンテナが再作成される場合がある。E2E実行中は使用しない。API・Frontendの起動段階では `--no-deps` を指定し、設定生成で取得したWorker・DBのIDを維持する。
 
 | オプション | 用途・既定値 |
 | --- | --- |
 | `--account` / `--fixture` / `--invalid-fixture` | 必須。フル実行用設定を生成する。テストは起動しない |
 | `--clock-skew-ms` | 時計ずれ上限。既定1000 ms、1〜5000 msの整数 |
+| `--start-services` | Worker・DB起動、設定生成、API・Frontend起動を一括実行。API・Frontendのhealthyを待ってから設定を反映 |
 | `--start-worker` | Terraform出力を渡してWorkerと依存DB・migrationを起動。省略時は起動済みコンテナを参照 |
 | `--terraform-directory` | スクリプト基準の `app/infra/terraform-e2e`。別stateの環境では変更 |
 | `--project` | Composeプロジェクト。既定は `streaming-video-e2e` |
@@ -148,7 +149,17 @@ Worker/DBが既に起動済みなら `--start-worker` を省略する。接続�
 
 `bash app/scripts/setup_reliability_env.sh ...` の直接実行は、親シェルへ設定を反映できないためエラーにする。必ず `source` を使う。
 生成値をシェルコードとして評価せず、値としてexportする。失敗時は非ゼロを返し、呼び出し元の環境変数は変更しない。
-起動済みのコンテナは維持する。Terraform apply、認証情報の発行・設定、API/Frontend起動、ブラウザ導入、事前確認、E2E実行は別途必要。
+起動済みのコンテナは維持する。`--start-services` のURLはlocalhost・127.0.0.1・[::1]のHTTPルートURLを指定し、APIとFrontendは異なるポートを使う。Frontend originはTerraformの `frontend_origin` と一致する必要がある。
+Terraform apply、認証情報の発行・設定、ホストのFFmpeg・Chromium導入、事前確認、E2E実行は別途必要。
+初回はホスト側で `node app/frontend/node_modules/@playwright/test/cli.js install chromium` を実行する。セットアップ成功後、同じシェルで次を順に実行する:
+
+```bash
+python app/scripts/run_reliability_e2e.py --check &&
+python app/scripts/run_reliability_e2e.py --live-preflight &&
+python app/scripts/run_reliability_e2e.py --scenario preflight &&
+python app/scripts/run_reliability_e2e.py --full
+```
+
 Terraformを使わない場合は、接続先を手動設定した上で後述の個別の設定生成手順を使用する。
 
 統合スクリプトのオフライン検証（AWS・Dockerは操作しない）:
@@ -285,7 +296,7 @@ load_e2e || echo '設定生成失敗。後続の実行を止めて確認して�
 フル実行用に生成すると、正常・不正fixture、時計ずれ、`E2E_PROJECT=chromium`、全共通設定が同じファイル/JSONに揃う。
 統合スクリプトまたは個別の生成JSONを読み込んだ後、これらを個別にexportし直す必要はない。
 fixture検査はファイル形式・サイズの条件のみで、正常動画としての再生可否・encode時間や、実FFmpegでの失敗は保証しない。
-API/Frontend用のバケット、出力S3 endpoint、許可origin、API接続先、公開ポートも生成する。API/Frontendの起動・認証とS3 CORS、ホストFFmpeg、Chromiumのインストールは引き続き別途必要。秘密情報は生成ファイルへ含めない。
+API/Frontend用のバケット、出力S3 endpoint、許可origin、API接続先、公開ポートも生成する。`--start-services` は生成設定でAPI/Frontendの起動まで行う。認証とS3 CORS、ホストFFmpeg、Chromiumのインストールは別途必要。秘密情報は生成ファイルへ含めない。
 `E2E_RUN_ID` と監視の先行run IDはフルrunnerが設定するため、生成設定には含めない。
 
 生成JSON・コマンドはいずれも非機密設定だけだが、環境固有の値なのでGitにはコミットしない。
@@ -407,7 +418,7 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 
 ### ブラウザ使用シナリオの追加準備
 
-`preflight` と最終 `@phase1-pipeline` には、Worker/DBに加えてAPI・Frontendを起動する。フル実行では開始前に準備する。
+`preflight` と最終 `@phase1-pipeline` には、Worker/DBに加えてAPI・Frontendを起動する。`--start-services` によるセットアップ済みなら追加のCompose起動は不要。以下は個別に準備する場合の手順。
 
 1. API用principalの認証を `API_AWS_ACCESS_KEY_ID` / `API_AWS_SECRET_ACCESS_KEY`、一時認証なら `API_AWS_SESSION_TOKEN` に設定する。Worker用・ホスト用の認証設定だけではAPIに渡らない。APIは同じDB、`VIDEO_INPUT_BUCKET` / `VIDEO_OUTPUT_BUCKET`、regionを参照させる。
 2. 生成設定を読み込む。`--frontend-url` / `--api-url` からComposeの公開ポートも生成する。生成器のAPI URL既定は8000なので、8080で公開する場合は `--api-url http://localhost:8080` を指定する。ComposeはHTTPで配信するため、HTTPSのURLを使う場合は別途proxyの設定が必要。

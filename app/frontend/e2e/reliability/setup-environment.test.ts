@@ -5,7 +5,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { setupEnvironment } from '../../../scripts/setup_reliability_env.mjs'
 
 const roots: string[] = []
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
+afterEach(() => {
+  vi.unstubAllEnvs()
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'reliability-setup-'))
   roots.push(root)
@@ -18,11 +21,12 @@ function fixture() {
     WORKER_LEASE_DURATION_SECONDS: '30', WORKER_RETRY_DELAY_SECONDS: '10',
     WORKER_MAXIMUM_ATTEMPTS: '3', FRONTEND_ORIGIN: 'http://localhost:5173',
   }
-  const state = { fail: '', stale: false }
+  const state = { fail: '', stale: false, unhealthy: false }
   const execute = vi.fn((tool, args, options) => {
     if (state.fail === tool) throw new Error('private-value')
     if (tool === 'terraform') return JSON.stringify(runtime)
     expect(options.env.VIDEO_INPUT_BUCKET).toBe('input')
+    if (args.includes('--wait') && state.unhealthy) throw new Error('private health diagnostics')
     if (args.includes('ps')) return args.at(-1) === 'worker' ? 'a'.repeat(64) : 'b'.repeat(64)
     if (args.includes('inspect')) return JSON.stringify([{ Config: { Env: Object.entries(runtime)
       .map(([name, value]) => `${name}=${state.stale && name === 'VIDEO_INPUT_BUCKET' ? 'old' : value}`) } }])
@@ -30,13 +34,61 @@ function fixture() {
   })
   const discover = vi.fn((options, command) => {
     command('aws', ['sts'], { env: { AWS_PROFILE: 'runner' } })
-    return { E2E_VALID_FIXTURE: options.fixture, E2E_INVALID_FIXTURE: options.invalidFixture }
+    return {
+      E2E_VALID_FIXTURE: options.fixture, E2E_INVALID_FIXTURE: options.invalidFixture,
+      API_PORT: new URL(options.apiUrl).port, FRONTEND_PORT: new URL(options.frontendUrl).port,
+      FRONTEND_ORIGIN: new URL(options.frontendUrl).origin,
+      VITE_API_BASE_URL: options.apiUrl + '/api/v1', OUTPUT_S3_ENDPOINT: 'https://output.s3.us-east-1.amazonaws.com',
+    }
   })
   const options = { account: '123456789012', fixture: valid, 'invalid-fixture': invalid,
     'clock-skew-ms': '100', 'terraform-directory': root, 'docker-host': 'unix:///var/run/docker.sock' }
   return { root, valid, runtime, options, execute, discover, state }
 }
 describe('Linux reliability setup orchestration', () => {
+  function serviceCredentials() {
+    for (const role of ['WORKER', 'API']) {
+      vi.stubEnv(`${role}_AWS_ACCESS_KEY_ID`, 'test-key')
+      vi.stubEnv(`${role}_AWS_SECRET_ACCESS_KEY`, 'test-secret')
+    }
+  }
+  it('starts API/frontend with generated settings after discovery and waits without recreating Worker/DB', () => {
+    serviceCredentials()
+    const f = fixture(), before = { ...process.env }
+    f.runtime.FRONTEND_ORIGIN = 'http://localhost:6173'
+    setupEnvironment({ ...f.options, 'start-services': true,
+      'frontend-url': 'http://localhost:6173', 'api-url': 'http://localhost:9080' }, f.execute, f.discover)
+    const starts = f.execute.mock.calls.filter(([, args]) => args.includes('up'))
+    expect(starts).toHaveLength(2)
+    expect(starts[0]![1].at(-1)).toBe('worker')
+    expect(starts[1]![1].slice(-6)).toEqual(['--no-deps', '--wait', '--wait-timeout', '120', 'api', 'frontend'])
+    expect(starts[1]![2].env).toMatchObject({ API_PORT: '9080', FRONTEND_PORT: '6173',
+      FRONTEND_ORIGIN: 'http://localhost:6173', VITE_API_BASE_URL: 'http://localhost:9080/api/v1',
+      OUTPUT_S3_ENDPOINT: 'https://output.s3.us-east-1.amazonaws.com', API_AWS_ACCESS_KEY_ID: 'test-key' })
+    expect(f.execute.mock.calls.findIndex(([, args]) => args.includes('--wait')))
+      .toBeGreaterThan(f.execute.mock.calls.findIndex(([tool]) => tool === 'aws'))
+    expect(process.env).toEqual(before)
+  })
+  it('fails without exporting settings when API/frontend health checks fail', () => {
+    serviceCredentials()
+    const f = fixture(), before = { ...process.env }
+    f.state.unhealthy = true
+    expect(() => setupEnvironment({ ...f.options, 'start-services': true }, f.execute, f.discover)).toThrow('API/frontend startup')
+    expect(process.env).toEqual(before)
+  })
+  it('requires API credentials before starting any service', () => {
+    serviceCredentials(); vi.stubEnv('API_AWS_SECRET_ACCESS_KEY', '')
+    const f = fixture()
+    expect(() => setupEnvironment({ ...f.options, 'start-services': true }, f.execute, f.discover)).toThrow('service credentials')
+    expect(f.execute).not.toHaveBeenCalled()
+  })
+  it('rejects frontend origins inconsistent with Terraform S3 CORS before startup', () => {
+    serviceCredentials()
+    const f = fixture()
+    expect(() => setupEnvironment({ ...f.options, 'start-services': true,
+      'frontend-url': 'http://localhost:6173' }, f.execute, f.discover)).toThrow('frontend origin')
+    expect(f.execute).toHaveBeenCalledTimes(1)
+  })
   it('defaults the clock skew bound to 1000 ms when omitted', () => {
     const f = fixture()
     setupEnvironment({ ...f.options, 'clock-skew-ms': undefined }, f.execute, f.discover)
@@ -80,7 +132,9 @@ describe('Linux reliability setup orchestration', () => {
   })
   it('rejects generated multiline values before returning any settings', () => {
     const f = fixture()
-    f.discover.mockReturnValue({ E2E_VALID_FIXTURE: 'bad\nvalue', E2E_INVALID_FIXTURE: '' })
+    f.discover.mockReturnValue({ E2E_VALID_FIXTURE: 'bad\nvalue', E2E_INVALID_FIXTURE: '',
+      API_PORT: '8080', FRONTEND_PORT: '5173', FRONTEND_ORIGIN: 'http://localhost:5173',
+      VITE_API_BASE_URL: 'http://localhost:8080/api/v1', OUTPUT_S3_ENDPOINT: 'https://output.s3.us-east-1.amazonaws.com' })
     expect(() => setupEnvironment(f.options, f.execute, f.discover)).toThrow('E2E generation')
   })
 })

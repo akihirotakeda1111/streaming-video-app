@@ -17,6 +17,7 @@ const HELP = `Use: source app/scripts/setup_reliability_env.sh [options]
 Required: --account ID --fixture PATH --invalid-fixture PATH
   --clock-skew-ms MS    Clock skew upper bound, 1..5000; default 1000 ms
   --start-worker        Build/start Worker and dependencies after loading Terraform outputs
+  --start-services      Build/start Worker, DB, API and frontend; wait for API/frontend health
   --terraform-directory PATH  Default: app/infra/terraform-e2e relative to this script
   --project NAME        Default: streaming-video-e2e
   --frontend-url URL    Default: http://localhost:5173
@@ -26,14 +27,15 @@ Required: --account ID --fixture PATH --invalid-fixture PATH
   --profile NAME        Runner AWS profile (Terraform uses the calling shell's credentials)
   --alarms A,B,C        Optional three alarm names
   --help               Show help without contacting services
-Requires Linux Node.js and Bash. Configure host/Worker credentials beforehand.
-Does not apply Terraform or run E2E. Existing containers can be recreated by --start-worker.
+Requires Linux Node.js and Bash. Configure host/Worker/API credentials beforehand.
+Does not apply Terraform or run E2E. Startup options can recreate existing containers.
 `;
 
 /** @typedef {{account?: string, fixture?: string, 'invalid-fixture'?: string,
  * 'clock-skew-ms'?: string, 'terraform-directory'?: string, project?: string,
  * 'frontend-url'?: string, 'api-url'?: string, 'evidence-dir'?: string,
- * 'docker-host'?: string, profile?: string, alarms?: string, 'start-worker'?: boolean}} SetupOptions */
+ * 'docker-host'?: string, profile?: string, alarms?: string, 'start-worker'?: boolean,
+ * 'start-services'?: boolean}} SetupOptions */
 /** @param {SetupOptions} values
  * @param {import('./generate_reliability_env.mjs').CommandExecutor} [execute]
  * @param {typeof discoverEnvironment} [discover] */
@@ -60,13 +62,23 @@ export function setupEnvironment(values, execute = execFileSync, discover = disc
     for (const value of [frontendUrl, apiUrl]) {
       const url = new URL(value);
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error();
+      if (values['start-services'] && (url.protocol !== 'http:' || url.pathname !== '/' ||
+          !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) throw Error();
     }
+    if (values['start-services'] && new URL(frontendUrl).port === new URL(apiUrl).port) throw Error();
     const terraformDirectory = resolve(values['terraform-directory'] || resolve(scripts, '../infra/terraform-e2e'));
     if (!statSync(terraformDirectory).isDirectory()) throw Error();
     /** @param {string} tool @param {string[]} args */
     const command = (tool, args, env = process.env, timeout = 120000) => execute(tool, args, {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout, maxBuffer: 4 * 1024 * 1024, env,
     }).trim();
+
+    if (values['start-services']) {
+      stage = 'service credentials (set WORKER_AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY and API_AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY)';
+      for (const role of ['WORKER', 'API']) {
+        if (!process.env[`${role}_AWS_ACCESS_KEY_ID`]?.trim() || !process.env[`${role}_AWS_SECRET_ACCESS_KEY`]?.trim()) throw Error();
+      }
+    }
 
     stage = 'Terraform output (check state access and authentication)';
     const runtime = JSON.parse(command('terraform', [`-chdir=${terraformDirectory}`, 'output', '-json', 'compose_environment']));
@@ -75,17 +87,21 @@ export function setupEnvironment(values, execute = execFileSync, discover = disc
       if (typeof runtime[name] !== 'string' || !runtime[name].trim() || /[\r\n\0]/.test(runtime[name])) throw Error();
     }
     if (!runtime.VIDEO_ENCODING_QUEUE_URL.startsWith(`https://sqs.${runtime.AWS_REGION}.amazonaws.com/${account}/`)) throw Error();
+    if (values['start-services'] && runtime.FRONTEND_ORIGIN !== new URL(frontendUrl).origin) {
+      stage = 'frontend origin (match --frontend-url to Terraform frontend_origin / S3 CORS)';
+      throw Error();
+    }
     runtime.FRONTEND_ORIGIN = new URL(frontendUrl).origin;
     // All preparation stays in child environments. The parent Bash changes only on success.
     const childEnv = { ...process.env, ...runtime };
     const compose = ['--host', dockerHost, 'compose', '-p', project,
       '-f', resolve(scripts, '../compose.yaml'), '-f', resolve(scripts, '../compose.e2e.yaml')];
-    if (values['start-worker']) {
+    if (values['start-worker'] || values['start-services']) {
       stage = 'Worker startup (check credentials and Compose configuration)';
       command('docker', [...compose, 'config', '--quiet'], childEnv);
       command('docker', [...compose, 'up', '--build', '-d', 'worker'], childEnv, 1800000);
     }
-    stage = 'running Worker/DB lookup (start them first or use --start-worker)';
+    stage = 'running Worker/DB lookup (start them first or use --start-services)';
     const worker = command('docker', [...compose, 'ps', '-q', 'worker'], childEnv);
     const database = command('docker', [...compose, 'ps', '-q', 'postgres'], childEnv);
     if (![worker, database].every(id => /^[a-f0-9]{12,64}$/.test(id))) throw Error();
@@ -104,6 +120,14 @@ export function setupEnvironment(values, execute = execFileSync, discover = disc
     }, (tool, args, options) => execute(tool, args, { ...options, env: { ...options.env, ...runtime } }));
     // Reuse the generator's allowlist/value validation, without evaluating shell code.
     validateGeneratedEnvironment(settings);
+    if (values['start-services']) {
+      stage = 'API/frontend startup (check API credentials, ports and container health)';
+      const serviceEnv = { ...childEnv, ...settings };
+      command('docker', [...compose, 'config', '--quiet'], serviceEnv);
+      // Worker/DB identities were just captured. Do not recreate dependencies here.
+      command('docker', [...compose, 'up', '--build', '-d', '--no-deps',
+        '--wait', '--wait-timeout', '120', 'api', 'frontend'], serviceEnv, 1800000);
+    }
     return { ...runtime, ...settings };
   } catch {
     throw new Error(`Reliability setup failed at: ${stage}. Shell settings were not changed. Containers already started are left running.`);
@@ -115,7 +139,8 @@ export function main(args = process.argv.slice(2)) {
     const options = Object.fromEntries(['account', 'fixture', 'invalid-fixture', 'clock-skew-ms',
       'terraform-directory', 'project', 'frontend-url', 'api-url', 'evidence-dir', 'docker-host',
       'profile', 'alarms'].map(name => [name, { type: 'string' }]));
-    const { values } = parseArgs({ args, options: { ...options, 'start-worker': { type: 'boolean' }, help: { type: 'boolean' } } });
+    const { values } = parseArgs({ args, options: { ...options, 'start-worker': { type: 'boolean' },
+      'start-services': { type: 'boolean' }, help: { type: 'boolean' } } });
     if (values.help) { process.stderr.write(HELP); return 0; }
     if (process.platform !== 'linux') { process.stderr.write('Use Linux Node.js inside WSL/Linux.\n'); return 2; }
     const env = setupEnvironment(values);
