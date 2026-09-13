@@ -4,7 +4,7 @@
 
 このリポジトリは、ストリーミング動画アプリケーションと、その実装作業をMarkdownのTask Specから実行するオーケストレーターを含むモノレポです。
 
-アプリケーションは個人開発、自己学習、ポートフォリオを目的としています。現在の実装範囲はPhase 1で、動画のアップロードから非同期エンコード、HLS生成、ブラウザ再生までの正常系E2Eを対象とします。
+アプリケーションは個人開発、自己学習、ポートフォリオを目的としています。Phase 2では、動画アップロードからHLS再生までのPhase 1に加え、lease・heartbeat・再試行・DLQ・キュー監視とReliability E2Eを実装しています。
 
 ```text
 Browser
@@ -31,13 +31,7 @@ Browser
 | `pyproject.toml` | Pythonオーケストレーターのpackage・dependency・lint設定 |
 | `.coderabbit.yaml` | CodeRabbitのrepository設定 |
 
-現在、`specs/tasks/` にはPhase 1用のTask Specが38件あります。
-
-- Infra: 3件
-- Go API: 10件
-- Rust Worker: 10件
-- Frontend: 8件
-- E2E: 7件
+`specs/tasks/` にはPhase 1の38件とPhase 2の20件のTask Specがあります。実装済み機能と将来計画は以下のPhase Scopeを参照してください。
 
 ## Application
 
@@ -45,7 +39,7 @@ Browser
 
 API process内で動画を同期変換せず、upload、job管理、queue consumption、encoding、playbackを別の責務として実装しています。
 
-Phase 1ではFrontend、Go API、Rust Worker、PostgreSQLをローカルで実行し、S3、SQS、IAMは実AWSを利用します。CloudFrontは使用せず、ブラウザがOutput S3のHLS objectsをCORS経由で直接取得します。
+Frontend、Go API、Rust Worker、PostgreSQLをローカルで実行し、S3、SQS/DLQ、IAM、CloudWatchアラームは実AWSを利用します。CloudFrontは使用せず、ブラウザがOutput S3のHLS objectsをCORS経由で直接取得します。
 
 ### Components
 
@@ -53,16 +47,17 @@ Phase 1ではFrontend、Go API、Rust Worker、PostgreSQLをローカルで実�
 | --- | --- | --- |
 | Frontend | MP4選択、S3 direct upload、status polling、HLS playback | Vue 3、TypeScript、Vite、video.js |
 | Go API | video/job作成、Presigned PUT URL、status、playback情報 | Go、AWS SDK for Go v2、pgx |
-| Rust Worker | SQS受信、atomic claim、S3入出力、FFmpeg、job状態更新 | Rust、Tokio、AWS SDK for Rust、FFmpeg |
-| PostgreSQL | video metadata、upload metadata、job status | PostgreSQL 16 |
-| Infra | Input/Output S3、SQS Standard Queue、IAM、CORS | Terraform、AWS |
+| Rust Worker | SQS受信、lease・heartbeat、再試行、FFmpeg、job状態更新 | Rust、Tokio、AWS SDK for Rust、FFmpeg |
+| PostgreSQL | video metadata、job status、lease所有者・期限・試行回数 | PostgreSQL 16 |
+| Infra | Input/Output S3、SQS/DLQ、IAM、CORS、CloudWatchアラーム | Terraform、AWS |
 | Contracts | REST API、job statuses、S3/HLS conventions、examples | OpenAPI 3.1、JSON Schema、Markdown |
 
-Phase 1のjob statusesは次の5つです。
+公開APIのjob statusesは次の5つを維持します。再試行可能な失敗ではPROCESSINGからQUEUEDへ戻り、試行上限に達した失敗をFAILEDにします。
 
 ```text
 UPLOADING -> QUEUED -> PROCESSING -> COMPLETED
                          \-> FAILED
+             QUEUED <- PROCESSING (retry)
 ```
 
 Input S3とOutput S3は分離されています。WorkerはHLS segmentsを先にuploadし、`index.m3u8` を最後にuploadしてからjobを `COMPLETED` にします。
@@ -73,6 +68,8 @@ Input S3とOutput S3は分離されています。WorkerはHLS segmentsを先に
 - [OpenAPI contract](./app/contracts/openapi/api.yaml)
 - [Job status schema](./app/contracts/domain/job-status.schema.json)
 - [Storage conventions](./app/contracts/domain/storage-conventions.md)
+- [Reliability contract](./app/contracts/domain/reliability-conventions.md)
+- [Reliability E2E運用ガイド](./app/frontend/e2e/reliability/runner.md)
 - [Architecture decision](./app/docs/adr/adr-001-video-streaming-mvp-architecture.md)
 
 ## Task Specs
@@ -151,12 +148,13 @@ Frontend、Go API、Rust Worker、E2Eに必要なtoolchainは、Task Specの `al
 
 [`.github/workflows/merge-tests.yml`](./.github/workflows/merge-tests.yml) は `main` または `dev` で始まるブランチの `app/**` 変更時、またはmanual dispatchで実行されます。
 
+- Contracts: API・storage・reliabilityyの静的検証
 - Frontend: dependency install、unit tests、build
 - Go API: `go test ./...`
 - Rust Worker: Cargo workspace tests
 - E2E: helper tests、Compose runtime、Playwrightによる実パイプライン確認
 
-変更pathに応じて必要なjobだけを実行します。
+変更pathに応じて必要なjobだけを実行します。障害注入を伴うReliability E2Eの実環境シナリオは専用環境で手動実行します。
 
 ## Repository Structure
 
@@ -167,10 +165,12 @@ streaming-video-app/
 │   ├── backend/
 │   │   ├── api/                 # Go API
 │   │   └── worker/              # Rust Worker
-│   ├── infra/terraform/         # Phase 1 S3 / SQS / IAM
+│   ├── infra/terraform/         # S3 / SQS / DLQ / IAM / alarms
+│   ├── infra/terraform-e2e/     # Reliability E2E専用AWS環境
 │   ├── contracts/               # OpenAPI、job status、storage conventions
 │   ├── docs/                    # ADRとrunbook
 │   ├── scripts/                 # contract validationとE2E起動
+│   ├── compose.e2e.yaml         # Reliability E2E専用override
 │   ├── compose.yaml
 │   └── README.md
 ├── specs/tasks/                 # Markdown Task Specs
@@ -189,6 +189,8 @@ streaming-video-app/
 ### Application
 
 Docker Composeによる起動、AWS prerequisites、環境変数、component単位のtest、Full E2E手順は [app/README.md](./app/README.md#local-development--setup) を参照してください。
+
+Reliability E2E専用AWS環境、認証、統合セットアップ、障害注入テストは [Reliability E2E運用ガイド](./app/frontend/e2e/reliability/runner.md) に集約しています。統合セットアップはWorker・DB・API・Frontendの起動とE2E設定のシェル反映を行います。
 
 ### Orchestrator
 
@@ -251,18 +253,24 @@ FrontendにはAWS credentialsを渡しません。APIとWorkerのcredentialsは�
 - ローカルCompose runtimeと実AWSを使用するE2E harness
 - Phase 1を小さい実装単位へ分割したTask Specs
 
-### Phase 2 and Phase 3
+### Phase 2 — implemented reliability
 
-次の項目は将来計画で、現在のアプリケーションには実装されていません。
+- DB leaseの原子的取得、期限切れleaseの再取得、owner条件付き状態更新
+- SQS visibilityとDB leaseのheartbeat、所有権喪失時の処理中断
+- 固定遅延・試行上限付き再試行、SQS redriveによるDLQ隔離、完了済み再配送の再処理防止
+- PostgreSQL接続終了時のWorker停止、通常処理完了時の進行中SQS受信の保持
+- キュー滞留時間・可視メッセージ数・DLQ件数のCloudWatchアラーム
+- 重複配送、crash recovery、長時間heartbeat、試行上限、poison隔離、監視と最終再生のE2E
+- 専用Terraform/Compose環境、統合セットアップ、証跡・復旧runbook
 
-- Lease、visibility timeout heartbeat、retry policy、DLQ
-- stuck-job recovery、CloudWatch monitoring
+### Future scope
+
+以下は未実装です。
+
 - CloudFront + OAC、private Output S3
 - API、Worker、PostgreSQLのAWS deployment
 - Step Functions、distributed encoding、Auto Scaling
 - ABR、複数renditions、FFmpeg C APIによる最適化
-
-Atomic `UPLOADING -> QUEUED` claimとS3/SQS/IAM Terraformは、限定されたPhase 1機能として実装済みです。
 
 ## Current Limitations
 
@@ -270,7 +278,8 @@ Atomic `UPLOADING -> QUEUED` claimとS3/SQS/IAM Terraformは、限定されたPh
 - HLSはH.264/AAC、MPEG-TSの単一品質です。
 - Authentication、user management、authorizationはありません。
 - Phase 1のOutput HLS prefixはpublic `s3:GetObject` を使用します。
-- Worker crash後のjob recovery、体系化されたretry、DLQはありません。
+- crash後の復旧はSQS再配送と残り試行回数が前提です。全ジョブを巡回する自動修復やDLQ自動再投入はありません。
+- SQS受信回数とDB試行回数は異なり、DLQ移動だけでは非終端ジョブの状態は更新されません。
 - Application computeとPostgreSQLはTerraform管理されていません。
 - Terraform CLIによるinit、validate、plan、applyはAgent pipelineの対象外です。
 - Full E2Eには設定済みの実AWS resourcesと専用credentialsが必要です。

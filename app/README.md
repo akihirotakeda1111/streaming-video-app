@@ -4,13 +4,13 @@
 
 Streaming Video App は、動画アップロードから非同期エンコード、HLS生成、ブラウザ再生までを一つのパイプラインとして学ぶための、個人開発MVPです。自己学習とポートフォリオを主目的とし、APIの応答処理と時間のかかる動画変換を分離した、最小のストリーミング動画アプリケーションを実装しています。
 
-現在の実装範囲は Phase 1 です。目標は、次の正常系E2Eを成立させることです。
+Phase 2では次の正常系パイプラインに加え、lease・heartbeat・上限付き再試行・DLQ隔離・キュー監視と障害注入E2Eを実装しています。
 
 ```text
 Upload -> asynchronous Encode -> HLS generation -> Playback
 ```
 
-このリポジトリは本番向け動画配信サービスではありません。Phase 1では、Frontend、Go API、Rust Worker、PostgreSQLをローカルで実行し、S3、SQS、IAMだけ実AWSを利用します。
+このリポジトリは本番向け動画配信サービスではありません。Phase 2では、Frontend、Go API、Rust Worker、PostgreSQLをローカルで実行し、S3、SQS/DLQ、IAM、CloudWatchアラームは実AWSを利用します。
 
 ## What this application does
 
@@ -18,7 +18,7 @@ Upload -> asynchronous Encode -> HLS generation -> Playback
 
 アップロード完了をS3の `ObjectCreated` 通知がSQSへ伝え、Rust Workerがメッセージを受信します。WorkerはInput bucketから動画を取得し、FFmpeg CLIで単一品質のHLS playlistとMPEG-TS segmentsへ変換します。変換結果はOutput S3 bucketへ配置され、ジョブ完了後にFrontendがvideo.jsを使って再生します。
 
-Frontendは処理中、Go APIをポーリングしてジョブ状態を表示します。Phase 1ではCloudFrontを使用せず、ブラウザがOutput S3 bucketのHLSオブジェクトをCORS経由で直接取得します。
+Frontendは処理中、Go APIをポーリングしてジョブ状態を表示します。現在はCloudFrontを使用せず、ブラウザがOutput S3 bucketのHLSオブジェクトをCORS経由で直接取得します。
 
 ## Architecture Overview
 
@@ -33,7 +33,9 @@ flowchart LR
 
     Input -->|4. ObjectCreated notification| Queue[[SQS Standard Queue]]
     Queue -->|5. long poll| Worker[Rust Worker]
-    Worker -->|atomic claim and status updates| DB
+    Queue -->|redrive policy| DLQ[[SQS Dead Letter Queue]]
+    Worker -->|lease acquisition / renewal / status updates| DB
+    Worker -->|visibility heartbeat| Queue
     Worker -->|6. GET source.mp4| Input
     Worker -->|7. FFmpeg x264/AAC| FFmpeg[FFmpeg CLI]
     Worker -->|8. PUT segments, then index.m3u8| Output[(S3 Output bucket)]
@@ -50,7 +52,7 @@ flowchart LR
 - Rust WorkerはSQSメッセージを起点に、claim、ダウンロード、エンコード、公開、状態更新を行います。ブラウザ向けAPIは提供しません。
 - Frontendはユーザー操作、S3への直接アップロード、状態ポーリング、HLS再生を担当します。AWS認証情報は持ちません。
 - PostgreSQLは動画メタデータ、アップロード情報、現在のジョブ状態を保持します。
-- TerraformはPhase 1で必要なS3、SQS、IAMを定義します。Frontend、API、Worker、PostgreSQLのAWSデプロイは定義しません。
+- TerraformはS3、SQS/DLQ、IAM、CloudWatchアラームを定義します。Frontend、API、Worker、PostgreSQLのAWSデプロイは定義しません。
 
 ## Component Responsibilities
 
@@ -96,22 +98,30 @@ APIは起動時にPostgreSQL接続、`videos` / `jobs` table、AWS credential pr
 - standard S3 Event Notificationの全 `Records` を解析する
 - event name、Input bucket、URL decode後のobject key、UUID形式を検証する
 - PostgreSQLの条件付きUPDATEで `UPLOADING -> QUEUED` を原子的にclaimする
-- `QUEUED -> PROCESSING` 後にInput S3 objectを一時ディレクトリへ保存する
+- 未所有または期限切れのleaseを原子的に取得し、PROCESSINGへの遷移とattempt加算を行う
+- heartbeatでDB leaseとSQS visibilityを延長し、所有権喪失時は処理を中断する
+- lease取得後にInput S3 objectを一時ディレクトリへ保存する
 - shellを介さずFFmpeg CLIを起動し、H.264/AAC、6秒segment、VOD形式のHLSを生成する
 - playlistと連番segmentの存在・安全な相対パスを検証する
 - Output S3へ全segmentsを先にuploadし、`index.m3u8` を最後にuploadする
 - 一時ファイル削除後、jobを `COMPLETED` にする
-- 所有した全jobが成功した場合だけSQS messageをdeleteする
-- 処理失敗時はjobを `FAILED`、failure codeを `ENCODING_FAILED` にする
+- 通知内の全jobが完了済みの場合だけSQS messageをdeleteし、完了済み再配送では再エンコードしない
+- 再試行可能な失敗はowner条件付きでQUEUEDへ戻し、固定遅延後の再配送を要求する
+- 所有中の試行上限到達時の失敗をFAILEDとし、通知はSQS redriveによるDLQ移動に任せる
+- PostgreSQL接続終了時は受信・処理を停止して異常終了する
+- 処理完了時も進行中のSQS受信を保持し、応答を処理へ引き渡す
 
 Worker containerには固定バージョンのFFmpeg / ffprobe 7.1.1が含まれ、非root userで実行されます。
 
+通常Composeは `unless-stopped` でWorkerを再起動し、DB接続を張り直します。障害注入用の `compose.e2e.yaml` は `restart: "no"` とし、シナリオが同じコンテナのstop/startを制御します。詳細は [再試行と冪等性のrunbook](./docs/runbooks/retry-and-idempotency.md) を参照してください。
+
 ### Infra
 
-`infra/terraform/` はPhase 1のAWS foundationを定義する単一のTerraform rootです。
+`infra/terraform/` は共通のAWS foundation、`infra/terraform-e2e/` は独立したstateを持つReliability E2E専用ルートです。
 
 - 分離されたInput / Output S3 buckets
-- SQS Standard Queue
+- SQS Standard Queue、DLQ、受信回数上限に基づくredrive policy
+- source最古メッセージ年齢・source可視件数・DLQ可視件数の3つのCloudWatchアラーム
 - `s3:ObjectCreated:*` からSQSへの通知
   - prefix: `videos/`
   - suffix: `/source.mp4`
@@ -129,12 +139,13 @@ TerraformはIAM access keyを生成しません。認証情報の発行・保管
 `contracts/` がコンポーネント間の共有契約です。
 
 - [OpenAPI 3.1 contract](./contracts/openapi/api.yaml): create、status、playback APIとレスポンス例
-- [Job status schema](./contracts/domain/job-status.schema.json): Phase 1の5状態
+- [Job status schema](./contracts/domain/job-status.schema.json): 公開APIの5状態
+- [Reliability conventions](./contracts/domain/reliability-conventions.md): lease、attempt、retry、heartbeat、ack、DLQの契約
 - [Storage conventions](./contracts/domain/storage-conventions.md): bucketの役割、S3 keys、S3 event、HLS公開順序
 - `contracts/examples/api/`: OpenAPIから参照されるcanonical API examples
 - `contracts/examples/s3/object-created.json`: Workerが解釈するcanonical S3 notification fixture
 
-Phase 1では独自の `encoding-requested`、`encoding-progress`、`encoding-completed` eventsを使用しません。SQS message bodyはAWS標準のS3 Event Notification JSONです。
+現在も独自の `encoding-requested`、`encoding-progress`、`encoding-completed` eventsを使用しません。SQS message bodyはAWS標準のS3 Event Notification JSONです。
 
 ## End-to-End Flow
 
@@ -144,11 +155,11 @@ Phase 1では独自の `encoding-requested`、`encoding-progress`、`encoding-co
 4. Go APIがPostgreSQLへvideoと `UPLOADING` jobをtransactionで保存し、Presigned URLをFrontendへ返します。
 5. BrowserがAPIを経由せず、返されたURLとheadersで動画をInput S3 bucketへPUTします。
 6. S3がkey filterに一致する `ObjectCreated:*` notificationをSQSへ送ります。
-7. Rust Workerがnotificationを受信し、Input bucketとkeyを検証して、jobを原子的に `QUEUED` へclaimします。既にclaim済みならエンコードしません。
-8. Workerがjobを `PROCESSING` にし、元動画をInput S3から一時ディレクトリへ取得します。
+7. Rust Workerがnotificationを受信し、Input bucketとkeyを検証して、jobを原子的に `QUEUED` へclaimします。再配送も含め、続くlease取得結果で処理可否を決めます。
+8. Workerが未所有または期限切れのleaseを取得してattemptを加算し、jobをPROCESSINGにします。heartbeatを開始し、元動画をInput S3から一時ディレクトリへ取得します。
 9. WorkerがFFmpegで単一品質のHLS playlistとMPEG-TS segmentsを生成し、生成物を検証します。
 10. WorkerがsegmentsをOutput S3へuploadし、公開境界となる `index.m3u8` を最後にuploadします。
-11. Workerが一時ディレクトリを削除し、jobを `COMPLETED` にしてからSQS messageをdeleteします。途中で失敗した場合は `FAILED` にします。
+11. Workerが一時ディレクトリを削除し、jobを `COMPLETED` にしてからSQS messageをdeleteします。再試行可能な失敗はQUEUEDへ戻し、試行上限到達時の失敗はFAILEDにします。所有権喪失やDB結果が不確かな場合は終端状態を確定せず、通知を残します。
 12. Frontendはstatus APIをポーリングし、`COMPLETED` 後にplayback APIからmanifest URLを取得します。
 13. video.jsがOutput S3からmanifestと相対参照されたsegmentsをCORS GETし、動画を再生します。
 
@@ -163,7 +174,7 @@ app/
 │   │   ├── api/                    # API types、response validation、direct upload
 │   │   ├── config/                 # VITE_API_BASE_URL
 │   │   └── App.vue                 # upload -> polling -> playback workflow
-│   └── e2e/                        # preflightと実AWSを使うPhase 1 E2E
+│   └── e2e/                        # 正常系・Reliability E2Eと運用ガイド
 ├── backend/
 │   ├── api/                        # Go HTTP API
 │   │   ├── cmd/api/                # process entrypointとruntime wiring
@@ -179,7 +190,8 @@ app/
 │           ├── queue/              # SQS port / adapter
 │           ├── storage/            # S3 port / adapter
 │           └── persistence/        # PostgreSQL job-state transitions
-├── infra/terraform/                # Phase 1 S3 / SQS / IAM
+├── infra/terraform/                # S3 / SQS / DLQ / IAM / alarms
+├── infra/terraform-e2e/             # 専用AWS環境と独立state
 ├── contracts/
 │   ├── openapi/                    # REST API contract
 │   ├── domain/                     # job statusとstorage conventions
@@ -190,8 +202,11 @@ app/
 ├── scripts/
 │   ├── validate_contracts.py       # OpenAPI / examples / domain整合性
 │   ├── validate_terraform_contracts.py
-│   └── start-e2e-compose.sh        # disposable E2E runtime起動
+│   ├── start-e2e-compose.sh        # Phase 1正常系E2E runtime起動
+│   ├── setup_reliability_env.sh    # Bashへ統合設定を反映（.mjsと連携）
+│   └── run_reliability_e2e.py      # 事前確認・シナリオ・証跡管理
 ├── config/                         # 現在は空の予約領域
+├── compose.e2e.yaml                # 専用DB・ラベル・restart policy
 ├── compose.yaml                    # PostgreSQL、migration、API、Worker、Frontend
 └── .env.example                    # local runtime設定例（実credentialは含まない）
 ```
@@ -207,6 +222,7 @@ API migrationの実体は `backend/api/internal/persistence/migrations/` にあ�
 | OpenAPI | Frontend / Go API | request、response、error、UUID、5 GiB上限、playback readiness |
 | Job status schema | Frontend / Go API / Rust Worker / PostgreSQL | `UPLOADING`, `QUEUED`, `PROCESSING`, `COMPLETED`, `FAILED` |
 | Storage conventions | Go API / Rust Worker / Terraform / Frontend | bucket分離、input key、S3 notification、HLS keys、公開順序 |
+| Reliability conventions | Worker / DB / Infra / E2E | lease所有権、attempt、retry、heartbeat、ack / DLQ |
 | API examples | Contract validator | OpenAPI schemaに対するcanonical payloads |
 | S3 example | Rust Worker / Contract validator | AWS標準 `ObjectCreated` message body |
 
@@ -218,17 +234,18 @@ OpenAPIに含まれない `GET /api/v1/health` は、アプリケーション機
 stateDiagram-v2
     [*] --> UPLOADING: Go API creates video/job
     UPLOADING --> QUEUED: Worker atomically claims valid S3 event
-    QUEUED --> PROCESSING: Worker starts download/encode
-    PROCESSING --> COMPLETED: segments + manifest published
-    QUEUED --> FAILED: unrecoverable Phase 1 error
-    PROCESSING --> FAILED: unrecoverable Phase 1 error
+    QUEUED --> PROCESSING: acquire lease / increment attempt
+    PROCESSING --> PROCESSING: reacquire expired lease / increment attempt
+    PROCESSING --> QUEUED: retryable failure / release lease
+    PROCESSING --> COMPLETED: publish manifest / owner-only completion
+    PROCESSING --> FAILED: owned attempt exhausted
     COMPLETED --> [*]
     FAILED --> [*]
 ```
 
-状態遷移のownerは、作成時の `UPLOADING` だけGo API、それ以降はRust Workerです。`UPLOADING -> QUEUED` はSQSのat-least-once deliveryを前提に、job ID、video ID、現在状態を条件にした単一UPDATEで所有権を確定します。
+Go APIが作成時のUPLOADINGを設定し、その後の遷移はWorkerが行います。claimとlease取得は別操作です。lease取得時にのみ内部のattemptを加算し、有効なownerだけが更新・公開・完了・失敗確定を行います。worker_id、attempt、lease_expires_atは公開APIには追加しません。
 
-Phase 1にLeaseやvisibility timeout heartbeatはありません。そのため、claim後にWorkerが停止するとjobが `QUEUED` または `PROCESSING` に残る可能性があります。
+crash後は、SQS再配送時にleaseが期限切れで試行予算が残っていれば取得し直します。COMPLETEDは再取得せず、再配送では削除だけを再試行します。DLQ移動はSQSの受信回数に基づき、DBのattemptとは別です。DLQに移っただけではDB状態はFAILEDに変わりません。
 
 ## HLS / S3 Object Layout
 
@@ -249,8 +266,8 @@ Output bucket
 | Object | Content-Type | 公開方法 |
 | --- | --- | --- |
 | `source.mp4` | `video/mp4` | 非公開。Presigned PUTとWorker readのみ |
-| `segment-{nnnnn}.ts` | `video/mp2t` | Phase 1ではHLS prefixにpublic GET + CORS |
-| `index.m3u8` | `application/vnd.apple.mpegurl` | Phase 1ではHLS prefixにpublic GET + CORS |
+| `segment-{nnnnn}.ts` | `video/mp2t` | HLS prefixにpublic GET + CORS |
+| `index.m3u8` | `application/vnd.apple.mpegurl` | HLS prefixにpublic GET + CORS |
 
 Playlist内のsegment参照は `segment-00000.ts` のような相対名です。manifestを最後に公開し、その後でjobを `COMPLETED` にすることで、Frontendが不完全なplaylistを取得する時間帯を避けます。
 
@@ -263,7 +280,7 @@ Playlist内のsegment参照は `segment-00000.ts` のような相対名です。
 | Worker | Rust 1.98, Tokio, AWS SDK for Rust, tokio-postgres |
 | Media | FFmpeg / ffprobe 7.1.1 in the Worker image, H.264 + AAC, HLS MPEG-TS |
 | Database | PostgreSQL 16 |
-| AWS | S3, SQS Standard Queue, IAM |
+| AWS | S3, SQS Standard Queue / DLQ, IAM, CloudWatch alarms |
 | Infrastructure | Terraform >= 1.6, AWS provider `~> 5.0` |
 | Local runtime | Docker Compose |
 | Validation | Python 3.11+, JSON Schema, PyYAML, Vitest, Playwright, Go test, Cargo test |
@@ -273,12 +290,12 @@ Playlist内のsegment参照は `segment-00000.ts` のような相対名です。
 ### Prerequisites
 
 - Docker EngineまたはDocker DesktopとDocker Compose
-- 実AWS account内に、`infra/terraform/` と同じPhase 1構成のS3、SQS、IAMが存在すること
+- 実AWS account内に、`infra/terraform/` に対応するS3、SQS/DLQ、IAM、アラームが存在すること
 - Input bucketとOutput bucketが別名であること
 - Input S3 CORSのorigin、Output S3 CORSのorigin、`FRONTEND_ORIGIN` が実際のFrontend originと一致すること
 - APIとWorkerに別々の最小権限AWS credentialsを用意すること
 
-Terraform configurationは存在しますが、state backend、workspace、AWS account選択、apply運用は現在ドキュメント化されていません。利用するAWS accountとstate管理方法を決めたうえで、Compose起動前に必要なAWS resourcesを用意してください。
+通常開発用のAWS resourcesはCompose起動前に用意してください。Reliability E2Eでは独立した `infra/terraform-e2e/` と `compose.e2e.yaml` を使います。アカウント確認、state、plan/apply、認証設定は [専用環境の運用ガイド](./frontend/e2e/reliability/runner.md#事前準備) に従ってください。
 
 ### Configuration
 
@@ -302,6 +319,13 @@ Terraform configurationは存在しますが、state backend、workspace、AWS a
 | `TMPDIR` | Worker | per-job temporary directory root |
 | `API_AWS_*` | Compose API | API専用AWS credentials |
 | `WORKER_AWS_*` | Compose Worker | Worker専用AWS credentials |
+| `WORKER_HEARTBEAT_INTERVAL_SECONDS` | Worker | heartbeat間隔（秒） |
+| `WORKER_VISIBILITY_EXTENSION_SECONDS` | Worker | SQS visibility延長（秒） |
+| `WORKER_LEASE_DURATION_SECONDS` | Worker | DB lease期間（秒） |
+| `WORKER_RETRY_DELAY_SECONDS` | Worker | 再試行の固定遅延（秒） |
+| `WORKER_MAXIMUM_ATTEMPTS` | Worker | lease取得の試行上限（1〜10） |
+
+heartbeat間隔の2倍がlease期間・visibility延長・sourceキューのvisibility以下になるよう設定します。通常Composeの既定値は順に30 / 120 / 300 / 900秒、5試行です。Reliability E2Eは専用Terraformの5 / 120 / 60 / 10秒、3試行を使い、統合セットアップで反映します。
 
 ### Start the complete local stack
 
@@ -346,10 +370,10 @@ OpenAPI外部参照、API examples、job statuses、`FAILED` / `failure` semanti
 ### Terraform architecture contract
 
 ```sh
-python app/scripts/validate_terraform_contracts.py --stage complete
+python app/scripts/validate_terraform_contracts.py --stage reliability
 ```
 
-このvalidatorはTerraform CLIやAWSへ接続せず、Phase 1のresource境界、S3/SQS notification、CORS、public read範囲、queue policy、API / Worker IAM分離、Phase 1外resourceの不在を静的に検証します。
+このvalidatorはTerraform CLIやAWSへ接続せず、S3/SQS notification、CORS、public read範囲、queue policy、API / Worker IAM分離、DLQ、heartbeat時間設定、CloudWatchアラームを静的に検証します。
 
 ### Component tests
 
@@ -361,6 +385,7 @@ npm --prefix app/frontend ci
 npm --prefix app/frontend run test:unit -- --run
 npm --prefix app/frontend run build
 npm --prefix app/frontend run test:e2e:helpers
+npm --prefix app/frontend run test:e2e:type-check
 ```
 
 ### Full Phase 1 E2E
@@ -386,10 +411,40 @@ npm --prefix app/frontend run test:e2e
 
 E2Eは、Browserの単一direct PUT、状態遷移、HLS object layout / content types、manifestとsegmentsのbrowser GET、video.js初期化、再生時間の進行まで確認します。
 
+### Reliability E2E（Phase 2）
+
+専用AWS環境、ホスト・Worker・API認証、正常／不正MP4、Linux版Node.js、Terraform、AWS CLI、Docker Compose、ホストFFmpeg・Chromiumを準備します。詳細は [運用ガイド](./frontend/e2e/reliability/runner.md) に集約しています。
+
+リポジトリルートのWSL / Linux Bashで実行します。アカウントとfixtureパスは対象環境に置き換えてください。
+
+```bash
+source app/scripts/setup_reliability_env.sh \
+  --account 123456789012 \
+  --fixture "$HOME/e2e/long.mp4" \
+  --invalid-fixture "$HOME/e2e/invalid.mp4" \
+  --start-services
+```
+
+成功後、同じシェルで以下を順に実行し、失敗した場合は後続へ進みません。
+
+```bash
+python app/scripts/run_reliability_e2e.py --check
+python app/scripts/run_reliability_e2e.py --live-preflight
+python app/scripts/run_reliability_e2e.py --scenario preflight
+python app/scripts/run_reliability_e2e.py --full
+```
+
+起動済み環境の設定を読み込む場合は同じ引数から起動オプションを省略します。設定やコンテナを更新する場合はE2E終了後に再セットアップします。
+
+フル実行は重複配送、crash recovery、長時間heartbeat、FFmpeg試行上限、poison隔離、キュー監視を実施し、最後に新規アップロードとブラウザ再生を検証します。証跡は既定で `artifacts/reliability-e2e/` に保存されます。DLQメッセージが人手確認用に残るシナリオがあり、無条件のpurgeや再投入は行いません。
+
+helperテストはオフラインで実行できますが、実環境シナリオはAWSへの書き込みやWorker停止を伴います。通常のPhase 1 E2E起動スクリプトを専用セットアップの代用にはしません。
+
 ## Phase Scope
 
 ロードマップの原典は [ADR-001](./docs/adr/adr-001-video-streaming-mvp-architecture.md) です。
-### Phase 1 — current implementation
+
+### Phase 1 — implemented pipeline
 
 - Browser -> Go APIでvideo/job作成とPresigned PUT URL発行
 - Browser -> Input S3への直接upload
@@ -405,20 +460,16 @@ E2Eは、Browserの単一direct PUT、状態遷移、HLS object layout / content
 
 ソースコードとテストharnessは存在しますが、実際のE2E成功には正しく構成されたAWS resourcesとcredentialsが必要です。リポジトリだけで特定AWS環境へのデプロイ済み状態までは保証しません。
 
-### Phase 2 — planned reliability and infrastructure hardening
+### Phase 2 — implemented reliability
 
-次は将来計画で、現在のPhase 1 runtimeには実装されていません。
+- DB lease取得・更新・期限切れ再取得、owner条件付きの状態更新
+- SQS visibilityとDB leaseのheartbeat、所有権喪失時の処理中断
+- 固定遅延・試行上限付き再試行、完了済み再配送での再処理防止
+- DLQ / poison隔離、キューのCloudWatch metrics / alarmsと証跡
+- DB接続終了の監視とWorker異常終了、進行中のSQS受信の保持
+- 専用Terraform / Compose、統合セットアップ、障害注入E2Eと復旧runbook
 
-- Lease取得と期限切れLeaseの回収
-- 長時間処理中のSQS visibility timeout heartbeat
-- 明示的なretry policy、backoff、attempt上限
-- DLQとpoison message運用
-- Worker crash後に `QUEUED` / `PROCESSING` jobを回収する仕組み
-- CloudWatch logs / metrics / alarms
-- CloudFront + OACとprivate Output S3
-- API、Worker、PostgreSQL、network、monitoringまで含めたTerraform拡張
-
-Atomic `UPLOADING -> QUEUED` claimとS3/SQS/IAM Terraformは、Phase 2全体に先行してPhase 1へ限定導入済みです。これらをもってPhase 2の信頼性要件が完了したわけではありません。
+CloudFront + OAC、private Output S3、アプリ・DB・ネットワークのAWS配置、WorkerログのCloudWatch転送は未実装です。
 
 ### Phase 3 — future scalability and distributed encoding
 
@@ -436,13 +487,13 @@ Atomic `UPLOADING -> QUEUED` claimとS3/SQS/IAM Terraformは、Phase 2全体に�
 - Authentication、user management、authorizationはありません。
 - Phase 1の入力は空でないMP4 1ファイル、最大5 GiB、単一Presigned PUTだけです。multipart uploadはありません。
 - HLSはH.264/AAC、6秒MPEG-TS segmentsの単一品質です。ABR、複数renditions、字幕、thumbnail、live streamingはありません。
-- Output HLS prefixは匿名 `s3:GetObject` を許可します。private deliveryはPhase 2のCloudFront + OACまで対象外です。
+- Output HLS prefixは匿名 `s3:GetObject` を許可します。CloudFront + OACによるprivate deliveryは未実装です。
 - API、Worker、PostgreSQLはAWSへデプロイされず、Terraform管理されません。
 - WorkerはS3 source object全体をmemoryへ収集してからlocal diskへ書き、upload時も各HLS fileをmemoryへ読み込みます。大容量・高並列処理向けではありません。
-- Lease、heartbeat、timeout、cancel、stuck-job recoveryがないため、Worker停止後にjobが `QUEUED` / `PROCESSING` のまま残る可能性があります。
-- 失敗したmessageと、atomic claimで所有できなかったmessageはdeleteされません。Phase 1には体系化されたretry / DLQ処理がないため、SQS visibility timeout後に再配信される可能性があります。
+- 復旧はSQS再配送と残り試行回数が前提です。全ジョブを巡回する自動修復やDLQ自動再投入はありません。メッセージ削除・DLQ移動後にQUEUED / PROCESSINGが残った場合は状態確認と手動復旧が必要です。
+- busy・無効通知・FAILEDはdeleteせず、SQS redriveに任せます。受信回数とDB試行回数は一致するとは限らず、DLQ移動だけでは非終端ジョブをFAILEDにしません。
 - Worker processの受信・処理は固定上限で、distributed computeやautoscalingはありません。
 - CORSは単一の設定済みFrontend originを前提とします。
-- Terraformのremote state、environment分割、application deployment手順は未定義です。
+- E2E環境は独立したlocal stateとComposeプロジェクトで分離します。共有remote stateとアプリのAWS deploymentは未整備です。
 
 アーキテクチャの背景とPhaseごとの判断理由は [ADR-001](./docs/adr/adr-001-video-streaming-mvp-architecture.md)、storageと状態遷移の厳密な規約は [storage conventions](./contracts/domain/storage-conventions.md) を参照してください。

@@ -12,6 +12,13 @@ pub struct WorkItem {
     pub job_id: String,
 }
 
+/// The validation result for one entry in an S3 notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParsedRecord {
+    Work(WorkItem),
+    Invalid,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventParseError(&'static str);
 
@@ -31,6 +38,23 @@ pub fn parse_notification(
     body: &str,
     configured_input_bucket: &str,
 ) -> Result<Vec<WorkItem>, EventParseError> {
+    Ok(parse_notification_records(body, configured_input_bucket)?
+        .into_iter()
+        .filter_map(|record| match record {
+            ParsedRecord::Work(item) => Some(item),
+            ParsedRecord::Invalid => None,
+        })
+        .collect())
+}
+
+/// Parse a notification without discarding invalid records.
+///
+/// Lease acquisition uses this form so later message acknowledgement can
+/// account for every record that was delivered.
+pub fn parse_notification_records(
+    body: &str,
+    configured_input_bucket: &str,
+) -> Result<Vec<ParsedRecord>, EventParseError> {
     let event: Value = serde_json::from_str(body).map_err(|_| EventParseError("invalid JSON"))?;
     let records = event
         .get("Records")
@@ -39,7 +63,11 @@ pub fn parse_notification(
 
     Ok(records
         .iter()
-        .filter_map(|record| parse_record(record, configured_input_bucket))
+        .map(|record| {
+            parse_record(record, configured_input_bucket)
+                .map(ParsedRecord::Work)
+                .unwrap_or(ParsedRecord::Invalid)
+        })
         .collect())
 }
 

@@ -12,3 +12,9 @@ The image copies both `/usr/local/bin/ffmpeg` and
 `ffprobe` is available on `PATH`. The worker runs as the unprivileged `worker`
 user and receives its remaining required configuration through environment
 variables.
+
+The heartbeat interval must be at most half both the lease duration and visibility
+extension. The source queue visibility timeout must retain the same margin.
+PostgreSQL driver termination stops receipt and cancels in-flight work through
+the bounded shutdown path, then exits with status 1. Run the worker with a restart
+policy (as in Compose) so it establishes a fresh connection after a database outage.

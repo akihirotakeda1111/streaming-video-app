@@ -1,19 +1,13 @@
-//! Configuration and lifecycle support for the Phase 1 encoding worker.
+//! Configuration and lifecycle support for the encoding worker.
 
-pub mod claim;
+pub mod acquisition;
+pub mod completion;
 pub mod event;
 pub mod fakes;
+pub mod heartbeat;
 pub mod publish;
+pub mod retry;
 pub mod runtime;
-pub mod terminal;
-
-/// A deterministic representation of wall-clock time used by worker ports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Timestamp(pub u64);
-
-pub trait Clock {
-    fn now(&mut self) -> Timestamp;
-}
 
 use std::{env, fmt, path::PathBuf};
 
@@ -26,6 +20,11 @@ const INPUT_BUCKET: &str = "VIDEO_INPUT_BUCKET";
 const OUTPUT_BUCKET: &str = "VIDEO_OUTPUT_BUCKET";
 const FFMPEG_PATH: &str = "FFMPEG_PATH";
 const TEMPORARY_DIRECTORY: &str = "TMPDIR";
+const HEARTBEAT_INTERVAL_SECONDS: &str = "WORKER_HEARTBEAT_INTERVAL_SECONDS";
+const VISIBILITY_EXTENSION_SECONDS: &str = "WORKER_VISIBILITY_EXTENSION_SECONDS";
+const LEASE_DURATION_SECONDS: &str = "WORKER_LEASE_DURATION_SECONDS";
+const RETRY_DELAY_SECONDS: &str = "WORKER_RETRY_DELAY_SECONDS";
+const MAXIMUM_ATTEMPTS: &str = "WORKER_MAXIMUM_ATTEMPTS";
 
 /// All runtime settings required by the worker.
 #[derive(Clone, PartialEq, Eq)]
@@ -37,6 +36,11 @@ pub struct Config {
     pub output_bucket: String,
     pub ffmpeg_path: PathBuf,
     pub temporary_directory: PathBuf,
+    pub heartbeat_interval_seconds: u64,
+    pub visibility_extension_seconds: u64,
+    pub lease_duration_seconds: u64,
+    pub retry_delay_seconds: u64,
+    pub maximum_attempts: u32,
 }
 
 impl Config {
@@ -56,6 +60,41 @@ impl Config {
         let output_bucket = required(&lookup, OUTPUT_BUCKET)?;
         let ffmpeg_path = PathBuf::from(required(&lookup, FFMPEG_PATH)?);
         let temporary_directory = PathBuf::from(required(&lookup, TEMPORARY_DIRECTORY)?);
+        let heartbeat_interval_seconds = positive_seconds(&lookup, HEARTBEAT_INTERVAL_SECONDS)?;
+        let visibility_extension_seconds = positive_seconds(&lookup, VISIBILITY_EXTENSION_SECONDS)?;
+        let lease_duration_seconds = positive_seconds(&lookup, LEASE_DURATION_SECONDS)?;
+        let retry_delay_seconds = positive_seconds(&lookup, RETRY_DELAY_SECONDS)?;
+        let maximum_attempts = positive_u32(&lookup, MAXIMUM_ATTEMPTS)?;
+        if maximum_attempts > 10 {
+            return Err(ConfigError::invalid(MAXIMUM_ATTEMPTS, "must not exceed 10"));
+        }
+
+        if visibility_extension_seconds > 43_200 {
+            return Err(ConfigError::invalid(
+                VISIBILITY_EXTENSION_SECONDS,
+                "must not exceed 43200 seconds",
+            ));
+        }
+        if lease_duration_seconds > heartbeat::MAX_LEASE_DURATION_SECONDS {
+            return Err(ConfigError::invalid(
+                LEASE_DURATION_SECONDS,
+                "must not exceed 43200 seconds",
+            ));
+        }
+        if heartbeat_interval_seconds > visibility_extension_seconds / 2
+            || heartbeat_interval_seconds > lease_duration_seconds / 2
+        {
+            return Err(ConfigError::invalid(
+                HEARTBEAT_INTERVAL_SECONDS,
+                "must be at most half the lease duration and visibility extension",
+            ));
+        }
+        if retry_delay_seconds > 43_200 {
+            return Err(ConfigError::invalid(
+                RETRY_DELAY_SECONDS,
+                "must not exceed 43200 seconds",
+            ));
+        }
 
         validate_postgres_url(&database_url)?;
         validate_region(&aws_region)?;
@@ -77,6 +116,11 @@ impl Config {
             output_bucket,
             ffmpeg_path,
             temporary_directory,
+            heartbeat_interval_seconds,
+            visibility_extension_seconds,
+            lease_duration_seconds,
+            retry_delay_seconds,
+            maximum_attempts,
         })
     }
 }
@@ -92,6 +136,17 @@ impl fmt::Debug for Config {
             .field("output_bucket", &self.output_bucket)
             .field("ffmpeg_path", &self.ffmpeg_path)
             .field("temporary_directory", &self.temporary_directory)
+            .field(
+                "heartbeat_interval_seconds",
+                &self.heartbeat_interval_seconds,
+            )
+            .field(
+                "visibility_extension_seconds",
+                &self.visibility_extension_seconds,
+            )
+            .field("lease_duration_seconds", &self.lease_duration_seconds)
+            .field("retry_delay_seconds", &self.retry_delay_seconds)
+            .field("maximum_attempts", &self.maximum_attempts)
             .finish()
     }
 }
@@ -129,6 +184,34 @@ where
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_owned())
         .ok_or_else(|| ConfigError::invalid(variable, "is required"))
+}
+
+fn positive_seconds<F>(lookup: &F, variable: &'static str) -> Result<u64, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = required(lookup, variable)?;
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| ConfigError::invalid(variable, "must be a positive integer"))?;
+    if seconds == 0 {
+        return Err(ConfigError::invalid(variable, "must be a positive integer"));
+    }
+    Ok(seconds)
+}
+
+fn positive_u32<F>(lookup: &F, variable: &'static str) -> Result<u32, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = required(lookup, variable)?;
+    let attempts = value
+        .parse::<u32>()
+        .map_err(|_| ConfigError::invalid(variable, "must be a positive integer"))?;
+    if attempts == 0 {
+        return Err(ConfigError::invalid(variable, "must be a positive integer"));
+    }
+    Ok(attempts)
 }
 
 fn validate_postgres_url(value: &str) -> Result<(), ConfigError> {
@@ -240,6 +323,11 @@ mod tests {
             (OUTPUT_BUCKET, "video-output".into()),
             (FFMPEG_PATH, "/usr/bin/ffmpeg".into()),
             (TEMPORARY_DIRECTORY, "/tmp/video-worker".into()),
+            (HEARTBEAT_INTERVAL_SECONDS, "30".into()),
+            (VISIBILITY_EXTENSION_SECONDS, "120".into()),
+            (LEASE_DURATION_SECONDS, "300".into()),
+            (RETRY_DELAY_SECONDS, "900".into()),
+            (MAXIMUM_ATTEMPTS, "5".into()),
         ])
     }
 
@@ -252,6 +340,83 @@ mod tests {
     }
 
     #[test]
+    fn validates_retry_configuration_bounds() {
+        for (variable, values) in [
+            (
+                MAXIMUM_ATTEMPTS,
+                vec!["0", "11", "4294967295", "4294967296", "-1", "1.5"],
+            ),
+            (RETRY_DELAY_SECONDS, vec!["0", "43201", "-1"]),
+        ] {
+            for value in values {
+                let mut config = valid();
+                config.insert(variable, value.into());
+                assert_eq!(load(&config).unwrap_err().variable, variable);
+            }
+        }
+        for attempts in ["1", "10"] {
+            for delay in ["1", "43200"] {
+                let mut config = valid();
+                config.insert(MAXIMUM_ATTEMPTS, attempts.into());
+                config.insert(RETRY_DELAY_SECONDS, delay.into());
+                load(&config).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn startup_requires_half_duration_heartbeat_margin() {
+        for variable in [LEASE_DURATION_SECONDS, VISIBILITY_EXTENSION_SECONDS] {
+            for (duration, accepted) in [(59, false), (60, true), (61, true)] {
+                let mut values = valid();
+                values.insert(variable, duration.to_string());
+                assert_eq!(load(&values).is_ok(), accepted);
+            }
+        }
+        let mut values = valid();
+        values.insert(HEARTBEAT_INTERVAL_SECONDS, "119".into());
+        values.insert(LEASE_DURATION_SECONDS, "120".into());
+        values.insert(VISIBILITY_EXTENSION_SECONDS, "120".into());
+        assert!(load(&values).is_err());
+    }
+
+    #[test]
+    fn validates_heartbeat_configuration_without_exposing_values() {
+        for variable in [
+            HEARTBEAT_INTERVAL_SECONDS,
+            VISIBILITY_EXTENSION_SECONDS,
+            LEASE_DURATION_SECONDS,
+        ] {
+            for value in [
+                "",
+                "0",
+                "-1",
+                "1.5",
+                "18446744073709551615",
+                "18446744073709551616",
+                "secret-invalid-value",
+            ] {
+                let mut values = valid();
+                values.insert(variable, value.into());
+                let error = load(&values).unwrap_err();
+                assert_eq!(error.variable, variable);
+                assert!(!error.to_string().contains("secret-invalid-value"));
+                assert!(!format!("{error:?}").contains("password"));
+            }
+        }
+        for lease in ["60", "43200"] {
+            let mut values = valid();
+            values.insert(LEASE_DURATION_SECONDS, lease.into());
+            load(&values).unwrap();
+        }
+        for lease in ["30", "31", "59", "43201"] {
+            let mut values = valid();
+            values.insert(LEASE_DURATION_SECONDS, lease.into());
+            assert!(load(&values).is_err());
+        }
+    }
+
+    #[test]
     fn rejects_each_missing_required_value() {
         for variable in [
             DATABASE_URL,
@@ -261,6 +426,11 @@ mod tests {
             OUTPUT_BUCKET,
             FFMPEG_PATH,
             TEMPORARY_DIRECTORY,
+            HEARTBEAT_INTERVAL_SECONDS,
+            VISIBILITY_EXTENSION_SECONDS,
+            LEASE_DURATION_SECONDS,
+            RETRY_DELAY_SECONDS,
+            MAXIMUM_ATTEMPTS,
         ] {
             let mut values = valid();
             values.remove(variable);

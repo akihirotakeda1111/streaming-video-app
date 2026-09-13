@@ -14,6 +14,9 @@ impl Execute for ProcessExecutor {
     async fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
         let output = tokio::process::Command::new(&command.executable)
             .args(&command.argv)
+            // Dropping the execution future on shutdown or lease loss must
+            // also terminate FFmpeg instead of leaving it running in the background.
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|error| ProcessError(format!("execute {:?}: {error}", command.executable)))?;
@@ -74,6 +77,72 @@ impl JobDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{net::TcpListener, time::Duration};
+
+    // Run in a separate test process so cancellation exercises a real child
+    // on Windows and Unix without depending on an installed FFmpeg or shell.
+    #[test]
+    #[ignore = "child process helper invoked by executor_cancellation_terminates_child"]
+    fn cancellation_child() {
+        let Some(marker) = std::env::args().skip_while(|arg| arg != "--skip").nth(1) else {
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        fs::write(marker, listener.local_addr().unwrap().to_string()).unwrap();
+        // A finite lifetime also cleans up the helper if the regression test fails.
+        std::thread::sleep(Duration::from_secs(10));
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn executor_cancellation_terminates_child() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("child-address");
+        let command = Command::new(
+            std::env::current_exe().unwrap(),
+            vec![
+                "--ignored".into(),
+                "--exact".into(),
+                "runtime::tests::cancellation_child".into(),
+                "--skip".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+        );
+        let task = tokio::spawn(async move { ProcessExecutor.execute(command).await });
+        let address = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                assert!(!task.is_finished(), "child exited before cancellation");
+                if let Ok(value) = fs::read_to_string(&marker) {
+                    if let Ok(address) = value.parse::<std::net::SocketAddr>() {
+                        break address;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child did not start");
+        assert!(
+            TcpListener::bind(address).is_err(),
+            "child must hold the port"
+        );
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                // Rebinding proves the OS released the child's resource,
+                // rather than merely observing that the Rust future stopped.
+                if let Ok(listener) = TcpListener::bind(address) {
+                    drop(listener);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled executor left its child process running");
+    }
 
     #[test]
     fn job_directories_are_isolated_under_root_and_removable() {

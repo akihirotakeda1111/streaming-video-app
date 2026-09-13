@@ -19,6 +19,11 @@ output "runtime_configuration" {
     video_encoding_queue_url = var.video_encoding_queue_url
     video_input_bucket       = var.video_input_bucket
     video_output_bucket      = var.video_output_bucket
+    worker_heartbeat_interval_seconds   = var.worker_heartbeat_interval_seconds
+    worker_visibility_extension_seconds = var.worker_visibility_extension_seconds
+    worker_lease_duration_seconds       = var.worker_lease_duration_seconds
+    worker_retry_delay_seconds          = var.worker_retry_delay_seconds
+    worker_maximum_attempts             = var.worker_maximum_attempts
   }
 
   precondition {

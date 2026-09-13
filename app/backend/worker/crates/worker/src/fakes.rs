@@ -6,19 +6,22 @@ use std::{
     fs,
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use encoding::{Command, Execute, Output, ProcessError};
-use persistence::{JobState, PersistenceError};
-use queue::{Delete, Message, QueueError, Receive};
+use persistence::{JobState, LeaseAcquisitionOutcome, PersistenceError};
+use queue::{ChangeVisibility, Delete, Message, QueueError, Receive};
 use storage::{ObjectError, Read, Write};
-
-use crate::{Clock, Timestamp};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Call {
     Receive,
     Delete(String),
+    ChangeVisibility {
+        receipt_handle: String,
+        visibility_timeout: Duration,
+    },
     Read {
         bucket: String,
         key: String,
@@ -33,13 +36,14 @@ pub enum Call {
         job_id: String,
         video_id: String,
     },
-    MarkProcessing(String),
-    MarkCompleted(String),
-    MarkFailed {
+    AcquireLease {
         job_id: String,
-        reason: String,
+        video_id: String,
+        worker_id: String,
+        lease_seconds: u64,
+        max_attempts: u32,
     },
-    Now,
+    MarkProcessing(String),
     Execute(Command),
     ReadSource {
         path: String,
@@ -66,6 +70,7 @@ pub struct FakeQueue {
     messages: VecDeque<Message>,
     receive_failures: VecDeque<String>,
     delete_failures: VecDeque<String>,
+    visibility_failures: VecDeque<String>,
 }
 
 impl FakeQueue {
@@ -75,6 +80,7 @@ impl FakeQueue {
             messages: VecDeque::new(),
             receive_failures: VecDeque::new(),
             delete_failures: VecDeque::new(),
+            visibility_failures: VecDeque::new(),
         }
     }
     pub fn push_message(&mut self, message: Message) {
@@ -85,6 +91,9 @@ impl FakeQueue {
     }
     pub fn fail_delete(&mut self, message: impl Into<String>) {
         self.delete_failures.push_back(message.into());
+    }
+    pub fn fail_visibility(&mut self, message: impl Into<String>) {
+        self.visibility_failures.push_back(message.into());
     }
 }
 
@@ -106,6 +115,23 @@ impl Delete for FakeQueue {
         }
         self.messages
             .retain(|message| message.receipt_handle != receipt_handle);
+        Ok(())
+    }
+}
+
+impl ChangeVisibility for FakeQueue {
+    async fn change_visibility(
+        &mut self,
+        receipt_handle: &str,
+        visibility_timeout: Duration,
+    ) -> Result<(), QueueError> {
+        self.log.push(Call::ChangeVisibility {
+            receipt_handle: receipt_handle.into(),
+            visibility_timeout,
+        });
+        if let Some(error) = self.visibility_failures.pop_front() {
+            return Err(QueueError(error));
+        }
         Ok(())
     }
 }
@@ -138,10 +164,6 @@ impl FakeStorage {
     }
     pub fn fail_read(&mut self, message: impl Into<String>) {
         self.read_failures.push_back(message.into());
-    }
-    pub fn fail_read_after(&mut self, successful_calls: usize, message: impl Into<String>) {
-        self.read_skip = successful_calls;
-        self.fail_read(message);
     }
     pub fn fail_write(&mut self, message: impl Into<String>) {
         self.write_failures.push_back(message.into());
@@ -198,8 +220,7 @@ pub struct FakeJobState {
     pub claims: Vec<(String, String, bool)>,
     claim_failures: VecDeque<String>,
     processing_failures: VecDeque<String>,
-    completed_failures: VecDeque<String>,
-    mark_failed_failures: VecDeque<String>,
+    lease_acquisitions: VecDeque<Result<LeaseAcquisitionOutcome, PersistenceError>>,
     claim_skip: usize,
 }
 
@@ -210,8 +231,7 @@ impl FakeJobState {
             claims: Vec::new(),
             claim_failures: VecDeque::new(),
             processing_failures: VecDeque::new(),
-            completed_failures: VecDeque::new(),
-            mark_failed_failures: VecDeque::new(),
+            lease_acquisitions: VecDeque::new(),
             claim_skip: 0,
         }
     }
@@ -221,18 +241,12 @@ impl FakeJobState {
     pub fn fail_claim(&mut self, message: impl Into<String>) {
         self.claim_failures.push_back(message.into());
     }
-    pub fn fail_claim_after(&mut self, successful_calls: usize, message: impl Into<String>) {
-        self.claim_skip = successful_calls;
-        self.fail_claim(message);
+    pub fn add_lease_acquisition(&mut self, outcome: LeaseAcquisitionOutcome) {
+        self.lease_acquisitions.push_back(Ok(outcome));
     }
-    pub fn fail_mark_processing(&mut self, message: impl Into<String>) {
-        self.processing_failures.push_back(message.into());
-    }
-    pub fn fail_mark_completed(&mut self, message: impl Into<String>) {
-        self.completed_failures.push_back(message.into());
-    }
-    pub fn fail_mark_failed(&mut self, message: impl Into<String>) {
-        self.mark_failed_failures.push_back(message.into());
+    pub fn fail_lease_acquisition(&mut self, message: impl Into<String>) {
+        self.lease_acquisitions
+            .push_back(Err(PersistenceError(message.into())));
     }
 }
 
@@ -283,33 +297,24 @@ impl JobState for FakeJobState {
         self.log.push(Call::MarkProcessing(job_id.into()));
         take_failure(&mut self.processing_failures)
     }
-    async fn mark_completed(&mut self, job_id: &str) -> Result<(), PersistenceError> {
-        self.log.push(Call::MarkCompleted(job_id.into()));
-        take_failure(&mut self.completed_failures)
-    }
-    async fn mark_failed(&mut self, job_id: &str, reason: &str) -> Result<(), PersistenceError> {
-        self.log.push(Call::MarkFailed {
+    async fn acquire_lease(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_attempts: u32,
+    ) -> Result<LeaseAcquisitionOutcome, PersistenceError> {
+        self.log.push(Call::AcquireLease {
             job_id: job_id.into(),
-            reason: reason.into(),
+            video_id: video_id.into(),
+            worker_id: worker_id.into(),
+            lease_seconds,
+            max_attempts,
         });
-        take_failure(&mut self.mark_failed_failures)
-    }
-}
-
-#[derive(Debug)]
-pub struct FakeClock {
-    pub log: CallLog,
-    pub current: Timestamp,
-}
-impl FakeClock {
-    pub fn new(log: CallLog, current: Timestamp) -> Self {
-        Self { log, current }
-    }
-}
-impl Clock for FakeClock {
-    fn now(&mut self) -> Timestamp {
-        self.log.push(Call::Now);
-        self.current
+        self.lease_acquisitions
+            .pop_front()
+            .unwrap_or(Ok(LeaseAcquisitionOutcome::UnknownOrMismatched))
     }
 }
 
@@ -321,14 +326,6 @@ pub struct FakeProcessExecutor {
     write_hls: bool,
 }
 impl FakeProcessExecutor {
-    pub fn new(log: CallLog, output: Output) -> Self {
-        Self {
-            log,
-            output,
-            failures: VecDeque::new(),
-            write_hls: false,
-        }
-    }
     /// Records `Execute` and writes a minimal valid HLS layout next to the
     /// playlist path ffmpeg would have produced. Used so encode tests do not
     /// spawn a real process.

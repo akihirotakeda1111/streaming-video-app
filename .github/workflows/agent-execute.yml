@@ -253,7 +253,7 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
       - name: Bootstrap Codex sandbox
-        uses: openai/codex-action@v1
+        uses: openai/codex-action@v1.11
         with:
           openai-api-key: unused-bootstrap-placeholder
           sandbox: workspace-write
@@ -278,6 +278,15 @@ jobs:
       - name: Stop E2E runtime
         if: ${{ always() && needs.parse-spec.outputs.e2e == 'true' }}
         run: docker compose -f app/compose.yaml down --volumes --remove-orphans || true
+
+      - name: Check artifact endpoint
+        run: |
+          echo "=== DNS ==="
+          getent hosts results-receiver.actions.githubusercontent.com || true
+
+          echo "=== HTTPS ==="
+          curl -v --connect-timeout 10 \
+            https://results-receiver.actions.githubusercontent.com/health || true
 
       - name: Upload work report
         id: upload-work-report

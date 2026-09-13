@@ -4,6 +4,7 @@ import { attachSafeDiagnostic, safeDiagnostic } from './diagnostics.js'
 import { withMp4Fixture, type VideoFixture } from './fixtures.js'
 import { urlEvidence } from './url-evidence.js'
 import { isSolePutToTarget, matchesTarget, putDestinations } from './upload-evidence.js'
+import { persistPlaybackEvidence } from './playback-evidence.js'
 
 interface NetworkEvidence {
   method: string
@@ -405,6 +406,7 @@ test.describe('@phase1-pipeline', () => {
     const statusResponses: Promise<StatusObservation>[] = []
     const playbackResponses: Promise<PlaybackObservation>[] = []
     const mediaNetworkFailures: MediaNetworkFailure[] = []
+    let passed = false
 
     page.on('response', (response) => {
       const method = response.request().method()
@@ -539,7 +541,7 @@ test.describe('@phase1-pipeline', () => {
                 const failed = observations.findLast((item) => item.status === 'FAILED')
                 throw new Error(
                   `pipeline reached FAILED: ${JSON.stringify(
-                    safeDiagnostic({ videoId, jobId, status: 'FAILED', failure: failed?.failure }),
+                    safeDiagnostic({ videoId, jobId, jobStatus: 'FAILED', failure: failed?.failure }),
                   )}`,
                 )
               }
@@ -613,8 +615,9 @@ test.describe('@phase1-pipeline', () => {
           uploadTarget,
         )
       })
+      passed = true
     } finally {
-      await attachSafeDiagnostic(testInfo, 'direct-upload-network', {
+      const network = {
         videoId,
         jobId,
         apiOrigin,
@@ -631,18 +634,18 @@ test.describe('@phase1-pipeline', () => {
             bodyBytes: response.bodyBytes,
           }),
         ),
-      })
-      await attachSafeDiagnostic(testInfo, 'pipeline-status', {
+      }
+      const pipeline = {
         videoId,
         jobId,
-        status: latestStatus,
+        jobStatus: latestStatus,
         observedStatuses,
-      })
+      }
       const mediaPrefix = mediaPathPrefix(videoId, jobId)
-      await attachSafeDiagnostic(testInfo, 'browser-playback', {
+      const playback = {
         videoId,
         jobId,
-        status: latestStatus,
+        jobStatus: latestStatus,
         manifestOrigin: playbackManifest?.origin,
         segmentCount: playbackEvidence?.segmentCount,
         readyState: playbackEvidence?.readyState,
@@ -650,7 +653,17 @@ test.describe('@phase1-pipeline', () => {
         currentTime: playbackEvidence?.currentTime,
         advancement: playbackEvidence?.advancement,
         failures: failuresForMedia(mediaNetworkFailures, playbackManifest, mediaPrefix),
-      })
+      }
+      const diagnostics = {
+        'direct-upload-network': network, 'pipeline-status': pipeline, 'browser-playback': playback,
+      }
+      try {
+        await persistPlaybackEvidence(diagnostics, passed)
+      } finally {
+        for (const [name, diagnostic] of Object.entries(diagnostics)) {
+          await attachSafeDiagnostic(testInfo, name, diagnostic)
+        }
+      }
     }
   })
 })

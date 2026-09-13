@@ -13,6 +13,7 @@ pub enum PublishError {
     Filesystem(io::Error),
     Storage(ObjectError),
     InvalidSegmentPath,
+    OwnershipLost,
 }
 
 impl fmt::Display for PublishError {
@@ -23,6 +24,7 @@ impl fmt::Display for PublishError {
             Self::InvalidSegmentPath => {
                 formatter.write_str("validated HLS segment has no filename")
             }
+            Self::OwnershipLost => formatter.write_str("lease ownership was lost"),
         }
     }
 }
@@ -50,6 +52,23 @@ pub async fn publish_hls<W: Write>(
     job_id: &str,
     output: &HlsOutput,
 ) -> Result<(), PublishError> {
+    publish_hls_with_checkpoint(storage, output_bucket, video_id, job_id, output, || true).await
+}
+
+/// Check ownership immediately before each upload, publishing the manifest last.
+/// This checkpoint cannot revoke an object write that is already in flight.
+pub async fn publish_hls_with_checkpoint<W, F>(
+    storage: &mut W,
+    output_bucket: &str,
+    video_id: &str,
+    job_id: &str,
+    output: &HlsOutput,
+    mut owned: F,
+) -> Result<(), PublishError>
+where
+    W: Write,
+    F: FnMut() -> bool,
+{
     let prefix = format!("videos/{video_id}/jobs/{job_id}/hls");
 
     for segment in &output.segments {
@@ -58,6 +77,10 @@ pub async fn publish_hls<W: Write>(
             .and_then(|name| name.to_str())
             .ok_or(PublishError::InvalidSegmentPath)?;
         let contents = tokio::fs::read(segment).await?;
+        if !owned() {
+            return Err(PublishError::OwnershipLost);
+        }
+        tracing::info!(operation = "segment_upload", outcome = "start", "media operation");
         storage
             .write(
                 output_bucket,
@@ -66,9 +89,15 @@ pub async fn publish_hls<W: Write>(
                 &contents,
             )
             .await?;
+        tracing::info!(operation = "segment_upload", outcome = "success", "media operation");
     }
 
     let playlist = tokio::fs::read(&output.playlist).await?;
+    if !owned() {
+        return Err(PublishError::OwnershipLost);
+    }
+
+    tracing::info!(operation = "manifest_upload", outcome = "start", "media operation");
     storage
         .write(
             output_bucket,
@@ -77,6 +106,7 @@ pub async fn publish_hls<W: Write>(
             &playlist,
         )
         .await?;
+    tracing::info!(operation = "manifest_upload", outcome = "success", "media operation");
     Ok(())
 }
 
@@ -104,6 +134,23 @@ mod tests {
                 segments: vec![segment_zero, segment_one],
             },
         )
+    }
+
+    #[tokio::test]
+    async fn ownership_loss_before_publication_uploads_nothing() {
+        let (_directory, output) = output();
+        let mut storage = FakeStorage::new(CallLog::default());
+        let result = publish_hls_with_checkpoint(
+            &mut storage,
+            "video-output",
+            VIDEO_ID,
+            JOB_ID,
+            &output,
+            || false,
+        )
+        .await;
+        assert!(matches!(result, Err(PublishError::OwnershipLost)));
+        assert!(storage.log.calls().is_empty());
     }
 
     #[tokio::test]
