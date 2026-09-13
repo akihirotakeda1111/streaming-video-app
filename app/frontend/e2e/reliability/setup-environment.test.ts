@@ -2,10 +2,11 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { setupEnvironment } from '../../../scripts/setup_reliability_env.mjs'
+import { main, setupEnvironment } from '../../../scripts/setup_reliability_env.mjs'
 
 const roots: string[] = []
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.unstubAllEnvs()
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
@@ -76,8 +77,9 @@ describe('Linux reliability setup orchestration', () => {
     expect(() => setupEnvironment({ ...f.options, 'start-services': true }, f.execute, f.discover)).toThrow('API/frontend startup')
     expect(process.env).toEqual(before)
   })
-  it('requires API credentials before starting any service', () => {
-    serviceCredentials(); vi.stubEnv('API_AWS_SECRET_ACCESS_KEY', '')
+  it.each(['WORKER_AWS_ACCESS_KEY_ID', 'WORKER_AWS_SECRET_ACCESS_KEY',
+    'API_AWS_ACCESS_KEY_ID', 'API_AWS_SECRET_ACCESS_KEY'])('requires %s before starting any service', (name) => {
+    serviceCredentials(); vi.stubEnv(name, '')
     const f = fixture()
     expect(() => setupEnvironment({ ...f.options, 'start-services': true }, f.execute, f.discover)).toThrow('service credentials')
     expect(f.execute).not.toHaveBeenCalled()
@@ -94,13 +96,24 @@ describe('Linux reliability setup orchestration', () => {
     setupEnvironment({ ...f.options, 'clock-skew-ms': undefined }, f.execute, f.discover)
     expect(f.discover.mock.calls[0][0]).toMatchObject({ clockSkewMs: '1000' })
   })
-  it.each([false, true])('loads settings with optional Worker startup: %s', (start) => {
+  it('rejects the removed Worker-only startup option before setup', () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    expect(main(['--start-worker', '--help'])).toBe(2)
+    expect(stderr).toHaveBeenCalledWith('Invalid setup arguments; use --help.\n')
+    expect(stdout).not.toHaveBeenCalled()
+  })
+  it('loads existing settings without starting services or requiring host-side service credentials', () => {
+    for (const role of ['WORKER', 'API']) {
+      vi.stubEnv(`${role}_AWS_ACCESS_KEY_ID`, '')
+      vi.stubEnv(`${role}_AWS_SECRET_ACCESS_KEY`, '')
+    }
     const f = fixture(), before = { ...process.env }
-    const result = setupEnvironment({ ...f.options, 'start-worker': start }, f.execute, f.discover)
+    const result = setupEnvironment(f.options, f.execute, f.discover)
     expect(result.E2E_VALID_FIXTURE).toBe(f.valid)
     expect(result.VIDEO_ENCODING_QUEUE_URL).toBe(f.runtime.VIDEO_ENCODING_QUEUE_URL)
     expect(f.execute.mock.calls[0][0]).toBe('terraform')
-    expect(f.execute.mock.calls.filter(([, args]) => args.includes('up'))).toHaveLength(start ? 1 : 0)
+    expect(f.execute.mock.calls.filter(([, args]) => args.includes('up'))).toHaveLength(0)
     expect(f.execute.mock.calls.every(([tool, args]) => tool !== 'docker' || args.slice(0, 2).join(' ') === '--host unix:///var/run/docker.sock')).toBe(true)
     expect(f.discover.mock.calls[0][0]).toMatchObject({ full: true, disposable: true, clockSkewMs: '100' })
     expect(process.env).toEqual(before)
@@ -118,11 +131,12 @@ describe('Linux reliability setup orchestration', () => {
     expect(f.discover).not.toHaveBeenCalled()
   })
   it.each(['unknown', 'newline', 'account'])('rejects invalid Terraform output: %s', (kind) => {
+    serviceCredentials()
     const f = fixture()
     if (kind === 'unknown') Object.assign(f.runtime, { PATH: 'untrusted' })
     if (kind === 'newline') f.runtime.AWS_REGION = 'us-east-1\nPATH=untrusted'
     if (kind === 'account') f.runtime.VIDEO_ENCODING_QUEUE_URL = f.runtime.VIDEO_ENCODING_QUEUE_URL.replace('123456789012', '999999999999')
-    expect(() => setupEnvironment({ ...f.options, 'start-worker': true }, f.execute, f.discover)).toThrow('Terraform output')
+    expect(() => setupEnvironment({ ...f.options, 'start-services': true }, f.execute, f.discover)).toThrow('Terraform output')
     expect(f.execute).toHaveBeenCalledTimes(1)
   })
   it.each(['npipe:////./pipe/docker_engine', 'tcp://remote:2375'])('rejects non-Linux or remote Docker endpoints: %s', (host) => {

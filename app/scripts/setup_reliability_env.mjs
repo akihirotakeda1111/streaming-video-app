@@ -16,7 +16,6 @@ export const RUNTIME_NAMES = [
 const HELP = `Use: source app/scripts/setup_reliability_env.sh [options]
 Required: --account ID --fixture PATH --invalid-fixture PATH
   --clock-skew-ms MS    Clock skew upper bound, 1..5000; default 1000 ms
-  --start-worker        Build/start Worker and dependencies after loading Terraform outputs
   --start-services      Build/start Worker, DB, API and frontend; wait for API/frontend health
   --terraform-directory PATH  Default: app/infra/terraform-e2e relative to this script
   --project NAME        Default: streaming-video-e2e
@@ -28,13 +27,13 @@ Required: --account ID --fixture PATH --invalid-fixture PATH
   --alarms A,B,C        Optional three alarm names
   --help               Show help without contacting services
 Requires Linux Node.js and Bash. Configure host/Worker/API credentials beforehand.
-Does not apply Terraform or run E2E. Startup options can recreate existing containers.
+Does not apply Terraform or run E2E. --start-services can recreate existing containers.
 `;
 
 /** @typedef {{account?: string, fixture?: string, 'invalid-fixture'?: string,
  * 'clock-skew-ms'?: string, 'terraform-directory'?: string, project?: string,
  * 'frontend-url'?: string, 'api-url'?: string, 'evidence-dir'?: string,
- * 'docker-host'?: string, profile?: string, alarms?: string, 'start-worker'?: boolean,
+ * 'docker-host'?: string, profile?: string, alarms?: string,
  * 'start-services'?: boolean}} SetupOptions */
 /** @param {SetupOptions} values
  * @param {import('./generate_reliability_env.mjs').CommandExecutor} [execute]
@@ -96,7 +95,7 @@ export function setupEnvironment(values, execute = execFileSync, discover = disc
     const childEnv = { ...process.env, ...runtime };
     const compose = ['--host', dockerHost, 'compose', '-p', project,
       '-f', resolve(scripts, '../compose.yaml'), '-f', resolve(scripts, '../compose.e2e.yaml')];
-    if (values['start-worker'] || values['start-services']) {
+    if (values['start-services']) {
       stage = 'Worker startup (check credentials and Compose configuration)';
       command('docker', [...compose, 'config', '--quiet'], childEnv);
       command('docker', [...compose, 'up', '--build', '-d', 'worker'], childEnv, 1800000);
@@ -139,7 +138,7 @@ export function main(args = process.argv.slice(2)) {
     const options = Object.fromEntries(['account', 'fixture', 'invalid-fixture', 'clock-skew-ms',
       'terraform-directory', 'project', 'frontend-url', 'api-url', 'evidence-dir', 'docker-host',
       'profile', 'alarms'].map(name => [name, { type: 'string' }]));
-    const { values } = parseArgs({ args, options: { ...options, 'start-worker': { type: 'boolean' },
+    const { values } = parseArgs({ args, options: { ...options,
       'start-services': { type: 'boolean' }, help: { type: 'boolean' } } });
     if (values.help) { process.stderr.write(HELP); return 0; }
     if (process.platform !== 'linux') { process.stderr.write('Use Linux Node.js inside WSL/Linux.\n'); return 2; }

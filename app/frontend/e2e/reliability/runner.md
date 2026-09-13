@@ -169,7 +169,6 @@ source app/scripts/setup_reliability_env.sh \
 | `--account` / `--fixture` / `--invalid-fixture` | 必須。フル実行用設定を生成する。テストは起動しない |
 | `--clock-skew-ms` | 時計ずれ上限。既定1000 ms、1〜5000 msの整数 |
 | `--start-services` | Worker・DB起動、設定生成、API・Frontend起動を一括実行。API・Frontendのhealthyを待ってから設定を反映 |
-| `--start-worker` | Terraform出力を渡してWorkerと依存DB・migrationを起動。省略時は起動済みコンテナを参照 |
 | `--terraform-directory` | スクリプト基準の `app/infra/terraform-e2e`。別stateの環境では変更 |
 | `--project` | Composeプロジェクト。既定は `streaming-video-e2e` |
 | `--frontend-url` / `--api-url` | 既定は `http://localhost:5173` / `http://localhost:8080` |
