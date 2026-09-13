@@ -97,32 +97,44 @@ where
             }
         }
 
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => break,
-            completed = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some(completed) = completed {
-                    record_completion(completed, &mut result);
-                    if result.is_err() {
-                        break 'receiving;
+        // A successful processor completion must not cancel ReceiveMessage:
+        // SQS may already have counted the receive and hidden the message.
+        // Keep the same request alive while reaping completed processors.
+        // Shutdown or a fatal error still cancels it; any accepted message
+        // remains undeleted and becomes available after visibility expires.
+        let receive = receiver.receive();
+        tokio::pin!(receive);
+        let received = loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break 'receiving,
+                completed = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(completed) = completed {
+                        record_completion(completed, &mut result);
+                        if result.is_err() {
+                            break 'receiving;
+                        }
                     }
                 }
+                received = &mut receive => break received,
             }
-            received = receiver.receive() => match received {
-                Ok(Some(message)) => {
-                    let mut message = message;
-                    message.delivery_id = Uuid::new_v4().to_string();
-                    let message_processor = processor.clone();
-                    let shutdown = processing_shutdown.clone();
-                    tasks.spawn(async move {
-                        message_processor.process_with_shutdown(message, shutdown).await
-                    });
-                }
-                Ok(None) => tokio::task::yield_now().await,
-                Err(error) => {
-                    result = Err(RunError::Receive(error));
-                    break;
-                }
+        };
+        match received {
+            Ok(Some(message)) => {
+                let mut message = message;
+                message.delivery_id = Uuid::new_v4().to_string();
+                let message_processor = processor.clone();
+                let shutdown = processing_shutdown.clone();
+                tasks.spawn(async move {
+                    message_processor
+                        .process_with_shutdown(message, shutdown)
+                        .await
+                });
+            }
+            Ok(None) => tokio::task::yield_now().await,
+            Err(error) => {
+                result = Err(RunError::Receive(error));
+                break;
             }
         }
     }
@@ -211,6 +223,89 @@ mod tests {
             receive_count: 1,
             visibility_deadline: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_processor_does_not_cancel_an_in_flight_receive() {
+        struct PendingReceive(Option<Arc<AtomicUsize>>);
+        impl Drop for PendingReceive {
+            fn drop(&mut self) {
+                if let Some(cancelled) = &self.0 {
+                    cancelled.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        struct DelayedReceiver {
+            calls: usize,
+            first_can_finish: Arc<Notify>,
+            cancelled: Arc<AtomicUsize>,
+        }
+        impl Receive for DelayedReceiver {
+            async fn receive(&mut self) -> Result<Option<Message>, QueueError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(Some(message("first"))),
+                    2 => {
+                        // SQS has accepted this request, but its response has
+                        // not arrived when the previous processor completes.
+                        let mut pending = PendingReceive(Some(self.cancelled.clone()));
+                        self.first_can_finish.notify_one();
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        pending.0 = None;
+                        Ok(Some(message("second")))
+                    }
+                    _ => std::future::pending().await,
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct Processor {
+            first_can_finish: Arc<Notify>,
+            recorded: Arc<std::sync::Mutex<Vec<String>>>,
+            second_processed: Arc<Notify>,
+        }
+        impl MessageProcessor for Processor {
+            type Error = Infallible;
+            async fn process(&self, message: Message) -> Result<(), Self::Error> {
+                if message.body == "first" {
+                    self.first_can_finish.notified().await;
+                }
+                self.recorded.lock().unwrap().push(message.body.clone());
+                if message.body == "second" {
+                    self.second_processed.notify_one();
+                }
+                Ok(())
+            }
+        }
+
+        let first_can_finish = Arc::new(Notify::new());
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let second_processed = Arc::new(Notify::new());
+        let receiver = DelayedReceiver {
+            calls: 0,
+            first_can_finish: first_can_finish.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let processor = Processor {
+            first_can_finish,
+            recorded: recorded.clone(),
+            second_processed: second_processed.clone(),
+        };
+        let (stop, shutdown) = watch::channel(false);
+        let task = tokio::spawn(run(receiver, processor, shutdown, 2));
+        let delivered =
+            tokio::time::timeout(Duration::from_secs(2), second_processed.notified()).await;
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+        assert!(
+            delivered.is_ok(),
+            "the pending response must reach its processor"
+        );
+        assert_eq!(*recorded.lock().unwrap(), ["first", "second"]);
     }
 
     #[tokio::test]
