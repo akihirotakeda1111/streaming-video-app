@@ -18,8 +18,8 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | シナリオ | `*.spec.ts`、driver、adapter | 事前確認後に操作・観測・検証・run単位のcleanupを実施 |
 | 診断 | `transport-diagnostics.ts`、`../diagnostics.ts` | 固定原因分類と秘密情報を除外した証跡 |
 
-設定の流れは **AWS準備 → Compose入力と認証設定 → コンテナ起動 → E2E設定生成・読み込み → 事前確認 → シナリオ実行**。
-設定生成だけではシェルも起動済みコンテナも更新されない。事前確認成功もシナリオ成功の代わりにはならない。
+設定の流れは **AWS・認証・fixtureの準備 → 統合セットアップ → 事前確認 → シナリオ実行**。
+統合セットアップは `--start-services` でコンテナ起動と設定の読み込みを行う。事前確認成功もシナリオ成功の代わりにはならない。
 
 ### シナリオと検証範囲
 
@@ -98,20 +98,52 @@ state・plan・実値tfvarsはコミットせず、provider lockファイルは�
 
 ### 起動前の接続先と認証
 
-ホスト用とWorker用の認証を分ける。`AWS_PROFILE` だけではWorkerに認証情報は渡らない。
+ホスト用・Worker用・API用の認証を分ける。`AWS_PROFILE` だけではWorkerやAPIに認証情報は渡らない。
 
 | 用途 | 起動元シェルの変数 | 設定元・注意点 |
 | --- | --- | --- |
-| 接続先 | `AWS_REGION`、`VIDEO_ENCODING_QUEUE_URL`、`VIDEO_INPUT_BUCKET`、`VIDEO_OUTPUT_BUCKET` | E2E専用Terraform output、または既存専用リソースの実値 |
+| 接続先 | `AWS_REGION`、`VIDEO_ENCODING_QUEUE_URL`、`VIDEO_INPUT_BUCKET`、`VIDEO_OUTPUT_BUCKET` | 統合セットアップがE2E専用Terraform outputから反映 |
 | Worker認証 | `WORKER_AWS_ACCESS_KEY_ID`、`WORKER_AWS_SECRET_ACCESS_KEY` | Worker用principalの認証。Composeがコンテナ内の `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` に渡す |
 | Worker一時認証 | `WORKER_AWS_SESSION_TOKEN` | 一時認証なら必須。長期キーの場合は古いtokenを残さない |
+| API認証 | `API_AWS_ACCESS_KEY_ID`、`API_AWS_SECRET_ACCESS_KEY` | API用principalの認証。Composeがコンテナ内の `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` に渡す |
+| API一時認証 | `API_AWS_SESSION_TOKEN` | 一時認証なら必須。長期キーの場合は古いtokenを残さない |
 | ホスト認証 | `AWS_PROFILE`、または `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / 必要なら `AWS_SESSION_TOKEN` | 設定生成・実体確認・アップロード・cleanup用。provisionerからrunner用へ切り替える |
 | DB | `POSTGRES_DB`、`POSTGRES_USER`、`POSTGRES_PASSWORD`、`COMPOSE_DATABASE_URL` | 既定値を使用可能。変更時は整合させ、コンテナ内の接続先は `postgres:5432` |
+
+認証は手動で用意する。Terraformはキーを発行しない。使用するWorker・APIユーザーとrunnerポリシーは次で確認できる。
+
+```text
+terraform -chdir=app/infra/terraform-e2e output worker_identity
+terraform -chdir=app/infra/terraform-e2e output api_identity
+terraform -chdir=app/infra/terraform-e2e output runner_policy_arn
+```
+
+runner policyはホスト側principalへ手動付与する。専用DLQに限定した `sqs:ReceiveMessage` を含む。source queueのReceive、queueのDelete/Purge、DLQ replay、Terraform適用権限は含まない。既存環境では更新したrunner policyを人手で適用してからFFmpeg exhaustionを実行する。
+CloudWatch DescribeAlarmsは設定生成の一覧取得に必要なため読み取りの `Resource=*` を使用する。
+AWS認証情報は生成ファイル・tfvars・Git管理ファイルに追記しない。WorkerのDATABASE_URLもコピー不要。
+
+WSLで秘密値を履歴・画面に出さず設定する例:
+
+```bash
+export AWS_PROFILE='<E2E runner用プロファイル名>'
+aws sts get-caller-identity
+read -rsp 'Worker access key ID: ' WORKER_AWS_ACCESS_KEY_ID; printf '\n'
+read -rsp 'Worker secret access key: ' WORKER_AWS_SECRET_ACCESS_KEY; printf '\n'
+read -rsp 'Worker session token (長期キーなら空欄): ' WORKER_AWS_SESSION_TOKEN; printf '\n'
+export WORKER_AWS_ACCESS_KEY_ID WORKER_AWS_SECRET_ACCESS_KEY WORKER_AWS_SESSION_TOKEN
+read -rsp 'API access key ID: ' API_AWS_ACCESS_KEY_ID; printf '\n'
+read -rsp 'API secret access key: ' API_AWS_SECRET_ACCESS_KEY; printf '\n'
+read -rsp 'API session token (長期キーなら空欄): ' API_AWS_SESSION_TOKEN; printf '\n'
+export API_AWS_ACCESS_KEY_ID API_AWS_SECRET_ACCESS_KEY API_AWS_SESSION_TOKEN
+```
+
+ホスト認証が有効でもWorker認証が空・期限切れならWorkerは処理できない。
+API認証も別途必要で、空・期限切れならAPIからのS3操作は成功しない。統合セットアップを実行する同じシェルで、Worker用・API用の両方を設定する。
 
 ### WSL / Linux：Terraform出力からE2E設定まで一括反映
 
 `app/scripts/setup_reliability_env.sh` を **E2Eを実行するBashでsource** すると、「Terraform出力の読み込み」と「設定生成・読み込み」が1回で完了する。
-Linux版Node.js、Terraform、AWS CLI、Docker Composeを使用する。統合スクリプトではjqは不要。
+Linux版Node.js、Terraform、AWS CLI、Docker Composeを使用する。
 AWS環境、ホスト・Worker・API認証、正常MP4、不正MP4は事前に用意する。APIには `API_AWS_ACCESS_KEY_ID` / `API_AWS_SECRET_ACCESS_KEY`、一時認証なら `API_AWS_SESSION_TOKEN` を設定する。
 時計ずれ上限の既定値は1000 ms。実環境に合わせて `--clock-skew-ms` で変更できる。使い捨てのE2E環境で実行する。
 
@@ -127,7 +159,7 @@ source app/scripts/setup_reliability_env.sh \
 ```
 
 実行順はTerraform `compose_environment` 取得 → 子プロセスへの設定 → Compose検査・Worker/DB起動 → コンテナID取得 → Worker実効値とTerraform出力の照合 → E2E設定生成 → 生成設定でAPI・Frontend起動 → ヘルスチェック完了待ち（最大120秒） → 現在のBashへ一括反映。
-成功後は以下の手動のTerraform読み込み・Worker起動・設定生成を重ねて行わず、「実行手順」へ進む。
+成功後は同じシェルで「実行手順」へ進む。
 
 全サービスが既に正しい設定で起動済みなら `--start-services` を省略して設定だけ読み込める。接続先や時間設定がTerraform出力と異なる場合は停止する。
 `--start-services` はビルド・起動を行うため、変更内容によって既存コンテナが再作成される場合がある。E2E実行中は使用しない。API・Frontendの起動段階では `--no-deps` を指定し、設定生成で取得したWorker・DBのIDを維持する。
@@ -160,8 +192,6 @@ python app/scripts/run_reliability_e2e.py --scenario preflight &&
 python app/scripts/run_reliability_e2e.py --full
 ```
 
-Terraformを使わない場合は、接続先を手動設定した上で後述の個別の設定生成手順を使用する。
-
 統合スクリプトのオフライン検証（AWS・Dockerは操作しない）:
 
 ```bash
@@ -169,71 +199,16 @@ bash app/frontend/e2e/reliability/setup-env-checks.sh
 npm --prefix app/frontend run test:e2e:helpers -- reliability/setup-environment.test.ts
 ```
 
-### Terraform出力を個別に読み込む場合
-
-Terraform outputから非機密のCompose入力とWorker時間設定を読み込む。
-
-<details>
-<summary>Terraform出力の読み込み（使用するシェルだけ実行）</summary>
-
-WSL / Bash（jqが必要）:
-
-```bash
-load_runtime() {
-  local runtime_json entries entry
-  runtime_json=$(terraform -chdir=app/infra/terraform-e2e output -json compose_environment) || return 1
-  entries=$(printf '%s' "$runtime_json" | jq -r 'to_entries[] | "\(.key)=\(.value)"') || return 1
-  while IFS= read -r entry; do export "$entry"; done <<< "$entries"
-}
-load_runtime || echo 'Terraform output failed; 起動せず設定を確認してください' >&2
-```
-
-</details>
-
-Terraformを使わない場合は上表の接続先を手動設定する。例: `export VIDEO_ENCODING_QUEUE_URL='https://sqs.ap-northeast-1.amazonaws.com/<account>/専用キュー名'`。
-開発用 `.env` やシェルに残った通常環境の接続先を引き継がない。
-
-認証は手動で用意する。Terraformはキーを発行しない。使用するWorkerユーザーとrunnerポリシーは次で確認できる。
-
-```text
-terraform -chdir=app/infra/terraform-e2e output worker_identity
-terraform -chdir=app/infra/terraform-e2e output runner_policy_arn
-```
-
-runner policyはホスト側principalへ手動付与する。専用DLQに限定した `sqs:ReceiveMessage` を含む。source queueのReceive、queueのDelete/Purge、DLQ replay、Terraform適用権限は含まない。既存環境では更新したrunner policyを人手で適用してからFFmpeg exhaustionを実行する。
-CloudWatch DescribeAlarmsは設定生成の一覧取得に必要なため読み取りの `Resource=*` を使用する。
-AWS認証情報は生成ファイル・tfvars・Git管理ファイルに追記しない。WorkerのDATABASE_URLもコピー不要。
-
-WSLで秘密値を履歴・画面に出さず設定する例:
-
-```bash
-export AWS_PROFILE='<E2E runner用プロファイル名>'
-aws sts get-caller-identity
-read -rsp 'Worker access key ID: ' WORKER_AWS_ACCESS_KEY_ID; printf '\n'
-read -rsp 'Worker secret access key: ' WORKER_AWS_SECRET_ACCESS_KEY; printf '\n'
-read -rsp 'Worker session token (長期キーなら空欄): ' WORKER_AWS_SESSION_TOKEN; printf '\n'
-export WORKER_AWS_ACCESS_KEY_ID WORKER_AWS_SECRET_ACCESS_KEY WORKER_AWS_SESSION_TOKEN
-```
-
-ホスト認証が有効でもWorker認証が空・期限切れならWorkerは処理できない。
-
-### Docker環境と起動
+### Docker環境の要件
 
 ローカルのLinux Engineに直接接続する。既定ソケットは `unix:///var/run/docker.sock`。
 リモート接続・authorization plugin・共有ストレージは未対応。設定生成はDocker contextを推測しない。
 必要なら `--docker-host` で実際のローカルソケットを指定する。
 
-```text
-docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml config --quiet
-docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up --build -d worker
-docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps
-```
-
-この起動ではWorkerと依存するDB・migrationだけが対象。API/Frontendが必要なシナリオでは追加起動し、公開ポート・URL・CORSも準備する。
 Workerの再起動ポリシーは専用overrideで `no` にする。通常の `app/compose.yaml` 単独では `unless-stopped` を維持する。
 `start-e2e-compose.sh` は通常Compose全体を起動するため、専用overrideの代用にはしない。
 DB名は `streaming-video-e2e-postgres`、volume名は `streaming-video-e2e-postgres-data`。DBホスト公開ポートは除去される。
-`-p` を変えると名前・scopeも変わる。全操作で同じプロジェクト名と2ファイルを指定する。
+`--project` を変えると名前・scopeも変わる。再実行時も同じプロジェクト名を指定する。
 AWSリソースはComposeで分離されないため、他consumerと共有しない専用キュー・バケットを指定する。
 
 共通事前確認が求める条件:
@@ -248,74 +223,21 @@ AWSリソースはComposeで分離されないため、他consumerと共有し�
 ラベルだけで専有を証明したとは扱わない。事前確認はvolume利用者・ネットワーク・完全ID・開始時刻・Engine IDを検査する。
 コンテナ制御能力の確認は接続条件に基づき、実際のstop/startや再起動成功の保証は行わない。
 
-起動後に接続先・認証を変更した場合、テストが終了していることを確認してWorkerを再作成する。
+接続先・認証を変更した場合は、E2Eの終了後に同じオプションと `--start-services` で統合セットアップを再実行する。コンテナを再作成した場合も、統合セットアップで現在のIDを読み込む。
 
-```text
-docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up -d --no-deps --force-recreate worker
-```
-
-IDが変わるためE2E設定を再生成・再読込する。`VIDEO_ENCODING_QUEUE_URL` と `E2E_SOURCE_QUEUE`、各VIDEOバケットとE2Eバケットは同じ対象である必要がある。
-
-### E2E設定の生成と読み込み
+### 自動生成される設定
 
 生成処理はAWS CLI認証を使い、既存ラベル・Worker実効値・STS・sourceのRedrivePolicy・DLQ・アラームを読み取る。
 取得失敗・値の不整合・複数のアラーム候補はエラーにする。各コマンド10秒、全体120秒、応答4 MiBが上限。
 バケット・SQS・アラームの作成、認証値の出力、シナリオ実行は行わない。
 
-統合スクリプトを実行済みなら、この節の個別手順は不要。個別に生成する場合は使用するシェルの手順だけ実行し、同じシェルで「実行手順」へ進む。
-コンテナを再作成した場合は再生成・再読込する。
-
-<details>
-<summary>WSL / Bash：設定生成・読み込み</summary>
-
-Terraformを使わず設定を個別に生成する場合は、取得関数のJSONを読み込む（この手動手順ではjqが必要）。
-
-```bash
-worker_id=$(docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q worker)
-db_id=$(docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q postgres)
-# 専用・破棄可能環境であることを確認してから実行。アカウントとfixtureを実値へ置換
-load_e2e() {
-  local settings entries entry
-  settings=$(node --input-type=module - "$worker_id" "$db_id" '123456789012' "$HOME/e2e/fixtures/test.mp4" "$HOME/e2e/fixtures/invalid.mp4" '1000' <<'JS'
-import { discoverEnvironment } from './app/scripts/generate_reliability_env.mjs'
-const [worker, database, account, fixture, invalidFixture, clockSkewMs] = process.argv.slice(2)
-try {
-  const env = discoverEnvironment({ worker, database, account, fixture, invalidFixture, clockSkewMs, disposable: true, full: true, frontendUrl: 'http://localhost:5173', apiUrl: 'http://localhost:8080' })
-  console.log(JSON.stringify(env))
-} catch { console.error('E2E設定生成失敗。認証・接続先・ラベル・アラーム・fixture・時計ずれの入力を確認してください'); process.exitCode = 2 }
-JS
-  ) || return 1
-  entries=$(printf '%s' "$settings" | jq -r 'to_entries[] | "\(.key)=\(.value)"') || return 1
-  while IFS= read -r entry; do export "$entry"; done <<< "$entries"
-}
-load_e2e || echo '設定生成失敗。後続の実行を止めて確認してください' >&2
-```
-
-</details>
-
-フル実行用に生成すると、正常・不正fixture、時計ずれ、`E2E_PROJECT=chromium`、全共通設定が同じファイル/JSONに揃う。
-統合スクリプトまたは個別の生成JSONを読み込んだ後、これらを個別にexportし直す必要はない。
+統合セットアップは正常・不正fixture、時計ずれ、`E2E_PROJECT=chromium`、全共通設定を現在のシェルへ反映する。
 fixture検査はファイル形式・サイズの条件のみで、正常動画としての再生可否・encode時間や、実FFmpegでの失敗は保証しない。
 API/Frontend用のバケット、出力S3 endpoint、許可origin、API接続先、公開ポートも生成する。`--start-services` は生成設定でAPI/Frontendの起動まで行う。認証とS3 CORS、ホストFFmpeg、Chromiumのインストールは別途必要。秘密情報は生成ファイルへ含めない。
 `E2E_RUN_ID` と監視の先行run IDはフルrunnerが設定するため、生成設定には含めない。
 
 生成JSON・コマンドはいずれも非機密設定だけだが、環境固有の値なのでGitにはコミットしない。
 認証を別シェルで使う場合は、そのシェルでも既存AWS CLIログイン・認証変数を手動設定する。
-
-| 生成時の指定 | 省略時・用途 |
-| --- | --- |
-| `--worker` / `--database` | 必須。DB名ではなくコンテナ名またはID |
-| `--account` | 推奨。STSアカウントと照合。省略時はSTS値を使用 |
-| `--profile` | 任意の既存AWSプロファイル名。秘密情報は受け付けない |
-| `--docker-host` | DOCKER_HOST、なければOS別ローカルソケット |
-| `--frontend-url` / `--api-url` | 既定は `http://127.0.0.1:5173` / `http://127.0.0.1:8000`。自動検出・稼働確認ではない |
-| `--evidence-dir` | カレントディレクトリの `artifacts/reliability-e2e` を絶対パス化 |
-| `--fixture` | `E2E_VALID_FIXTURE`。正常MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
-| `--invalid-fixture` | `E2E_INVALID_FIXTURE`。不正MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
-| `--clock-skew-ms` | `E2E_CLOCK_SKEW_MS`。既定1000 ms、1〜5000 msの整数。lease/visibilityとの余裕も確認 |
-| `--full` | 正常・不正fixtureの2引数を必須にする。正常・不正fixtureに同じパスを指定した場合もエラー。省略時は不足値を空欄として生成 |
-| `--disposable` | 破棄可能環境であるという利用者の確認。省略時は `E2E_RELIABILITY_DISPOSABLE` が空欄 |
-| `--alarms A,B,C` | 候補が重複・多数ある場合に実際の3アラーム名を指定 |
 
 <details>
 <summary>設定値・待機時間の詳細（調整時に参照）</summary>
@@ -339,7 +261,7 @@ API/Frontend用のバケット、出力S3 endpoint、許可origin、API接続先
 | `E2E_EVIDENCE_DIR` | 書き込み可能な絶対パス。親ディレクトリ参照 `..` は不可 |
 
 `E2E_RUN_ID` と `E2E_INCLUDE_RELIABILITY` はrunnerが設定する。`.env` はPlaywright/runnerでは自動読込しない。
-全7種類の `E2E_*_TIMEOUT_MS` は1〜900000の整数（ミリ秒）で明示設定が必要。生成値は次のとおり。
+全7種類の `E2E_*_TIMEOUT_MS` は統合セットアップが設定する。値は1〜900000の整数（ミリ秒）で、生成値は次のとおり。
 
 | 時間設定 | 生成値・照合 |
 | --- | --- |
@@ -418,32 +340,9 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 
 ### ブラウザ使用シナリオの追加準備
 
-`preflight` と最終 `@phase1-pipeline` には、Worker/DBに加えてAPI・Frontendを起動する。`--start-services` によるセットアップ済みなら追加のCompose起動は不要。以下は個別に準備する場合の手順。
+`preflight` と最終 `@phase1-pipeline` は、統合セットアップの `--start-services` で起動したAPI・Frontendを使用する。
+ブラウザが開くFrontend originはTerraformの `frontend_origin` と一致させる。`localhost` と `127.0.0.1` は別origin。必要なAWS変更は共通準備のplan確認手順で行う。
 
-1. API用principalの認証を `API_AWS_ACCESS_KEY_ID` / `API_AWS_SECRET_ACCESS_KEY`、一時認証なら `API_AWS_SESSION_TOKEN` に設定する。Worker用・ホスト用の認証設定だけではAPIに渡らない。APIは同じDB、`VIDEO_INPUT_BUCKET` / `VIDEO_OUTPUT_BUCKET`、regionを参照させる。
-2. 生成設定を読み込む。`--frontend-url` / `--api-url` からComposeの公開ポートも生成する。生成器のAPI URL既定は8000なので、8080で公開する場合は `--api-url http://localhost:8080` を指定する。ComposeはHTTPで配信するため、HTTPSのURLを使う場合は別途proxyの設定が必要。
-3. APIの `FRONTEND_ORIGIN`、Terraformの `frontend_origin` によるS3 CORS、ブラウザが開くFrontend originを一致させる。`localhost` と `127.0.0.1` は別origin。必要なAWS変更は共通準備のplan確認手順で行う。
-
-生成設定には次の起動用変数が含まれるため、個別設定は不要。既存専用環境のS3 CORSと異なる場合は、その環境のoriginを生成時に指定する。
-
-| 変数 | 生成元・値 |
-| --- | --- |
-| `AWS_REGION` | Workerのリージョン |
-| `VIDEO_INPUT_BUCKET` / `VIDEO_OUTPUT_BUCKET` | Workerと同じ入力・出力バケット |
-| `OUTPUT_S3_ENDPOINT` | `https://<出力バケット>.s3.<リージョン>.amazonaws.com` |
-| `FRONTEND_ORIGIN` | `--frontend-url` のorigin |
-| `VITE_API_BASE_URL` | `--api-url` に `/api/v1` を追加 |
-| `API_PORT` / `FRONTEND_PORT` | 指定URLのポート（省略時はHTTP 80 / HTTPS 443） |
-
-API必須の `HTTP_ADDR` と既定の `DATABASE_URL` はComposeが設定する。DB設定を変更している場合は既存DBに合う `COMPOSE_DATABASE_URL` を別途設定する。APIのAWS認証情報は上記1のとおり手動設定する。
-
-```text
-docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up --build -d api frontend
-docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps
-node app/frontend/node_modules/@playwright/test/cli.js install chromium
-```
-
-API・Frontendがhealthyになり、同じ専用Worker/DBが維持されていることを確認する。再生成時も `--frontend-url http://localhost:5173 --api-url http://localhost:8080` を指定してURLの不一致を戻さない。
 ホストFFmpegは `libx264` を利用可能にする。`FFMPEG_PATH` を指定する場合はホストで実行できるパスを使い、Workerコンテナ内パスを流用しない。
 通常はブラウザを表示するため、WSL等では表示環境も必要。`CI` 設定時はheadlessになる。
 最終再生では公開HTTPSのHLS manifest/segmentをブラウザから取得でき、適切なContent-TypeとCORS応答が必要。
@@ -473,11 +372,7 @@ python app/scripts/run_reliability_e2e.py --scenario runtime-authorization
 
 **追加条件：** データ作成シナリオ共通条件に加え、正常なMP4でencode中のbusy配送を観測できること。
 
-| 設定 | Bashの例 |
-| --- | --- |
-| 正常fixture | `export E2E_VALID_FIXTURE='/home/user/e2e/long.mp4'` |
-
-生成済み設定に正しい値が入っていれば再設定は不要。
+正常MP4は統合セットアップの `--fixture` で指定する。
 
 ```text
 python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery
@@ -496,9 +391,7 @@ python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery
 - `E2E_PROCESSING_TIMEOUT_MS > 2 × heartbeat間隔(ms)`、`E2E_MAX_ATTEMPTS >= 2`。
 - 保持される同一Workerコンテナをstop/startできること。restart policyは `no`。DBは停止しない。
 
-| 設定例（実測した上限に置換） | Bash |
-| --- | --- |
-| 時計ずれ上限1000 ms | `export E2E_CLOCK_SKEW_MS='1000'` |
+時計ずれの実測上限は統合セットアップの `--clock-skew-ms` で指定する。
 
 ```text
 python app/scripts/run_reliability_e2e.py --scenario crash-recovery
@@ -530,9 +423,7 @@ python app/scripts/run_reliability_e2e.py --scenario long-heartbeat
 node -e "require('node:fs').writeFileSync('invalid.mp4', 'not an mp4', {flag:'wx'})"
 ```
 
-| 設定 | Bash |
-| --- | --- |
-| 不正fixtureの絶対パス | `export E2E_INVALID_FIXTURE="$(pwd)/invalid.mp4"` |
+不正MP4は統合セットアップ前に作成し、`--invalid-fixture` で指定する。
 
 Workerとsourceキューの試行上限・retry設定を一致させ、全試行・DLQ到達・到達後の安定観測を待てる予算にする。
 全シナリオ共通のretry 10秒・試行上限3回を使う。旧環境のretry 900秒が残っている場合は、後述の固定設定への移行を先に行う。
@@ -658,13 +549,7 @@ terraform -chdir=app/infra/terraform-e2e plan -out=e2e.tfplan
 terraform -chdir=app/infra/terraform-e2e apply e2e.tfplan
 ```
 
-共通準備の手順で `compose_environment` を再読込し、Worker認証を設定したシェルでWorkerを再作成する。
-
-```text
-docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml up -d --no-deps --force-recreate worker
-```
-
-ホスト認証をrunner用に戻し、E2E設定を再生成・再読込して共通事前確認を行う。
+ホスト認証をrunner用に戻し、Worker・API認証を設定したシェルで、同じオプションと `--start-services` を指定して統合セットアップを再実行する。その後、共通事前確認を行う。
 ファイルを更新しただけではSQSや起動済みWorkerの設定は変わらない。ホストのE2E変数だけを変更して整合を取らない。
 既存通知の受信回数もリセットされないため、保持runは証跡のIDで確認する。queue purgeやDLQ自動replayは行わない。
 
