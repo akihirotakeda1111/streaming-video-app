@@ -11,6 +11,7 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | --- | --- | --- |
 | AWS環境 | `app/infra/terraform-e2e/` | 既存Terraformを再利用し、専用S3・SQS/DLQ・通知・3アラーム・IAMを作成 |
 | ローカル実行環境 | `app/compose.yaml` + `app/compose.e2e.yaml` | 専用プロジェクト・DB volume・ラベル。Worker、DB、migrationは既存定義を再利用 |
+| 設定統合（Bash） | `app/scripts/setup_reliability_env.sh` + `.mjs` | Terraform出力を読み込み、必要ならWorkerを起動してE2E設定を現在のシェルへ反映 |
 | 設定生成 | `app/scripts/generate_reliability_env.mjs` | AWS/Docker実効値から非機密の環境設定を生成。秘密情報は出力しない |
 | 共通事前確認 | `safety.mjs`、`live.mjs` | 設定形式とAWS/Dockerの実体・所有範囲を確認。プロセス操作やリモート書き込みは行わない |
 | 実行入口 | `app/scripts/run_reliability_e2e.py` | 検証、証跡ディレクトリ作成、実装済みシナリオ選択、Playwright起動 |
@@ -47,10 +48,10 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 
 ### ツールと実行場所
 
-コマンドはリポジトリルートで実行する。特記のないコマンドは **Windows（PowerShell）・WSL（Bash）共通**。
+コマンドはリポジトリルートで実行する。本ガイドは **WSL / LinuxのBash** を対象とする。
 1行ずつ実行し、失敗した場合は後続へ進まない。
 Python、Node.js、npm、npx、FFmpeg、AWS CLI、Dockerが必要。WSLでPythonのコマンド名が `python3` の場合は、以下の `python` を読み替える。
-TerraformはAWS環境を作成・削除する場合だけ必要（>=1.6、mockテストは>=1.7）。
+TerraformはAWS環境の作成・削除とTerraform出力の読み込みに必要（>=1.6、mockテストは>=1.7）。
 Docker Composeは `!reset` 対応版を使用する。構成確認はv2.35.1で実施している。
 
 ```text
@@ -58,7 +59,7 @@ npm --prefix app/frontend ci --include=dev
 node app/frontend/node_modules/@playwright/test/cli.js --version
 ```
 
-依存関係はテストを実行するOS側にインストールする。Docker内やWindows側のnode_modulesはWSL側の代用にならない。
+依存関係はE2Eを実行するLinux側にインストールする。Docker内のnode_modulesはホスト側の代用にならない。
 WSLではLinux版Nodeを使い、`node -p 'process.platform'` が `linux` であることを確認する。
 ブラウザを使用するシナリオでは、別途Playwrightの対象ブラウザをインストールする。
 
@@ -74,9 +75,9 @@ outputのHLSパスは既存構成と同じ公開読み取り方式。アカウ�
 `aws_account_id` を想定アカウントIDへ変更する。必要なら `aws_region` / `instance` も変更する。
 プロファイル設定だけは使用するシェルに合わせる。
 
-| 設定 | Windows / PowerShell | WSL / Bash |
-| --- | --- | --- |
-| 構築用プロファイル | `$env:AWS_PROFILE = 'e2e-provisioner'` | `export AWS_PROFILE='e2e-provisioner'` |
+| 設定 | WSL / Bash |
+| --- | --- |
+| 構築用プロファイル | `export AWS_PROFILE='e2e-provisioner'` |
 
 ```text
 terraform -chdir=app/infra/terraform-e2e init
@@ -107,21 +108,61 @@ state・plan・実値tfvarsはコミットせず、provider lockファイルは�
 | ホスト認証 | `AWS_PROFILE`、または `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / 必要なら `AWS_SESSION_TOKEN` | 設定生成・実体確認・アップロード・cleanup用。provisionerからrunner用へ切り替える |
 | DB | `POSTGRES_DB`、`POSTGRES_USER`、`POSTGRES_PASSWORD`、`COMPOSE_DATABASE_URL` | 既定値を使用可能。変更時は整合させ、コンテナ内の接続先は `postgres:5432` |
 
+### WSL / Linux：Terraform出力からE2E設定まで一括反映
+
+`app/scripts/setup_reliability_env.sh` を **E2Eを実行するBashでsource** すると、「Terraform出力の読み込み」と「設定生成・読み込み」が1回で完了する。
+Linux版Node.js、Terraform、AWS CLI、Docker Composeを使用する。統合スクリプトではjqは不要。
+AWS環境、ホスト・Worker認証、正常MP4、不正MP4は事前に用意する。
+時計ずれの上限は実環境を確認して指定する（100 msは例）。使い捨てのE2E環境で実行する。
+
+リポジトリルートからの初回実行例:
+
+```bash
+source app/scripts/setup_reliability_env.sh \
+  --account 123456789012 \
+  --fixture "$HOME/e2e/long.mp4" \
+  --invalid-fixture "$HOME/e2e/invalid.mp4" \
+  --clock-skew-ms 100 \
+  --start-worker
+```
+
+実行順はTerraform `compose_environment` 取得 → 子プロセスへの設定 → Compose検査・Worker/DB起動 → コンテナID取得 → Worker実効値とTerraform出力の照合 → E2E設定生成 → 現在のBashへ一括反映。
+成功後は以下の手動のTerraform読み込み・Worker起動・設定生成を重ねて行わず、「実行手順」へ進む。
+
+Worker/DBが既に起動済みなら `--start-worker` を省略する。接続先や時間設定がTerraform出力と異なる場合は停止する。
+`--start-worker` は `docker compose up --build -d worker` を行うため、変更内容によって既存Workerが再作成される場合がある。E2E実行中は使用しない。
+
+| オプション | 用途・既定値 |
+| --- | --- |
+| `--account` / `--fixture` / `--invalid-fixture` / `--clock-skew-ms` | 必須。フル実行用設定を生成する。テストは起動しない |
+| `--start-worker` | Terraform出力を渡してWorkerと依存DB・migrationを起動。省略時は起動済みコンテナを参照 |
+| `--terraform-directory` | スクリプト基準の `app/infra/terraform-e2e`。別stateの環境では変更 |
+| `--project` | Composeプロジェクト。既定は `streaming-video-e2e` |
+| `--frontend-url` / `--api-url` | 既定は `http://localhost:5173` / `http://localhost:8080` |
+| `--evidence-dir` | カレントディレクトリ基準の `artifacts/reliability-e2e` |
+| `--docker-host` | DOCKER_HOST、未設定なら `unix:///var/run/docker.sock`。Composeと設定生成で共通使用。ローカルLinuxソケットのみ対応 |
+| `--profile` | 設定生成のrunner用AWSプロファイル。Terraform出力取得は起動元シェルのAWS認証を使用 |
+| `--alarms` | 必要な場合のみ3つのアラーム名をカンマ区切りで指定 |
+| `--help` | 外部サービスに接続せずヘルプ表示 |
+
+`bash app/scripts/setup_reliability_env.sh ...` の直接実行は、親シェルへ設定を反映できないためエラーにする。必ず `source` を使う。
+生成値をシェルコードとして評価せず、値としてexportする。失敗時は非ゼロを返し、呼び出し元の環境変数は変更しない。
+起動済みのコンテナは維持する。Terraform apply、認証情報の発行・設定、API/Frontend起動、ブラウザ導入、事前確認、E2E実行は別途必要。
+Terraformを使わない場合は、接続先を手動設定した上で後述の個別の設定生成手順を使用する。
+
+統合スクリプトのオフライン検証（AWS・Dockerは操作しない）:
+
+```bash
+bash app/frontend/e2e/reliability/setup-env-checks.sh
+npm --prefix app/frontend run test:e2e:helpers -- reliability/setup-environment.test.ts
+```
+
+### Terraform出力を個別に読み込む場合
+
 Terraform outputから非機密のCompose入力とWorker時間設定を読み込む。
 
 <details>
 <summary>Terraform出力の読み込み（使用するシェルだけ実行）</summary>
-
-PowerShell:
-
-```powershell
-$runtimeJson = terraform -chdir=app/infra/terraform-e2e output -json compose_environment
-if ($LASTEXITCODE -ne 0) { throw 'Terraform output failed' }
-$runtime = $runtimeJson | ConvertFrom-Json
-foreach ($entry in $runtime.PSObject.Properties) {
-  [Environment]::SetEnvironmentVariable($entry.Name, [string]$entry.Value, 'Process')
-}
-```
 
 WSL / Bash（jqが必要）:
 
@@ -162,11 +203,11 @@ read -rsp 'Worker session token (長期キーなら空欄): ' WORKER_AWS_SESSION
 export WORKER_AWS_ACCESS_KEY_ID WORKER_AWS_SECRET_ACCESS_KEY WORKER_AWS_SESSION_TOKEN
 ```
 
-PowerShellでは同じ変数を `$env:変数名` に設定する。ホスト認証が有効でもWorker認証が空・期限切れならWorkerは処理できない。
+ホスト認証が有効でもWorker認証が空・期限切れならWorkerは処理できない。
 
 ### Docker環境と起動
 
-ローカルのLinux Engineに直接接続する。WSLの既定ソケットは `unix:///var/run/docker.sock`、Windowsは `npipe:////./pipe/docker_engine`。
+ローカルのLinux Engineに直接接続する。既定ソケットは `unix:///var/run/docker.sock`。
 リモート接続・authorization plugin・共有ストレージは未対応。設定生成はDocker contextを推測しない。
 必要なら `--docker-host` で実際のローカルソケットを指定する。
 
@@ -209,34 +250,13 @@ IDが変わるためE2E設定を再生成・再読込する。`VIDEO_ENCODING_QU
 取得失敗・値の不整合・複数のアラーム候補はエラーにする。各コマンド10秒、全体120秒、応答4 MiBが上限。
 バケット・SQS・アラームの作成、認証値の出力、シナリオ実行は行わない。
 
-使用するシェルの手順だけ実行し、同じシェルで「実行手順」へ進む。
+統合スクリプトを実行済みなら、この節の個別手順は不要。個別に生成する場合は使用するシェルの手順だけ実行し、同じシェルで「実行手順」へ進む。
 コンテナを再作成した場合は再生成・再読込する。
-
-<details>
-<summary>Windows / PowerShell：設定生成・読み込み</summary>
-
-フル実行向けの生成例。正常MP4と、非空の不正 `.mp4` を別々に用意する。時計ずれはホスト・Worker・DBの時刻同期を確認して上限を指定する（以下の100 msは例）。
-`--full` は環境設定生成の入力を検証するオプションで、テストを実行しない。
-
-PowerShellの例（アカウント・両fixture・時計ずれ・URLを実環境に合わせる）:
-
-```powershell
-$workerId = docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q worker
-$dbId = docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q postgres
-node app/scripts/generate_reliability_env.mjs --worker $workerId --database $dbId --account 123456789012 --fixture C:/e2e/long.mp4 --invalid-fixture C:/e2e/invalid.mp4 --clock-skew-ms 100 --frontend-url http://localhost:5173 --api-url http://localhost:8080 --disposable --full --output ./reliability-env.local.ps1
-# 成功を確認し、内容をレビューしてから同じシェルに読み込む
-Get-Content ./reliability-env.local.ps1
-. ./reliability-env.local.ps1
-```
-
-既存ファイルは上書きしない。再生成時は別の出力ファイル名を使う。
-
-</details>
 
 <details>
 <summary>WSL / Bash：設定生成・読み込み</summary>
 
-CLIの出力はPowerShell専用のため、Bashでは取得関数のJSONを読み込む（jqが必要）。
+Terraformを使わず設定を個別に生成する場合は、取得関数のJSONを読み込む（この手動手順ではjqが必要）。
 
 ```bash
 worker_id=$(docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q worker)
@@ -262,7 +282,7 @@ load_e2e || echo '設定生成失敗。後続の実行を止めて確認して�
 </details>
 
 フル実行用に生成すると、正常・不正fixture、時計ずれ、`E2E_PROJECT=chromium`、全共通設定が同じファイル/JSONに揃う。
-`.ps1`またはBashの生成JSONを読み込んだ後、これらを個別にexportし直す必要はない。
+統合スクリプトまたは個別の生成JSONを読み込んだ後、これらを個別にexportし直す必要はない。
 fixture検査はファイル形式・サイズの条件のみで、正常動画としての再生可否・encode時間や、実FFmpegでの失敗は保証しない。
 API/Frontend用のバケット、出力S3 endpoint、許可origin、API接続先、公開ポートも生成する。API/Frontendの起動・認証とS3 CORS、ホストFFmpeg、Chromiumのインストールは引き続き別途必要。秘密情報は生成ファイルへ含めない。
 `E2E_RUN_ID` と監視の先行run IDはフルrunnerが設定するため、生成設定には含めない。
@@ -377,7 +397,7 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 - 非versionedバケット（Enabled/Suspendedは不可）、Standardキュー。sourceバケットに単一の直接S3通知があり、他のSNS/Lambda/EventBridge通知がないこと。
 - 通知フィルタが `videos/<video UUID>/jobs/<job UUID>/source.mp4` に一致すること。通常prefixは `videos/`、suffixは `/source.mp4`。
 - Worker起動ログの `duplicate_observation_schema=1` を、起動以降の末尾2000行から確認できること。
-- fixtureは実行ホストから読める絶対パスの `.mp4`、非空、1 GiB以下。Windows側のパスをWSLへそのまま渡さない。
+- fixtureは実行ホストから読める絶対パスの `.mp4`、非空、1 GiB以下。Linux上で有効なパスを指定する。
 - ホストprincipalに共通の読み取りに加えて、sourceへの `sqs:SendMessage`、S3通知/versioning/list取得、source PutObject、output HeadObject、runオブジェクトのDeleteObject権限があること。HeadBucketはListBucket、HeadObjectはGetObjectに対応する。
 - DBロールが対象video/jobの作成・参照・削除を行えること。DB名・ユーザー名は英数字とunderscoreのみ対応。
 
@@ -441,9 +461,9 @@ python app/scripts/run_reliability_e2e.py --scenario runtime-authorization
 
 **追加条件：** データ作成シナリオ共通条件に加え、正常なMP4でencode中のbusy配送を観測できること。
 
-| 設定 | PowerShellの例 | Bashの例 |
-| --- | --- | --- |
-| 正常fixture | `$env:E2E_VALID_FIXTURE = 'C:/e2e/long.mp4'` | `export E2E_VALID_FIXTURE='/home/user/e2e/long.mp4'` |
+| 設定 | Bashの例 |
+| --- | --- |
+| 正常fixture | `export E2E_VALID_FIXTURE='/home/user/e2e/long.mp4'` |
 
 生成済み設定に正しい値が入っていれば再設定は不要。
 
@@ -464,9 +484,9 @@ python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery
 - `E2E_PROCESSING_TIMEOUT_MS > 2 × heartbeat間隔(ms)`、`E2E_MAX_ATTEMPTS >= 2`。
 - 保持される同一Workerコンテナをstop/startできること。restart policyは `no`。DBは停止しない。
 
-| 設定例（実測した上限に置換） | PowerShell | Bash |
-| --- | --- | --- |
-| 時計ずれ上限100 ms | `$env:E2E_CLOCK_SKEW_MS = '100'` | `export E2E_CLOCK_SKEW_MS='100'` |
+| 設定例（実測した上限に置換） | Bash |
+| --- | --- |
+| 時計ずれ上限100 ms | `export E2E_CLOCK_SKEW_MS='100'` |
 
 ```text
 python app/scripts/run_reliability_e2e.py --scenario crash-recovery
@@ -498,9 +518,9 @@ python app/scripts/run_reliability_e2e.py --scenario long-heartbeat
 node -e "require('node:fs').writeFileSync('invalid.mp4', 'not an mp4', {flag:'wx'})"
 ```
 
-| 設定 | PowerShell | Bash |
-| --- | --- | --- |
-| 不正fixtureの絶対パス | `$env:E2E_INVALID_FIXTURE = (Resolve-Path ./invalid.mp4).Path` | `export E2E_INVALID_FIXTURE="$(pwd)/invalid.mp4"` |
+| 設定 | Bash |
+| --- | --- |
+| 不正fixtureの絶対パス | `export E2E_INVALID_FIXTURE="$(pwd)/invalid.mp4"` |
 
 Workerとsourceキューの試行上限・retry設定を一致させ、全試行・DLQ到達・到達後の安定観測を待てる予算にする。
 全シナリオ共通のretry 10秒・試行上限3回を使う。旧環境のretry 900秒が残っている場合は、後述の固定設定への移行を先に行う。
@@ -707,7 +727,7 @@ Workerログに個々のオブジェクトキーはないため、upload回数�
 分類は原因の手掛かりであり、リモート処理の成否を断定しない。timeoutにはローカルの時間制限とCLI通信タイムアウトの両方を含む。
 元エラー・秘密値は出力しない。
 
-次はWindows・WSL共通。`<...>` は生成済み設定と今回の証跡から転記する。
+次のコマンドをBashで実行する。`<...>` は生成済み設定と今回の証跡から転記する。
 DB名・ユーザーを変更した場合は `-U` / `-d` も変更する。
 
 ```text

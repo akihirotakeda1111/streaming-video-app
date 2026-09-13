@@ -58,9 +58,11 @@ function positive(value, label, max = 43200) {
   return Number(value);
 }
 
+/** @typedef {(tool: string, args: readonly string[], options: import('node:child_process').ExecFileSyncOptionsWithStringEncoding) => string} CommandExecutor */
+
 /** Only the command transport is replaceable; no shell commands or remote mutations.
  * @param {Options} options
- * @param {typeof execFileSync} [execute]
+ * @param {CommandExecutor} [execute]
  * @returns {Record<string, string>}
  */
 export function discoverEnvironment(options, execute = execFileSync) {
@@ -397,7 +399,16 @@ export function discoverEnvironment(options, execute = execFileSync) {
 }
 
 /** @param {Record<string, string>} env */
+export function validateGeneratedEnvironment(env) {
+  for (const [name, value] of Object.entries(env)) {
+    if (!OUTPUT_NAMES.has(name) || typeof value !== "string" || /[\r\n\0]/.test(value))
+      fail("Unsupported generated setting");
+  }
+}
+
+/** @param {Record<string, string>} env */
 export function renderPowerShell(env) {
+  validateGeneratedEnvironment(env);
   const lines = [
     "# Generated configuration only; this is not successful live preflight evidence.",
     "# Review account, resource identities, local URL defaults and workload budgets.",
@@ -412,8 +423,6 @@ export function renderPowerShell(env) {
     "# HTTP_ADDR and default DATABASE_URL are supplied by Compose. Keep custom DB credentials aligned separately.",
   ];
   for (const [name, value] of Object.entries(env)) {
-    if (!OUTPUT_NAMES.has(name) || /[\r\n\0]/.test(value))
-      fail("Unsupported generated setting");
     lines.push(`$env:${name} = '${value.replaceAll("'", "''")}'`);
   }
   lines.push(
