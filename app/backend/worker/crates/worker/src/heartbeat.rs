@@ -3,8 +3,8 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,9 +12,9 @@ use std::{
 use persistence::{JobOperationOutcome, JobState, PersistenceError};
 use queue::{ChangeVisibility, QueueError};
 use tokio::{
-    sync::{watch, Mutex},
+    sync::{Mutex, watch},
     task::JoinHandle,
-    time::{interval_at, sleep_until, Instant, MissedTickBehavior},
+    time::{Instant, MissedTickBehavior, interval_at, sleep_until},
 };
 
 use crate::acquisition::AcquiredJob;
@@ -45,7 +45,7 @@ impl HeartbeatSettings {
         if lease_duration > MAX_LEASE_DURATION_SECONDS {
             return Err(HeartbeatSettingsError::LeaseTooLong);
         }
-        if interval >= lease_duration || interval >= visibility_extension {
+        if interval > lease_duration / 2 || interval > visibility_extension / 2 {
             return Err(HeartbeatSettingsError::IntervalTooLong);
         }
         Ok(Self {
@@ -71,13 +71,26 @@ impl fmt::Display for HeartbeatSettingsError {
             Self::VisibilityTooLong => "visibility extension must not exceed 43200 seconds",
             Self::LeaseTooLong => "lease duration must not exceed 43200 seconds",
             Self::IntervalTooLong => {
-                "heartbeat interval must be shorter than lease and visibility durations"
+                "heartbeat interval must be at most half the lease and visibility durations"
             }
         })
     }
 }
 
 impl std::error::Error for HeartbeatSettingsError {}
+
+#[test]
+fn heartbeat_settings_require_half_duration_margin() {
+    for (lease, visibility) in [(120, 300), (300, 120), (121, 121)] {
+        assert!(HeartbeatSettings::from_seconds(60, lease, visibility).is_ok());
+        for interval in [61, 119, u64::MAX] {
+            assert_eq!(
+                HeartbeatSettings::from_seconds(interval, lease, visibility),
+                Err(HeartbeatSettingsError::IntervalTooLong)
+            );
+        }
+    }
+}
 
 #[test]
 fn heartbeat_settings_reject_unbounded_lease_durations() {
@@ -604,8 +617,8 @@ mod tests {
         collections::VecDeque,
         future::pending,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
         },
         time::SystemTime,
     };

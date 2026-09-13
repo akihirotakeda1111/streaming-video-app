@@ -189,6 +189,20 @@ describe('read-only environment command generator', () => {
     expect(env).not.toHaveProperty('COMPOSE_DATABASE_URL')
     expect(env).not.toHaveProperty('API_AWS_SECRET_ACCESS_KEY')
   })
+  it.each(['WORKER_LEASE_DURATION_SECONDS', 'WORKER_VISIBILITY_EXTENSION_SECONDS', 'queue'])(
+    'requires half-duration heartbeat margin for %s',
+    (duration) => {
+      for (const [seconds, accepted] of [['59', false], ['60', true], ['61', true]] as const) {
+        const f = fixture()
+        if (duration === 'queue') f.state.visibility = seconds
+        else f.settings[duration] = seconds
+        const discover = () => discoverEnvironment(f.options, f.execute)
+        if (accepted) expect(discover).not.toThrow()
+        else expect(discover).toThrow('heartbeat safety margin')
+      }
+    },
+  )
+
   it.each(['account', 'labels', 'redrive', 'attempts', 'budget', 'heartbeat', 'missing-alarm'])(
     'rejects inconsistent %s instead of inventing values',
     (mode) => {

@@ -254,7 +254,7 @@ export function discoverEnvironment(options, execute = execFileSync) {
   );
   const retry = positive(settings.WORKER_RETRY_DELAY_SECONDS, "worker retry");
   const visibility = positive(source.VisibilityTimeout, "queue visibility");
-  if (2 * heartbeat > Math.min(extension, lease))
+  if (2 * heartbeat > Math.min(visibility, extension, lease))
     fail("Worker heartbeat safety margin is insufficient");
   // Add polling margin where possible without exceeding the existing validator's limit.
   const budget = (/** @type {number} */ seconds) => {

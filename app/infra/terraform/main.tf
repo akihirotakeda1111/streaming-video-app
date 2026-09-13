@@ -139,8 +139,8 @@ resource "aws_sqs_queue" "video_encoding" {
       error_message = "queue_max_receive_count must equal worker_maximum_attempts."
     }
     precondition {
-      condition     = var.worker_heartbeat_interval_seconds < var.worker_visibility_extension_seconds && var.worker_heartbeat_interval_seconds < var.worker_lease_duration_seconds && var.worker_heartbeat_interval_seconds < var.source_visibility_timeout_seconds
-      error_message = "The worker heartbeat must be shorter than visibility, lease, and source queue timeouts."
+      condition     = 2 * var.worker_heartbeat_interval_seconds <= var.worker_visibility_extension_seconds && 2 * var.worker_heartbeat_interval_seconds <= var.worker_lease_duration_seconds && 2 * var.worker_heartbeat_interval_seconds <= var.source_visibility_timeout_seconds
+      error_message = "Twice the worker heartbeat must not exceed visibility, lease, or source queue timeouts."
     }
   }
 }

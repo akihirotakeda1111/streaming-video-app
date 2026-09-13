@@ -12,7 +12,7 @@ use worker::{
 async fn shutdown_requested() -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut terminate = signal(SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result,
@@ -22,6 +22,24 @@ async fn shutdown_requested() -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await
+    }
+}
+
+async fn supervise_database<T>(
+    worker: impl std::future::Future<Output = T>,
+    connection_stopped: impl std::future::Future<Output = ()>,
+    stop: watch::Sender<bool>,
+) -> Result<T, persistence::PersistenceError> {
+    tokio::pin!(worker);
+    tokio::select! {
+        biased;
+        _ = connection_stopped => {
+            let _ = stop.send(true);
+            // Let the runtime cancel and join in-flight work within its grace period.
+            worker.await;
+            Err(persistence::PersistenceError("postgres connection stopped; restart required".into()))
+        }
+        result = &mut worker => Ok(result),
     }
 }
 
@@ -69,6 +87,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let connection_stopped = jobs.connection_stopped();
     let storage = match S3Storage::new(
         &config.aws_region,
         config.input_bucket.clone(),
@@ -115,6 +134,7 @@ async fn main() {
         }
     };
     let (stop, shutdown) = watch::channel(false);
+    let database_stop = stop.clone();
     tokio::spawn(async move {
         if let Err(error) = shutdown_requested().await {
             error!(%error, "cancellation signal failed");
@@ -124,9 +144,16 @@ async fn main() {
     });
 
     info!(region = %config.aws_region, queue_url = %config.queue_url, max_concurrency = PHASE1_MAX_CONCURRENCY, "worker started");
-    if let Err(error) =
-        worker::runtime::run(queue, processor, shutdown, PHASE1_MAX_CONCURRENCY).await
-    {
+    let result = supervise_database(
+        worker::runtime::run(queue, processor, shutdown, PHASE1_MAX_CONCURRENCY),
+        connection_stopped,
+        database_stop,
+    )
+    .await;
+    let result = result
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    if let Err(error) = result {
         error!(%error, "worker stopped with an error");
         std::process::exit(1);
     }
@@ -135,6 +162,43 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn normal_shutdown_does_not_require_database_disconnect() {
+        let (stop, _) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            super::supervise_database(async { 42 }, std::future::pending(), stop)
+                .await
+                .unwrap(),
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn database_disconnect_cancels_work_and_returns_a_fatal_error() {
+        let (stop, mut shutdown) = tokio::sync::watch::channel(false);
+        let (disconnect, disconnected) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::supervise_database(
+            async move {
+                shutdown.changed().await.unwrap();
+                assert!(*shutdown.borrow());
+            },
+            async move {
+                let _ = disconnected.await;
+            },
+            stop,
+        ));
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        disconnect.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+
     const DOCKERFILE: &str = include_str!("../../../Dockerfile");
     const README: &str = include_str!("../../../README.md");
 
