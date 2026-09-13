@@ -71,8 +71,8 @@ Fixture requirements apply to non-browser scenarios too:
 
 | Scenario | Fixture requirement |
 | --- | --- |
-| `duplicate-delivery`, `crash-recovery`, `long-heartbeat`, `poison-isolation` | `E2E_DUPLICATE_FIXTURE`: a normal MP4 |
-| `ffmpeg-exhaustion` | `E2E_FFMPEG_INVALID_FIXTURE`: an invalid MP4 that fails real FFmpeg processing |
+| `duplicate-delivery`, `crash-recovery`, `long-heartbeat`, `poison-isolation` | `E2E_VALID_FIXTURE`: a normal MP4 |
+| `ffmpeg-exhaustion` | `E2E_INVALID_FIXTURE`: an invalid MP4 that fails real FFmpeg processing |
 | `queue-monitoring` | No fixture; complete success requires the earlier FFmpeg and poison evidence |
 | `preflight`, final `@phase1-pipeline` playback | Host FFmpeg generates a fresh temporary MP4 |
 

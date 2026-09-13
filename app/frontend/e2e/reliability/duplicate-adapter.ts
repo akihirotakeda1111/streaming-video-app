@@ -251,8 +251,6 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
     }
   }
   async prepare(target: DuplicateTarget): Promise<void> {
-    if (this.env.E2E_DUPLICATE_EXCLUSIVE !== 'true')
-      fail('E2E_DUPLICATE_EXCLUSIVE=true is required for dedicated resources')
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
     if (
       !uuid.test(target.videoId) ||
@@ -262,9 +260,9 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
       target.sourceKey !== target.prefix + 'source.mp4'
     )
       fail('Noncanonical run target')
-    const fixture = this.env.E2E_DUPLICATE_FIXTURE || ''
+    const fixture = this.env.E2E_VALID_FIXTURE || ''
     if (!isAbsolute(fixture) || !fixture.toLowerCase().endsWith('.mp4'))
-      fail('E2E_DUPLICATE_FIXTURE must be an absolute MP4 path')
+      fail('E2E_VALID_FIXTURE must be an absolute MP4 path')
     let size
     try {
       const stat = statSync(fixture)
@@ -385,7 +383,7 @@ export class DockerDuplicateAdapter implements DuplicateAdapter {
         '--key',
         this.target!.sourceKey,
         '--body',
-        this.env.E2E_DUPLICATE_FIXTURE!,
+        this.env.E2E_VALID_FIXTURE!,
         '--content-type',
         'video/mp4',
         '--expected-bucket-owner',

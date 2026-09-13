@@ -223,7 +223,7 @@ PowerShellの例（アカウント・両fixture・時計ずれ・URLを実環境
 ```powershell
 $workerId = docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q worker
 $dbId = docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose.e2e.yaml ps -q postgres
-node app/scripts/generate_reliability_env.mjs --worker $workerId --database $dbId --account 123456789012 --fixture C:/e2e/long.mp4 --invalid-fixture C:/e2e/invalid.mp4 --clock-skew-ms 100 --frontend-url http://localhost:5173 --api-url http://localhost:8080 --exclusive --full --output ./reliability-env.local.ps1
+node app/scripts/generate_reliability_env.mjs --worker $workerId --database $dbId --account 123456789012 --fixture C:/e2e/long.mp4 --invalid-fixture C:/e2e/invalid.mp4 --clock-skew-ms 100 --frontend-url http://localhost:5173 --api-url http://localhost:8080 --disposable --full --output ./reliability-env.local.ps1
 # 成功を確認し、内容をレビューしてから同じシェルに読み込む
 Get-Content ./reliability-env.local.ps1
 . ./reliability-env.local.ps1
@@ -248,7 +248,7 @@ load_e2e() {
 import { discoverEnvironment } from './app/scripts/generate_reliability_env.mjs'
 const [worker, database, account, fixture, invalidFixture, clockSkewMs] = process.argv.slice(2)
 try {
-  const env = discoverEnvironment({ worker, database, account, fixture, invalidFixture, clockSkewMs, exclusive: true, full: true, frontendUrl: 'http://localhost:5173', apiUrl: 'http://localhost:8080' })
+  const env = discoverEnvironment({ worker, database, account, fixture, invalidFixture, clockSkewMs, disposable: true, full: true, frontendUrl: 'http://localhost:5173', apiUrl: 'http://localhost:8080' })
   console.log(JSON.stringify(env))
 } catch { console.error('E2E設定生成失敗。認証・接続先・ラベル・アラーム・fixture・時計ずれの入力を確認してください'); process.exitCode = 2 }
 JS
@@ -278,11 +278,11 @@ API/Frontend用のバケット、出力S3 endpoint、許可origin、API接続先
 | `--docker-host` | DOCKER_HOST、なければOS別ローカルソケット |
 | `--frontend-url` / `--api-url` | 既定は `http://127.0.0.1:5173` / `http://127.0.0.1:8000`。自動検出・稼働確認ではない |
 | `--evidence-dir` | カレントディレクトリの `artifacts/reliability-e2e` を絶対パス化 |
-| `--fixture` | `E2E_DUPLICATE_FIXTURE`。正常MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
-| `--invalid-fixture` | `E2E_FFMPEG_INVALID_FIXTURE`。不正MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
+| `--fixture` | `E2E_VALID_FIXTURE`。正常MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
+| `--invalid-fixture` | `E2E_INVALID_FIXTURE`。不正MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
 | `--clock-skew-ms` | `E2E_CLOCK_SKEW_MS`。1〜5000 msの整数を明示。lease/visibilityとの余裕も確認 |
-| `--full` | `--exclusive` と上記3引数を必須にする。正常・不正fixtureに同じパスを指定した場合もエラー。省略時は不足値を空欄として生成 |
-| `--exclusive` | 専用・破棄可能環境であるという利用者の宣言。省略時はdisposable/exclusiveが空欄 |
+| `--full` | 上記3引数を必須にする。正常・不正fixtureに同じパスを指定した場合もエラー。省略時は不足値を空欄として生成 |
+| `--disposable` | 破棄可能環境であるという利用者の確認。省略時は `E2E_RELIABILITY_DISPOSABLE` が空欄 |
 | `--alarms A,B,C` | 候補が重複・多数ある場合に実際の3アラーム名を指定 |
 
 <details>
@@ -361,7 +361,7 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 | --- | --- | --- | --- |
 | `preflight` | API・Frontend、対象ブラウザ、ホストFFmpeg | なし | Playwright結果・失敗時の診断添付 |
 | `runtime-authorization` | 共通設定のみ | なし | Playwright結果・失敗時の認可診断 |
-| `duplicate-delivery` | 下記「データ作成シナリオ共通条件」、長めの正常MP4、exclusive宣言 | なし | `duplicate-delivery-evidence.json` |
+| `duplicate-delivery` | 下記「データ作成シナリオ共通条件」、長めの正常MP4 | なし | `duplicate-delivery-evidence.json` |
 | `crash-recovery` | 同共通条件、正常MP4、時計ずれ設定、heartbeatログ、停止・再開可能なWorker | なし | `crash-recovery-evidence.json` |
 | `long-heartbeat` | 同共通条件、複数heartbeatを観測できる正常MP4、時計ずれ設定、heartbeatログ | なし | `long-heartbeat-evidence.json` |
 | `ffmpeg-exhaustion` | 同共通条件、不正MP4、DLQ受信権限、全再試行を待つ予算 | なし | `ffmpeg-exhaustion-evidence.json` |
@@ -381,7 +381,7 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 - ホストprincipalに共通の読み取りに加えて、sourceへの `sqs:SendMessage`、S3通知/versioning/list取得、source PutObject、output HeadObject、runオブジェクトのDeleteObject権限があること。HeadBucketはListBucket、HeadObjectはGetObjectに対応する。
 - DBロールが対象video/jobの作成・参照・削除を行えること。DB名・ユーザー名は英数字とunderscoreのみ対応。
 
-重複配送・ライフサイクルでは `E2E_DUPLICATE_EXCLUSIVE=true` が必須。FFmpeg・poisonのadapterはこの値を内部設定するが、実リソースを専有してよいことの確認は同様に必要。
+占有宣言は不要。使い捨て環境の確認と実行前のリソース検査は引き続き必須。
 正常MP4の内容・処理時間は利用者が用意する。MP4の再生時間やファイル容量だけでは、Workerのencode所要時間を保証できない。
 
 ### ブラウザ使用シナリオの追加準備
@@ -443,8 +443,7 @@ python app/scripts/run_reliability_e2e.py --scenario runtime-authorization
 
 | 設定 | PowerShellの例 | Bashの例 |
 | --- | --- | --- |
-| 専有宣言 | `$env:E2E_DUPLICATE_EXCLUSIVE = 'true'` | `export E2E_DUPLICATE_EXCLUSIVE='true'` |
-| 正常fixture | `$env:E2E_DUPLICATE_FIXTURE = 'C:/e2e/long.mp4'` | `export E2E_DUPLICATE_FIXTURE='/home/user/e2e/long.mp4'` |
+| 正常fixture | `$env:E2E_VALID_FIXTURE = 'C:/e2e/long.mp4'` | `export E2E_VALID_FIXTURE='/home/user/e2e/long.mp4'` |
 
 生成済み設定に正しい値が入っていれば再設定は不要。
 
@@ -457,7 +456,7 @@ python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery
 
 ### crash-recovery：停止後の再取得・復旧
 
-**追加条件：** 重複配送と同じ正常fixture・exclusive宣言・データ作成条件に、以下を加える。
+**追加条件：** 重複配送と同じ正常fixture・データ作成条件に、以下を加える。
 
 - encode中に1回のheartbeat成功とDB lease更新を観測できるfixture。
 - 起動ログに `heartbeat_observation_schema=1`。
@@ -479,7 +478,7 @@ python app/scripts/run_reliability_e2e.py --scenario crash-recovery
 
 ### long-heartbeat：複数周期のlease・visibility更新
 
-**追加条件：** crash-recoveryと同じ正常fixture・exclusive宣言・ログschema・時計ずれ条件。ただし停止を注入せず、2回以上の完全なheartbeat周期をencode中に観測できる長さが必要。
+**追加条件：** crash-recoveryと同じ正常fixture・ログschema・時計ずれ条件。ただし停止を注入せず、2回以上の完全なheartbeat周期をencode中に観測できる長さが必要。
 `E2E_PROCESSING_TIMEOUT_MS > 3 × heartbeat間隔(ms)` とする。試行上限2以上という追加制約はこの単独シナリオにはない。
 
 ```text
@@ -491,7 +490,7 @@ python app/scripts/run_reliability_e2e.py --scenario long-heartbeat
 
 ### ffmpeg-exhaustion：実FFmpeg失敗・試行上限・DLQ隔離
 
-**追加条件：** データ作成シナリオ共通条件と、専用DLQの `sqs:ReceiveMessage` 権限。不正MP4を `E2E_FFMPEG_INVALID_FIXTURE` に指定する。正常な `E2E_DUPLICATE_FIXTURE` はこのシナリオでは使わない。
+**追加条件：** データ作成シナリオ共通条件と、専用DLQの `sqs:ReceiveMessage` 権限。不正MP4を `E2E_INVALID_FIXTURE` に指定する。正常な `E2E_VALID_FIXTURE` はこのシナリオでは使わない。
 
 新しい不正fixtureを作る例（既存ファイルは上書きしない）:
 
@@ -501,7 +500,7 @@ node -e "require('node:fs').writeFileSync('invalid.mp4', 'not an mp4', {flag:'wx
 
 | 設定 | PowerShell | Bash |
 | --- | --- | --- |
-| 不正fixtureの絶対パス | `$env:E2E_FFMPEG_INVALID_FIXTURE = (Resolve-Path ./invalid.mp4).Path` | `export E2E_FFMPEG_INVALID_FIXTURE="$(pwd)/invalid.mp4"` |
+| 不正fixtureの絶対パス | `$env:E2E_INVALID_FIXTURE = (Resolve-Path ./invalid.mp4).Path` | `export E2E_INVALID_FIXTURE="$(pwd)/invalid.mp4"` |
 
 Workerとsourceキューの試行上限・retry設定を一致させ、全試行・DLQ到達・到達後の安定観測を待てる予算にする。
 全シナリオ共通のretry 10秒・試行上限3回を使う。旧環境のretry 900秒が残っている場合は、後述の固定設定への移行を先に行う。
@@ -516,7 +515,7 @@ DLQ受信は事前権限確認時もvisibilityを変える。メッセージは�
 
 ### poison-isolation：不正通知と正常jobの分離
 
-**追加条件：** データ作成シナリオ共通条件、専用DLQ受信権限、**正常な** `E2E_DUPLICATE_FIXTURE`。
+**追加条件：** データ作成シナリオ共通条件、専用DLQ受信権限、**正常な** `E2E_VALID_FIXTURE`。
 malformed本文と存在しないjobの通知はテストが生成するため、手動送信も不正fixture指定も不要。
 正常jobの完了とpoisonの全redriveを `PROCESSING + VISIBILITY + NAVIGATION + poison専用DLQ予算` の範囲で待つ。固定設定の生成値では合計970秒（約16分10秒）。全段階が遅延した場合の上限であり、通常所要時間は15分以内を目標とする。poison専用DLQ予算はadapterが計算するため、シェルでDLQ変数を長くする必要はない。
 
@@ -558,7 +557,7 @@ python app/scripts/run_reliability_e2e.py --scenario queue-monitoring --ffmpeg-e
 
 ### フル実行：全障害シナリオから最終ブラウザ再生まで
 
-**追加条件：** 個別条件すべて。長めの正常MP4と不正MP4の両パス、exclusive宣言、時計ずれ、DLQ/メトリクス権限、Chromium・API・Frontendを**開始前に**揃える。`preflight` を先に実行してブラウザ側の準備も確認する。
+**追加条件：** 個別条件すべて。長めの正常MP4と不正MP4の両パス、時計ずれ、DLQ/メトリクス権限、Chromium・API・Frontendを**開始前に**揃える。`preflight` を先に実行してブラウザ側の準備も確認する。
 フル実行は個別条件すべてを開始前に検証するわけではなく、後半の条件不足でも途中停止し得る。
 
 正常fixtureは重複配送と両ライフサイクルで十分なencode時間があり、poisonの正常jobとしても完了できるものを選ぶ。
