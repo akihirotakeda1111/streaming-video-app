@@ -37,6 +37,11 @@ function fixture() {
   return { root, valid, runtime, options, execute, discover, state }
 }
 describe('Linux reliability setup orchestration', () => {
+  it('defaults the clock skew bound to 1000 ms when omitted', () => {
+    const f = fixture()
+    setupEnvironment({ ...f.options, 'clock-skew-ms': undefined }, f.execute, f.discover)
+    expect(f.discover.mock.calls[0][0]).toMatchObject({ clockSkewMs: '1000' })
+  })
   it.each([false, true])('loads settings with optional Worker startup: %s', (start) => {
     const f = fixture(), before = { ...process.env }
     const result = setupEnvironment({ ...f.options, 'start-worker': start }, f.execute, f.discover)

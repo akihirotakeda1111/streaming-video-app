@@ -113,7 +113,7 @@ state・plan・実値tfvarsはコミットせず、provider lockファイルは�
 `app/scripts/setup_reliability_env.sh` を **E2Eを実行するBashでsource** すると、「Terraform出力の読み込み」と「設定生成・読み込み」が1回で完了する。
 Linux版Node.js、Terraform、AWS CLI、Docker Composeを使用する。統合スクリプトではjqは不要。
 AWS環境、ホスト・Worker認証、正常MP4、不正MP4は事前に用意する。
-時計ずれの上限は実環境を確認して指定する（100 msは例）。使い捨てのE2E環境で実行する。
+時計ずれ上限の既定値は1000 ms。実環境に合わせて `--clock-skew-ms` で変更できる。使い捨てのE2E環境で実行する。
 
 リポジトリルートからの初回実行例:
 
@@ -122,7 +122,7 @@ source app/scripts/setup_reliability_env.sh \
   --account 123456789012 \
   --fixture "$HOME/e2e/long.mp4" \
   --invalid-fixture "$HOME/e2e/invalid.mp4" \
-  --clock-skew-ms 100 \
+  --clock-skew-ms 1000 \
   --start-worker
 ```
 
@@ -134,7 +134,8 @@ Worker/DBが既に起動済みなら `--start-worker` を省略する。接続�
 
 | オプション | 用途・既定値 |
 | --- | --- |
-| `--account` / `--fixture` / `--invalid-fixture` / `--clock-skew-ms` | 必須。フル実行用設定を生成する。テストは起動しない |
+| `--account` / `--fixture` / `--invalid-fixture` | 必須。フル実行用設定を生成する。テストは起動しない |
+| `--clock-skew-ms` | 時計ずれ上限。既定1000 ms、1〜5000 msの整数 |
 | `--start-worker` | Terraform出力を渡してWorkerと依存DB・migrationを起動。省略時は起動済みコンテナを参照 |
 | `--terraform-directory` | スクリプト基準の `app/infra/terraform-e2e`。別stateの環境では変更 |
 | `--project` | Composeプロジェクト。既定は `streaming-video-e2e` |
@@ -264,7 +265,7 @@ db_id=$(docker compose -p streaming-video-e2e -f app/compose.yaml -f app/compose
 # 専用・破棄可能環境であることを確認してから実行。アカウントとfixtureを実値へ置換
 load_e2e() {
   local settings entries entry
-  settings=$(node --input-type=module - "$worker_id" "$db_id" '123456789012' "$HOME/e2e/fixtures/test.mp4" "$HOME/e2e/fixtures/invalid.mp4" '100' <<'JS'
+  settings=$(node --input-type=module - "$worker_id" "$db_id" '123456789012' "$HOME/e2e/fixtures/test.mp4" "$HOME/e2e/fixtures/invalid.mp4" '1000' <<'JS'
 import { discoverEnvironment } from './app/scripts/generate_reliability_env.mjs'
 const [worker, database, account, fixture, invalidFixture, clockSkewMs] = process.argv.slice(2)
 try {
@@ -300,8 +301,8 @@ API/Frontend用のバケット、出力S3 endpoint、許可origin、API接続先
 | `--evidence-dir` | カレントディレクトリの `artifacts/reliability-e2e` を絶対パス化 |
 | `--fixture` | `E2E_VALID_FIXTURE`。正常MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
 | `--invalid-fixture` | `E2E_INVALID_FIXTURE`。不正MP4の絶対パスへ変換し、存在・拡張子・サイズを検査 |
-| `--clock-skew-ms` | `E2E_CLOCK_SKEW_MS`。1〜5000 msの整数を明示。lease/visibilityとの余裕も確認 |
-| `--full` | 上記3引数を必須にする。正常・不正fixtureに同じパスを指定した場合もエラー。省略時は不足値を空欄として生成 |
+| `--clock-skew-ms` | `E2E_CLOCK_SKEW_MS`。既定1000 ms、1〜5000 msの整数。lease/visibilityとの余裕も確認 |
+| `--full` | 正常・不正fixtureの2引数を必須にする。正常・不正fixtureに同じパスを指定した場合もエラー。省略時は不足値を空欄として生成 |
 | `--disposable` | 破棄可能環境であるという利用者の確認。省略時は `E2E_RELIABILITY_DISPOSABLE` が空欄 |
 | `--alarms A,B,C` | 候補が重複・多数ある場合に実際の3アラーム名を指定 |
 
@@ -486,7 +487,7 @@ python app/scripts/run_reliability_e2e.py --scenario duplicate-delivery
 
 | 設定例（実測した上限に置換） | Bash |
 | --- | --- |
-| 時計ずれ上限100 ms | `export E2E_CLOCK_SKEW_MS='100'` |
+| 時計ずれ上限1000 ms | `export E2E_CLOCK_SKEW_MS='1000'` |
 
 ```text
 python app/scripts/run_reliability_e2e.py --scenario crash-recovery

@@ -173,7 +173,7 @@ describe('read-only environment command generator', () => {
     expect(env.E2E_RELIABILITY_DISPOSABLE).toBe('')
     expect(env.E2E_VALID_FIXTURE).toBe('')
     expect(env.E2E_INVALID_FIXTURE).toBe('')
-    expect(env.E2E_CLOCK_SKEW_MS).toBe('')
+    expect(env.E2E_CLOCK_SKEW_MS).toBe('1000')
     expect(env.E2E_PROJECT).toBe('chromium')
     expect(() => validateSettings(env, true)).toThrow('DISPOSABLE')
   })
@@ -293,7 +293,7 @@ describe('read-only environment command generator', () => {
   it('rejects incomplete full-suite inputs before discovery', () => {
     const f = fixture()
     const options = { ...f.options, full: true, disposable: true, fixture: 'normal.mp4', invalidFixture: 'invalid.mp4', clockSkewMs: '100' }
-    for (const name of ['fixture', 'invalidFixture', 'clockSkewMs'] as const) {
+    for (const name of ['fixture', 'invalidFixture'] as const) {
       expect(() => discoverEnvironment({ ...options, [name]: undefined }, f.execute)).toThrow('--full requires')
     }
     expect(f.execute).not.toHaveBeenCalled()

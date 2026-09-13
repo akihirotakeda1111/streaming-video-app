@@ -14,7 +14,8 @@ export const RUNTIME_NAMES = [
   'WORKER_MAXIMUM_ATTEMPTS', 'FRONTEND_ORIGIN',
 ];
 const HELP = `Use: source app/scripts/setup_reliability_env.sh [options]
-Required: --account ID --fixture PATH --invalid-fixture PATH --clock-skew-ms MS
+Required: --account ID --fixture PATH --invalid-fixture PATH
+  --clock-skew-ms MS    Clock skew upper bound, 1..5000; default 1000 ms
   --start-worker        Build/start Worker and dependencies after loading Terraform outputs
   --terraform-directory PATH  Default: app/infra/terraform-e2e relative to this script
   --project NAME        Default: streaming-video-e2e
@@ -41,7 +42,7 @@ export function setupEnvironment(values, execute = execFileSync, discover = disc
   try {
     const account = values.account;
     if (!/^\d{12}$/.test(account || '')) throw Error();
-    const clockSkewMs = values['clock-skew-ms'];
+    const clockSkewMs = values['clock-skew-ms'] ?? '1000';
     if (!/^\d+$/.test(clockSkewMs || '') || Number(clockSkewMs) < 1 || Number(clockSkewMs) > 5000) throw Error();
     const paths = [values.fixture, values['invalid-fixture']].map(path => {
       if (!path) throw Error();

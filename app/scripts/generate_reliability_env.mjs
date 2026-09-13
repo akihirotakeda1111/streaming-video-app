@@ -66,10 +66,10 @@ function positive(value, label, max = 43200) {
  * @returns {Record<string, string>}
  */
 export function discoverEnvironment(options, execute = execFileSync) {
-  if (options.full && (!options.fixture || !options.invalidFixture || !options.clockSkewMs))
-    fail("--full requires --fixture, --invalid-fixture and --clock-skew-ms");
+  if (options.full && (!options.fixture || !options.invalidFixture))
+    fail("--full requires --fixture and --invalid-fixture");
   const clockSkewMs = options.clockSkewMs === undefined
-    ? "" : String(positive(options.clockSkewMs, "clock skew bound", 5000));
+    ? "1000" : String(positive(options.clockSkewMs, "clock skew bound", 5000));
   if (!safeName(options.worker) || !safeName(options.database))
     fail("Worker and database names or IDs are required");
   const host =
@@ -416,7 +416,7 @@ export function renderPowerShell(env) {
     "# DATABASE_URL and Worker credentials remain in their existing containers; do not copy them here.",
     "# Empty E2E_RELIABILITY_DISPOSABLE requires confirmation; then set it to true.",
     "# Empty E2E_VALID_FIXTURE requires an absolute MP4 path.",
-    "# Full suite also requires E2E_INVALID_FIXTURE and a measured E2E_CLOCK_SKEW_MS bound.",
+    "# Full suite also requires E2E_INVALID_FIXTURE. Verify the E2E_CLOCK_SKEW_MS bound (default 1000 ms).",
     "# Fixture checks cover path/size only; verify normal media and invalid media contents separately.",
     "# Start API/frontend with matching URLs and CORS; install Chromium and host FFmpeg.",
     "# API_PORT/FRONTEND_PORT follow the URLs. Compose serves HTTP; HTTPS requires a separately configured proxy.",
@@ -442,7 +442,7 @@ Usage: node app/scripts/generate_reliability_env.mjs --worker NAME --database NA
   --api-url URL         Default http://127.0.0.1:8000; set the actual URL if different
   --fixture PATH        Existing MP4; otherwise emit an empty setting for manual completion
   --invalid-fixture PATH Existing nonempty invalid .mp4 for FFmpeg exhaustion
-  --clock-skew-ms MS     Explicit clock skew upper bound, 1..5000; otherwise emit empty
+  --clock-skew-ms MS     Clock skew upper bound, 1..5000; default 1000 ms
   --full                Require all full-suite inputs; does not execute tests or verify media contents
   --evidence-dir PATH   Default artifacts/reliability-e2e under the current directory
   --alarms A,B,C        Select exactly three matching alarms when discovery is ambiguous
