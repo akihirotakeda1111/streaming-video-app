@@ -295,11 +295,23 @@ Playlist内のsegment参照は `segment-00000.ts` のような相対名です。
 - Input S3 CORSのorigin、Output S3 CORSのorigin、`FRONTEND_ORIGIN` が実際のFrontend originと一致すること
 - APIとWorkerに別々の最小権限AWS credentialsを用意すること
 
-通常開発用のAWS resourcesはCompose起動前に用意してください。Reliability E2Eでは独立した `infra/terraform-e2e/` と `compose.e2e.yaml` を使います。アカウント確認、state、plan/apply、認証設定は [専用環境の運用ガイド](./frontend/e2e/reliability/runner.md#事前準備) に従ってください。
+通常開発用のAWS resourcesはCompose起動前に `infra/terraform/` で用意してください。既存環境を使う場合も、この通常開発用stateの出力とIAM userを確認します。S3 / SQSは実AWSを使用するため、Composeだけでは作成されません。
+
+`infra/terraform-e2e/` と `compose.e2e.yaml`、`setup_reliability_env.sh --start-services` はReliability E2E専用です。これらの準備・起動手順は後述の [Reliability E2E（Phase 2）](#reliability-e2ephase-2) を参照してください。
 
 ### Configuration
 
-`app/.env.example` を `app/.env` にコピーし、placeholderを実際のAWS resource valuesへ置き換えます。
+`app/.env.example` を `app/.env` にコピーし、placeholderと認証情報を通常開発用の値へ置き換えます。既存の `.env` がある場合は上書きせず、内容を確認・更新してください。
+
+通常開発用Terraformの出力は、repository rootから次のコマンドで確認できます。
+
+```sh
+terraform -chdir=app/infra/terraform output
+```
+
+`aws_region`、`video_input_bucket_name`、`video_output_bucket_name`、`video_encoding_queue_url` をそれぞれ `.env` の `AWS_REGION`、`VIDEO_INPUT_BUCKET`、`VIDEO_OUTPUT_BUCKET`、`VIDEO_ENCODING_QUEUE_URL` に反映します。`OUTPUT_S3_ENDPOINT` もそのOutput bucketとregionに合わせます。`api_local_execution` / `worker_local_execution` のIAM userに対応する認証情報を `API_AWS_*` / `WORKER_AWS_*` に設定してください。Terraformはaccess keyを発行しません。
+
+E2Eセットアップを `source` したシェルでは、AWS接続先・Worker設定・API URLなどがexportされています。Composeではシェルの環境変数が `--env-file` の値より優先されるため、通常開発はE2E設定を読み込んでいない新しいターミナルで実行してください。シェルの起動設定でもこれらをexportしている場合は解除し、`.env` 自体にもE2E用の接続先や認証情報が残っていないことを確認します。
 
 主なruntime variablesは次のとおりです。
 
@@ -329,12 +341,18 @@ heartbeat間隔の2倍がlease期間・visibility延長・sourceキューのvisi
 
 ### Start the complete local stack
 
-`app/` から実行します。
+repository rootから `app/` へ移動し、通常用の `compose.yaml`、`.env`、プロジェクト名 `app`（このディレクトリの既定名）を明示して起動します。
 
 ```sh
-docker compose up --build -d
-docker compose ps
+cd app
+docker compose -p app --env-file .env -f compose.yaml config --quiet
+docker compose -p app --env-file .env -f compose.yaml up --build -d
+docker compose -p app --env-file .env -f compose.yaml ps -a
 ```
+
+`postgres`、`api`、`worker`、`frontend` が起動し、`migrate` が終了コード0で完了していることを確認します。通常用PostgreSQLのコンテナ名は `streaming-video-postgres`、データvolume名は `streaming-video-postgres-data` です。
+
+Reliability E2Eの既定プロジェクト名は `streaming-video-e2e` です。Frontend / APIの既定ポートは通常環境と重なるため、E2Eが起動中の場合はテスト終了後にその環境を停止してから通常環境を起動してください。プロジェクトを分けてもAWS接続先は自動では分離されないため、前述の `.env` とシェル環境の確認が必要です。
 
 既定の接続先は次のとおりです。
 
@@ -346,8 +364,8 @@ docker compose ps
 ログ確認と停止:
 
 ```sh
-docker compose logs -f api worker frontend
-docker compose down
+docker compose -p app --env-file .env -f compose.yaml logs -f api worker frontend
+docker compose -p app --env-file .env -f compose.yaml down
 ```
 
 ローカルPostgreSQL dataを含むvolume削除は破壊的です。必要な場合だけ、[local Compose runbook](./docs/runbooks/local-compose.md) の注意事項を確認してください。
