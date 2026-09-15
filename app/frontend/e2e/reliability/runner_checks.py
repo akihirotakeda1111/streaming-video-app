@@ -53,7 +53,7 @@ class RunnerChecks(unittest.TestCase):
                         evidence["runId"] = "another-run"
                     if fault == "scenario-mismatch":
                         evidence["scenario"] = "another-scenario"
-                if name == "phase1-pipeline":
+                if name in ("phase1-pipeline", "delivery-regression"):
                     self.assertNotIn("E2E_INCLUDE_RELIABILITY", env)
                     self.assertEqual(env["E2E_PROJECT"], "chromium")
                     self.assertEqual(command[-2:], ["--retries", "0"])
@@ -83,8 +83,8 @@ class RunnerChecks(unittest.TestCase):
         code, report, calls = self.full_suite()
         self.assertEqual(code, 0)
         self.assertEqual(report["status"], "passed")
-        self.assertEqual([name for name, _ in calls], [*MODULE["FULL_LIVE_SCENARIOS"], "phase1-pipeline"])
-        self.assertEqual(len({env["E2E_RUN_ID"] for _, env in calls}), 7)
+        self.assertEqual([name for name, _ in calls], [*MODULE["FULL_LIVE_SCENARIOS"], "phase1-pipeline", "delivery-regression"])
+        self.assertEqual(len({env["E2E_RUN_ID"] for _, env in calls}), 8)
         monitoring = calls[5][1]
         self.assertEqual(monitoring["E2E_FFMPEG_EVIDENCE_RUN"], calls[3][1]["E2E_RUN_ID"])
         self.assertEqual(monitoring["E2E_POISON_EVIDENCE_RUN"], calls[4][1]["E2E_RUN_ID"])
@@ -97,7 +97,7 @@ class RunnerChecks(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(report["status"], "failed")
                 self.assertEqual(report["liveEvidence"][5]["status"], "failed")
-                self.assertEqual(report["unexecutedLiveChecks"], ["phase1-pipeline"])
+                self.assertEqual(report["unexecutedLiveChecks"], ["phase1-pipeline", "delivery-regression"])
                 self.assertEqual(len(calls), 6)
 
     def test_full_suite_requires_playback_artifact(self):
@@ -105,7 +105,8 @@ class RunnerChecks(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(len(calls), 7)
         self.assertEqual(report["status"], "failed")
-        self.assertEqual(report["liveEvidence"][-1]["status"], "failed")
+        self.assertEqual(report["liveEvidence"][-2]["status"], "failed")
+        self.assertEqual(report["liveEvidence"][-1]["status"], "unexecuted")
 
     def test_full_suite_preserves_partial_report_on_errors(self):
         for fault in ("config", "authorize", "launch", "exit"):
@@ -117,7 +118,7 @@ class RunnerChecks(unittest.TestCase):
                 self.assertEqual(report["liveEvidence"][0]["status"], "passed")
                 self.assertEqual(report["liveEvidence"][1]["status"], "blocked" if blocked else "failed")
                 self.assertEqual(report["unexecutedLiveChecks"],
-                                 [*MODULE["FULL_LIVE_SCENARIOS"][2:], "phase1-pipeline"])
+                                 [*MODULE["FULL_LIVE_SCENARIOS"][2:], "phase1-pipeline", "delivery-regression"])
 
     def test_preflight_selects_browser_project(self):
         for project in ("", "firefox"):

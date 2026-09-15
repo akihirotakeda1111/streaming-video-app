@@ -79,3 +79,31 @@ or promise immediate recovery based solely on this setting. See
 If playback fails, repair or postpone the API/distribution cutover while
 retaining private S3. Roll back by correcting the distribution, origin, or API
 configuration; never reopen the bucket to anonymous S3 reads.
+
+## Integrated delivery acceptance
+
+Use the dedicated E2E runner identity; it needs read-only CloudFront
+distribution/OAC/response-policy inspection and output bucket policy/BPA access,
+plus the existing scoped `s3:GetObject` inspection permission. Generate and
+review the disposable environment as described by the reliability runner, then
+run the offline commands from the task independently. Offline helper,
+discovery, type-check, and contract results are not live evidence.
+
+Run `python app/scripts/run_reliability_e2e.py --live-preflight` before the
+suite. The browser preflight additionally matches `PLAYBACK_BASE_URL` to one
+Deployed distribution, its regional S3 origin and SigV4 OAC, all four BPA
+settings, the distribution-scoped bucket policy, and the frontend origin in the
+CloudFront response-headers policy.
+
+Finally run `python app/scripts/run_reliability_e2e.py --full-suite`. It keeps
+all six Phase 2 scenarios, creates a fresh Phase 1 completion, proves that a
+403/404 requested before publication becomes a CloudFront 200 within the
+existing processing/playback bounds, and checks repeated HTTPS delivery,
+manifest/segment MIME types, relative segment references, allowed and denied
+CORS origins, anonymous S3 rejection, SDK-only private-object inspection, and
+positive browser media-time advancement. The final delivery-regression step
+lists completed manifests with the dedicated SDK identity, replays up to three
+through CloudFront, and confirms their keys did not move. Preserve the emitted
+run directories and `full-suite-*.json`; a missing/failed/unexecuted row is not
+a PASS. Cache-hit headers are deliberately not required while successful TTLs
+remain zero.

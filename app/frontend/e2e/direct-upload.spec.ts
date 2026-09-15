@@ -1,4 +1,5 @@
-import { test, expect, type Page, type Request } from '@playwright/test'
+import { execFileSync } from 'node:child_process'
+import { test, expect, type Page, type Request, type APIRequestContext } from '@playwright/test'
 import { normalizePlaybackBaseURL } from '../../scripts/generate_reliability_env.mjs'
 import { e2eConfig } from './config.js'
 import { attachSafeDiagnostic, safeDiagnostic } from './diagnostics.js'
@@ -39,6 +40,16 @@ interface BrowserPlaybackEvidence {
   initialTime: number
   currentTime: number
   advancement: number
+  delivery: DeliveryEvidence
+}
+
+interface DeliveryEvidence {
+  missingBeforePublication: number
+  cloudFrontStatuses: number[]
+  anonymousS3Status: number
+  allowedOrigin: string
+  disallowedOriginAllowed: boolean
+  sdkObjectsInspected: number
 }
 
 interface MediaNetworkFailure {
@@ -256,10 +267,89 @@ async function inspectHlsObjects(
   return result.segments.length
 }
 
+function inspectPrivateObjectsWithSdk(keys: string[]): number {
+  const bucket = process.env.E2E_OUTPUT_BUCKET?.trim()
+  const region = process.env.AWS_REGION?.trim()
+  if (!bucket || !region) throw new Error('dedicated E2E SDK output inspection is not configured')
+  for (const key of keys) {
+    execFileSync(
+      'aws',
+      ['s3api', 'head-object', '--bucket', bucket, '--key', key, '--region', region, '--output', 'json'],
+      {
+        encoding: 'utf8',
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { ...process.env, AWS_EC2_METADATA_DISABLED: 'true', AWS_PAGER: '', AWS_CLI_AUTO_PROMPT: 'off' },
+      },
+    )
+  }
+  return keys.length
+}
+
+async function verifyPrivateCloudFrontDelivery(
+  request: APIRequestContext,
+  manifest: URL,
+  segmentReferences: string[],
+  missingBeforePublication: number,
+  frontendOrigin: string,
+): Promise<DeliveryEvidence> {
+  expect([403, 404]).toContain(missingBeforePublication)
+  const cloudFrontStatuses: number[] = []
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await request.get(manifest.href, { headers: { Origin: frontendOrigin } })
+    cloudFrontStatuses.push(response.status())
+    expect(response.status()).toBe(200)
+    expect(response.url()).toMatch(/^https:/)
+    expect(response.headers()['content-type']?.split(';', 1)[0]).toBe('application/vnd.apple.mpegurl')
+    expect(response.headers()['access-control-allow-origin']).toBe(frontendOrigin)
+  }
+
+  const preflightHeaders = {
+    Origin: frontendOrigin,
+    'Access-Control-Request-Method': 'GET',
+    'Access-Control-Request-Headers': 'range',
+  }
+  const preflight = await request.fetch(manifest.href, { method: 'OPTIONS', headers: preflightHeaders })
+  expect(preflight.status()).toBeGreaterThanOrEqual(200)
+  expect(preflight.status()).toBeLessThan(300)
+  expect(preflight.headers()['access-control-allow-origin']).toBe(frontendOrigin)
+  expect(preflight.headers()['access-control-allow-methods']).toContain('GET')
+
+  const disallowed = await request.get(manifest.href, {
+    headers: { Origin: 'https://disallowed.invalid' },
+  })
+  expect(disallowed.status()).toBe(200)
+  const disallowedOriginAllowed = Boolean(disallowed.headers()['access-control-allow-origin'])
+  expect(disallowedOriginAllowed).toBe(false)
+  const disallowedPreflight = await request.fetch(manifest.href, {
+    method: 'OPTIONS',
+    headers: { ...preflightHeaders, Origin: 'https://disallowed.invalid' },
+  })
+  expect(disallowedPreflight.headers()['access-control-allow-origin']).toBeUndefined()
+
+  const outputEndpoint = process.env.OUTPUT_S3_ENDPOINT?.trim()
+  if (!outputEndpoint) throw new Error('OUTPUT_S3_ENDPOINT is required for anonymous S3 rejection')
+  const anonymous = await request.get(`${outputEndpoint}${manifest.pathname}`)
+  expect([401, 403]).toContain(anonymous.status())
+
+  const keys = [manifest.pathname.slice(1), ...segmentReferences.map((reference) =>
+    new URL(reference, manifest).pathname.slice(1))]
+  return {
+    missingBeforePublication,
+    cloudFrontStatuses,
+    anonymousS3Status: anonymous.status(),
+    allowedOrigin: frontendOrigin,
+    disallowedOriginAllowed,
+    sdkObjectsInspected: inspectPrivateObjectsWithSdk(keys),
+  }
+}
+
 async function proveBrowserPlayback(
   page: Page,
   manifestUrl: string,
   segmentCount: number,
+  delivery: DeliveryEvidence,
 ): Promise<BrowserPlaybackEvidence> {
   const players = page.locator('video[aria-label="Uploaded video"]')
   await expect(players, 'exactly one video.js player must initialize').toHaveCount(1)
@@ -341,6 +431,7 @@ async function proveBrowserPlayback(
     initialTime,
     currentTime: finalState.currentTime,
     advancement: finalState.currentTime - initialTime,
+    delivery,
   }
 }
 
@@ -386,7 +477,7 @@ test.use({ trace: 'off' })
 
 test.describe('@phase1-pipeline', () => {
   test('uploads one video and reaches COMPLETED through the asynchronous pipeline', async ({
-    page,
+    page, request,
   }, testInfo) => {
     const createTarget = createVideoTarget()
     const apiOrigin = new URL(e2eConfig.apiUrl).origin
@@ -403,11 +494,26 @@ test.describe('@phase1-pipeline', () => {
     let latestStatusIndex = -1
     let playbackEvidence: BrowserPlaybackEvidence | undefined
     let playbackManifest: URL | undefined
+    let missingBeforePublication: number | undefined
     const observedStatuses: JobStatus[] = []
     const statusResponses: Promise<StatusObservation>[] = []
     const playbackResponses: Promise<PlaybackObservation>[] = []
     const mediaNetworkFailures: MediaNetworkFailure[] = []
     let passed = false
+
+    await page.route('**', async (route) => {
+      const upload = route.request()
+      if (upload.method() === 'PUT' && missingBeforePublication === undefined) {
+        const path = new URL(upload.url()).pathname
+        const match = path.match(/\/videos\/([^/]+)\/jobs\/([^/]+)\//)
+        if (match) {
+          const futureManifest = `${normalizePlaybackBaseURL(process.env.PLAYBACK_BASE_URL ?? '')}/videos/${match[1]}/jobs/${match[2]}/hls/index.m3u8`
+          const response = await request.get(futureManifest)
+          missingBeforePublication = response.status()
+        }
+      }
+      await route.continue()
+    })
 
     page.on('response', (response) => {
       const method = response.request().method()
@@ -592,7 +698,16 @@ test.describe('@phase1-pipeline', () => {
           apiOrigin,
           frontendOrigin,
         )
-        playbackEvidence = await proveBrowserPlayback(page, playback.manifestUrl, segmentCount)
+        if (missingBeforePublication === undefined) {
+          throw new Error('missing CloudFront key was not requested before publication')
+        }
+        const manifestText = await (await request.get(playback.manifestUrl)).text()
+        const segmentReferences = manifestText.split(/\r?\n/).map((line) => line.trim())
+          .filter((line) => line.length > 0 && !line.startsWith('#'))
+        const delivery = await verifyPrivateCloudFrontDelivery(
+          request, playbackManifest, segmentReferences, missingBeforePublication, frontendOrigin,
+        )
+        playbackEvidence = await proveBrowserPlayback(page, playback.manifestUrl, segmentCount, delivery)
 
         const mediaPrefix = `/videos/${videoId}/jobs/${jobId}/hls/`
         const fatalMediaFailures = failuresForMedia(
@@ -653,6 +768,7 @@ test.describe('@phase1-pipeline', () => {
         initialTime: playbackEvidence?.initialTime,
         currentTime: playbackEvidence?.currentTime,
         advancement: playbackEvidence?.advancement,
+        delivery: playbackEvidence?.delivery,
         failures: failuresForMedia(mediaNetworkFailures, playbackManifest, mediaPrefix),
       }
       const diagnostics = {

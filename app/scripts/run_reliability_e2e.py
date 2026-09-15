@@ -23,6 +23,7 @@ SCENARIOS = {
     "ffmpeg-exhaustion": ("@ffmpeg-exhaustion", "invalid media FFmpeg exhaustion and run-owned DLQ isolation"),
     "poison-isolation": ("@poison-isolation", "malformed and unknown-job poison DLQ isolation with a concurrently valid job"),
     "queue-monitoring": ("@queue-monitoring", "read-only source backlog, DLQ depth, and alarm observation correlated with failure evidence"),
+    "delivery-regression": ("@delivery-regression", "previously completed private output replay through CloudFront"),
 }
 FULL_LIVE_SCENARIOS = (
     "duplicate-delivery",
@@ -132,7 +133,7 @@ def _dispatch(config: LiveConfig, selector: str, project: str, reliability: bool
     else:
         child_environment.pop("E2E_INCLUDE_RELIABILITY", None)
         child_environment["E2E_PROJECT"] = project
-    if config.scenario == "phase1-pipeline":
+    if config.scenario in ("phase1-pipeline", "delivery-regression"):
         args.extend(["--retries", "0"])
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
@@ -224,6 +225,10 @@ def _full() -> int:
         run_row("phase1-pipeline", "@phase1-pipeline", "chromium", False)
         failed = rows[-1]["status"] != "passed"
 
+    if not failed:
+        run_row("delivery-regression", "@delivery-regression", "chromium", False)
+        failed = rows[-1]["status"] != "passed"
+
     for name in FULL_LIVE_SCENARIOS:
         if not any(row["name"] == name for row in rows):
             rows.append({"name": name, "selector": SCENARIOS[name][0], "project": "reliability",
@@ -231,9 +236,12 @@ def _full() -> int:
     if not any(row["name"] == "phase1-pipeline" for row in rows):
         rows.append({"name": "phase1-pipeline", "selector": "@phase1-pipeline", "project": "chromium",
                      "status": "unexecuted", "reason": "failure or missing scenario prevented final upload"})
+    if not any(row["name"] == "delivery-regression" for row in rows):
+        rows.append({"name": "delivery-regression", "selector": "@delivery-regression", "project": "chromium",
+                     "status": "unexecuted", "reason": "failure prevented completed-output replay"})
 
     report = {
-        "suite": "phase2-reliability-e2e-playback-regression",
+        "suite": "phase3-cloudfront-delivery-e2e-regression",
         "status": "blocked" if any(row["status"] == "blocked" for row in rows) else "failed" if failed else "passed",
         "componentChecks": [{"command": command, "status": "declared; run by offline validation"}
                             for command in COMPONENT_CHECKS],
