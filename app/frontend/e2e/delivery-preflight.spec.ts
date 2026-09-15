@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { test, expect } from '@playwright/test'
 import { normalizePlaybackBaseURL } from '../../scripts/generate_reliability_env.mjs'
 import { e2eConfig } from './config.js'
+import { persistPlaybackEvidence } from './playback-evidence.js'
 
 function aws(args: string[]): unknown {
   const region = process.env.AWS_REGION?.trim()
@@ -20,7 +21,7 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 test.describe('@preflight @delivery-preflight', () => {
-  test('verifies private output bucket, deployed distribution, OAC, and frontend CORS policy', () => {
+  test('verifies private output bucket, deployed distribution, OAC, and frontend CORS policy', async () => {
     const playback = new URL(normalizePlaybackBaseURL(process.env.PLAYBACK_BASE_URL ?? ''))
     const bucket = process.env.E2E_OUTPUT_BUCKET?.trim()
     const account = process.env.E2E_AWS_ACCOUNT_ID?.trim()
@@ -75,5 +76,11 @@ test.describe('@preflight @delivery-preflight', () => {
     const cors = record(policyConfig.CorsConfig)
     const allowOrigins = record(cors.AccessControlAllowOrigins)
     expect(allowOrigins.Items).toContain(new URL(e2eConfig.frontendUrl).origin)
+    await persistPlaybackEvidence({ resources: {
+      distributionId: String(id), distributionArn, bucket,
+      oacId: String(origin.OriginAccessControlId),
+      frontendOrigin: new URL(e2eConfig.frontendUrl).origin,
+      deployed: true, privateOutput: true,
+    } }, true, process.env, 'delivery-preflight')
   })
 })

@@ -14,7 +14,9 @@ from pathlib import Path
 from dataclasses import dataclass
 from uuid import uuid4
 
+SUITE_ID = "phase3-cloudfront-delivery-e2e-regression"
 SCENARIOS = {
+    "delivery-preflight": ("@delivery-preflight", "read-only CloudFront/private S3 resource verification"),
     "preflight": ("@preflight", "local/browser/API readiness"),
     "runtime-authorization": ("@reliability", "reliability authorization"),
     "duplicate-delivery": ("@duplicate-delivery", "active and completed redelivery with correlated media and acknowledgement evidence"),
@@ -108,8 +110,14 @@ def _live_config(scenario: str, ffmpeg_evidence_run: str | None = None, poison_e
 
 
 def _preflight() -> int:
-    """Verify disposable targets without creating a run or dispatching Playwright."""
+    """Verify disposable targets and persist the read-only delivery gate evidence."""
     evidence = _settings("preflight")
+    config = _live_config("delivery-preflight")
+    code = _run(config)
+    if code != 0:
+        return code
+    _validate_evidence(config, config.evidence_dir / "delivery-preflight-evidence.json")
+    evidence["deliveryEvidenceDirectory"] = str(config.evidence_dir)
     record = {**evidence, "scenarioStarted": False}
     evidence_dir = Path(os.environ["E2E_EVIDENCE_DIR"].strip()) / f"preflight-{uuid4()}"
     evidence_dir.mkdir(parents=True, exist_ok=False)
@@ -133,7 +141,7 @@ def _dispatch(config: LiveConfig, selector: str, project: str, reliability: bool
     else:
         child_environment.pop("E2E_INCLUDE_RELIABILITY", None)
         child_environment["E2E_PROJECT"] = project
-    if config.scenario in ("phase1-pipeline", "delivery-regression"):
+    if config.scenario in ("phase1-pipeline", "delivery-regression", "delivery-preflight"):
         args.extend(["--retries", "0"])
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
@@ -149,6 +157,8 @@ def _dispatch(config: LiveConfig, selector: str, project: str, reliability: bool
 
 def _run(config: LiveConfig) -> int:
     """Dispatch one registered reliability scenario."""
+    if config.scenario in ("delivery-preflight", "delivery-regression"):
+        return _dispatch(config, SCENARIOS[config.scenario][0], "chromium", False)
     if config.scenario == "preflight":
         return _dispatch(config, SCENARIOS[config.scenario][0],
                          os.environ.get("E2E_PROJECT", "").strip() or "chromium", False)
@@ -172,7 +182,7 @@ def _validate_evidence(config: LiveConfig, evidence_file: Path) -> None:
 
 
 def _full() -> int:
-    """Run every live failure scenario serially, then the fresh Phase 1 playback test."""
+    """Gate delivery resources, run all reliability scenarios, then verify playback."""
     _settings("validate")
     parent = Path(os.environ["E2E_EVIDENCE_DIR"].strip()).resolve()
     report_path = parent / f"full-suite-{uuid4()}.json"
@@ -205,8 +215,10 @@ def _full() -> int:
             completed[name] = config.evidence_dir.name
         return code
 
-    failed = False
+    failed = run_row("delivery-preflight", "@delivery-preflight", "chromium", False) != 0
     for name in FULL_LIVE_SCENARIOS:
+        if failed:
+            break
         if name == "queue-monitoring":
             code = run_row(
                 name, SCENARIOS[name][0], "reliability", True,
@@ -241,7 +253,7 @@ def _full() -> int:
                      "status": "unexecuted", "reason": "failure prevented completed-output replay"})
 
     report = {
-        "suite": "phase3-cloudfront-delivery-e2e-regression",
+        "suite": SUITE_ID,
         "status": "blocked" if any(row["status"] == "blocked" for row in rows) else "failed" if failed else "passed",
         "componentChecks": [{"command": command, "status": "declared; run by offline validation"}
                             for command in COMPONENT_CHECKS],
@@ -292,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return _full()
         except (ValueError, OSError) as error:
-            print(json.dumps({"status": "blocked", "suite": "phase2-reliability-e2e-playback-regression",
+            print(json.dumps({"status": "blocked", "suite": SUITE_ID,
                               "message": str(error) if isinstance(error, ValueError) else "full-suite dispatch failed",
                               "liveResourcesVerified": False}), file=sys.stderr)
             return 2

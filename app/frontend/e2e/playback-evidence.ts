@@ -16,7 +16,7 @@ export async function persistPlaybackEvidence(
     || !directory || !isAbsolute(directory) || basename(directory) !== runId) {
     throw new Error('Playback evidence requires a run-scoped destination')
   }
-  if (!['phase1-pipeline', 'delivery-regression'].includes(scenario)) {
+  if (!['phase1-pipeline', 'delivery-regression', 'delivery-preflight'].includes(scenario)) {
     throw new Error('Unsupported playback evidence scenario')
   }
   const report: Record<string, unknown> = {

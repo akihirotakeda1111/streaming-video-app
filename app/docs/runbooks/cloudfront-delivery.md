@@ -90,7 +90,9 @@ run the offline commands from the task independently. Offline helper,
 discovery, type-check, and contract results are not live evidence.
 
 Run `python app/scripts/run_reliability_e2e.py --live-preflight` before the
-suite. The browser preflight additionally matches `PLAYBACK_BASE_URL` to one
+suite. This runs the read-only delivery preflight and requires its run-scoped
+evidence. The full suite also runs this gate before any reliability scenario;
+a failed gate or missing evidence prevents all later scenarios. It matches `PLAYBACK_BASE_URL` to one
 Deployed distribution, its regional S3 origin and SigV4 OAC, all four BPA
 settings, the distribution-scoped bucket policy, and the frontend origin in the
 CloudFront response-headers policy.
@@ -102,8 +104,38 @@ existing processing/playback bounds, and checks repeated HTTPS delivery,
 manifest/segment MIME types, relative segment references, allowed and denied
 CORS origins, anonymous S3 rejection, SDK-only private-object inspection, and
 positive browser media-time advancement. The final delivery-regression step
-lists completed manifests with the dedicated SDK identity, replays up to three
-through CloudFront, and confirms their keys did not move. Preserve the emitted
+uses the pre-cutover inventory described below, checks each real status and
+playback API, and plays each job with video.js on the actual frontend origin.
+It requires positive media-time advancement and CloudFront manifest/segment
+responses, and checks the original manifest key and ETag using dedicated IAM
+before and after playback. Preserve the emitted
 run directories and `full-suite-*.json`; a missing/failed/unexecuted row is not
 a PASS. Cache-hit headers are deliberately not required while successful TTLs
 remain zero.
+
+### Previously completed job inventory
+
+Before changing delivery, record at least one completed Phase 1 job and one
+completed Phase 2 job from the dedicated disposable environment. Save their
+original IDs, manifest keys, and S3 HeadObject ETags in an operator-owned JSON
+file. Set `capturedAt` to the inventory capture time and `cutoverAt` to the actual
+subsequent CloudFront cutover time (UTC ISO timestamps). Retain the corresponding
+pre-cutover completion evidence; the phase labels are operator-supplied provenance.
+Do not generate replacements during the suite or move/re-encode the old objects.
+
+The JSON shape is `{ "capturedAt": "…", "cutoverAt": "…", "jobs": [...] }`.
+Each job contains `phase` (`phase1` or `phase2`), `videoId`, `jobId`,
+`manifestKey` (`videos/<videoId>/jobs/<jobId>/hls/index.m3u8`), and
+`manifestETag` (the exact HeadObject ETag string, including its double quotes).
+Both phases are mandatory; 2–10 distinct videos are supported. Job `updatedAt`
+must be no later than capture, and capture must precede cutover.
+
+After loading the generated environment, export
+`E2E_LEGACY_DELIVERY_FIXTURES=/absolute/path/to/legacy-delivery.json` in the runner
+shell. The generator does not create historical evidence. Missing/invalid
+inventory fails the delivery regression; it never substitutes fresh output.
+For an isolated rerun, use
+`python app/scripts/run_reliability_e2e.py --scenario delivery-regression`.
+Both this command and the full suite select Chromium with retries disabled.
+The existing UI has no route for reopening old jobs, so the E2E harness mounts
+the installed video.js player on the frontend page with the real API URL.
