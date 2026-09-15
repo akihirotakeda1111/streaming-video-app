@@ -1,10 +1,9 @@
 import { execFileSync } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { test, expect, type Response } from '@playwright/test'
 import { normalizePlaybackBaseURL } from '../../scripts/generate_reliability_env.mjs'
 import { e2eConfig } from './config.js'
-import { parseLegacyDeliveryFixtures } from './delivery-fixtures.js'
+import { loadDeliveryTargets } from './delivery-fixtures.js'
 import { persistPlaybackEvidence } from './playback-evidence.js'
 
 function objectETag(key: string): string {
@@ -23,10 +22,8 @@ function objectETag(key: string): string {
 }
 
 test.describe('@delivery-regression', () => {
-  test('plays pre-cutover Phase 1 and Phase 2 jobs using their real playback API', async ({ page, request }) => {
-    const inventoryPath = process.env.E2E_LEGACY_DELIVERY_FIXTURES?.trim()
-    if (!inventoryPath) throw new Error('E2E_LEGACY_DELIVERY_FIXTURES must name a pre-cutover inventory JSON file')
-    const inventory = parseLegacyDeliveryFixtures(await readFile(inventoryPath, 'utf8'))
+  test('replays selected completed jobs using their real playback API', async ({ page, request }) => {
+    const inventory = await loadDeliveryTargets(process.env)
     const origin = normalizePlaybackBaseURL(process.env.PLAYBACK_BASE_URL ?? '')
     const frontendOrigin = new URL(e2eConfig.frontendUrl).origin
     const api = e2eConfig.apiUrl.replace(/\/$/, '').replace(/\/api\/v1$/, '') + '/api/v1'
@@ -101,6 +98,7 @@ test.describe('@delivery-regression', () => {
       passed = true
     } finally {
       await persistPlaybackEvidence({ 'cloudfront-completed-replay': { checked,
+        verificationScope: inventory.verificationScope, sourceRunId: inventory.sourceRunId,
         capturedAt: inventory.capturedAt, cutoverAt: inventory.cutoverAt } }, passed, process.env, 'delivery-regression')
     }
   })

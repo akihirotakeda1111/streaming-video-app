@@ -44,6 +44,9 @@ interface BrowserPlaybackEvidence {
 }
 
 interface DeliveryEvidence {
+  manifestKey: string
+  manifestETag: string
+  outputBucket: string
   missingBeforePublication: number
   cloudFrontStatuses: number[]
   anonymousS3Status: number
@@ -267,12 +270,13 @@ async function inspectHlsObjects(
   return result.segments.length
 }
 
-function inspectPrivateObjectsWithSdk(keys: string[]): number {
+function inspectPrivateObjectsWithSdk(keys: string[]): Pick<DeliveryEvidence, 'sdkObjectsInspected' | 'manifestKey' | 'manifestETag' | 'outputBucket'> {
   const bucket = process.env.E2E_OUTPUT_BUCKET?.trim()
   const region = process.env.AWS_REGION?.trim()
   if (!bucket || !region) throw new Error('dedicated E2E SDK output inspection is not configured')
+  let manifestETag = ''
   for (const key of keys) {
-    execFileSync(
+    const raw = execFileSync(
       'aws',
       ['s3api', 'head-object', '--bucket', bucket, '--key', key, '--region', region, '--output', 'json'],
       {
@@ -283,8 +287,10 @@ function inspectPrivateObjectsWithSdk(keys: string[]): number {
         env: { ...process.env, AWS_EC2_METADATA_DISABLED: 'true', AWS_PAGER: '', AWS_CLI_AUTO_PROMPT: 'off' },
       },
     )
+    if (key === keys[0]) manifestETag = (JSON.parse(raw) as { ETag: string }).ETag
   }
-  return keys.length
+  expect(manifestETag).toMatch(/^"[a-f0-9]+(?:-\d+)?"$/i)
+  return { sdkObjectsInspected: keys.length, manifestKey: keys[0]!, manifestETag, outputBucket: bucket }
 }
 
 async function verifyPrivateCloudFrontDelivery(
@@ -341,7 +347,7 @@ async function verifyPrivateCloudFrontDelivery(
     anonymousS3Status: anonymous.status(),
     allowedOrigin: frontendOrigin,
     disallowedOriginAllowed,
-    sdkObjectsInspected: inspectPrivateObjectsWithSdk(keys),
+    ...inspectPrivateObjectsWithSdk(keys),
   }
 }
 

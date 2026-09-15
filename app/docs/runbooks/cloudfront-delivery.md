@@ -104,7 +104,7 @@ existing processing/playback bounds, and checks repeated HTTPS delivery,
 manifest/segment MIME types, relative segment references, allowed and denied
 CORS origins, anonymous S3 rejection, SDK-only private-object inspection, and
 positive browser media-time advancement. The final delivery-regression step
-uses the pre-cutover inventory described below, checks each real status and
+automatically consumes the successful Phase 1 run from this same suite, checks its real status and
 playback API, and plays each job with video.js on the actual frontend origin.
 It requires positive media-time advancement and CloudFront manifest/segment
 responses, and checks the original manifest key and ETag using dedicated IAM
@@ -112,6 +112,37 @@ before and after playback. Preserve the emitted
 run directories and `full-suite-*.json`; a missing/failed/unexecuted row is not
 a PASS. Cache-hit headers are deliberately not required while successful TTLs
 remain zero.
+
+### Continuous full suite and isolated replay
+
+`--full-suite` passes the preceding `phase1-pipeline` run ID to delivery replay,
+just as queue monitoring receives its preceding failure scenario run IDs.
+No legacy inventory or manual selection is required. The Phase 1 evidence now
+includes the output bucket and original manifest key/ETag for this handoff.
+Failed or missing upstream evidence prevents replay. The aggregate report
+records `playbackEvidenceRun` and `verificationScope: completed-job-replay`.
+
+To replay a retained successful run independently, use:
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario delivery-regression --playback-evidence-run e2e-<UUID>
+```
+
+Keep `E2E_EVIDENCE_DIR` set to the parent evidence directory, as for monitoring.
+The selected child directory must contain `phase1-pipeline-evidence.json` from
+a successful run, with matching run/job IDs, COMPLETED status, bucket and
+manifest fingerprint. Older artifacts lacking these fields are rejected;
+use the historical inventory option below for pre-cutover acceptance.
+Missing files or deleted objects fail rather than selecting another job.
+
+The two source arguments are mutually exclusive and valid only for standalone
+delivery regression. Inherited `E2E_PLAYBACK_EVIDENCE_RUN` and
+`E2E_LEGACY_DELIVERY_FIXTURES` are cleared by the runner: explicit CLI selection
+or the full suite's automatic handoff is authoritative.
+
+Full-suite success proves current completed-job replay, not pre-cutover
+compatibility. Task 04's historical acceptance still requires the separate
+inventory run below; preserve both sets of evidence for completion.
 
 ### Previously completed job inventory
 
@@ -130,12 +161,15 @@ Each job contains `phase` (`phase1` or `phase2`), `videoId`, `jobId`,
 Both phases are mandatory; 2–10 distinct videos are supported. Job `updatedAt`
 must be no later than capture, and capture must precede cutover.
 
-After loading the generated environment, export
-`E2E_LEGACY_DELIVERY_FIXTURES=/absolute/path/to/legacy-delivery.json` in the runner
-shell. The generator does not create historical evidence. Missing/invalid
-inventory fails the delivery regression; it never substitutes fresh output.
-For an isolated rerun, use
-`python app/scripts/run_reliability_e2e.py --scenario delivery-regression`.
-Both this command and the full suite select Chromium with retries disabled.
+After loading the generated environment, run:
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario delivery-regression --legacy-delivery-fixtures /absolute/path/to/legacy-delivery.json
+```
+
+The result records `verificationScope: pre-cutover-compatibility`. The generator
+does not create historical evidence. Missing/invalid inventory fails the
+regression; it never substitutes fresh output. All replay modes select Chromium
+with retries disabled.
 The existing UI has no route for reopening old jobs, so the E2E harness mounts
 the installed video.js player on the frontend page with the real API URL.

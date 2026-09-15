@@ -37,6 +37,11 @@ class RunnerChecks(unittest.TestCase):
             def dispatch(command, **kwargs):
                 env = kwargs["env"]
                 name = command[command.index("--grep") + 1][1:]
+                self.assertNotIn("E2E_LEGACY_DELIVERY_FIXTURES", env)
+                if name == "delivery-regression":
+                    self.assertEqual(env["E2E_PLAYBACK_EVIDENCE_RUN"], calls[-1][1]["E2E_RUN_ID"])
+                else:
+                    self.assertNotIn("E2E_PLAYBACK_EVIDENCE_RUN", env)
                 calls.append((name, env))
                 if name == "delivery-preflight" and fault == "preflight-exit":
                     return subprocess.CompletedProcess(command, 1)
@@ -68,7 +73,9 @@ class RunnerChecks(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0)
 
             with patch.dict(os.environ, {"E2E_EVIDENCE_DIR": root, "E2E_PROJECT": "firefox",
-                                         "E2E_INCLUDE_RELIABILITY": "true"}), \
+                                         "E2E_INCLUDE_RELIABILITY": "true",
+                                         "E2E_PLAYBACK_EVIDENCE_RUN": "stale-run",
+                                         "E2E_LEGACY_DELIVERY_FIXTURES": "stale-inventory"}), \
                     patch.dict(GLOBALS, {"_settings": settings}), \
                     patch("shutil.which", return_value="node-test"), \
                     patch("subprocess.run", side_effect=dispatch), \
@@ -93,6 +100,40 @@ class RunnerChecks(unittest.TestCase):
         self.assertEqual(monitoring["E2E_FFMPEG_EVIDENCE_RUN"], calls[4][1]["E2E_RUN_ID"])
         self.assertEqual(monitoring["E2E_POISON_EVIDENCE_RUN"], calls[5][1]["E2E_RUN_ID"])
         self.assertEqual(report["unexecutedLiveChecks"], [])
+        self.assertEqual(report["liveEvidence"][-1]["playbackEvidenceRun"], calls[-2][1]["E2E_RUN_ID"])
+        self.assertEqual(report["liveEvidence"][-1]["verificationScope"], "completed-job-replay")
+
+    def test_delivery_source_arguments_and_stale_environment(self):
+        run_id = "e2e-11111111-1111-4111-8111-111111111111"
+        for source in (["--playback-evidence-run", run_id], ["--legacy-delivery-fixtures", "legacy.json"]):
+            with tempfile.TemporaryDirectory() as root:
+                with patch.dict(os.environ, {"E2E_EVIDENCE_DIR": root,
+                                             "E2E_PLAYBACK_EVIDENCE_RUN": "stale",
+                                             "E2E_LEGACY_DELIVERY_FIXTURES": "stale"}), \
+                        patch.dict(GLOBALS, {"_settings": lambda mode: {}}), \
+                        patch("shutil.which", return_value="node-test"), \
+                        patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as dispatch, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(MODULE["main"](["--scenario", "delivery-regression", *source]), 0)
+                env = dispatch.call_args.kwargs["env"]
+                self.assertEqual(env.get("E2E_PLAYBACK_EVIDENCE_RUN"), run_id if source[0] == "--playback-evidence-run" else None)
+                self.assertEqual(env.get("E2E_LEGACY_DELIVERY_FIXTURES"),
+                                 str(Path("legacy.json").resolve()) if source[0] == "--legacy-delivery-fixtures" else None)
+                self.assertEqual(dispatch.call_args.args[0][-4:], ["--project", "chromium", "--retries", "0"])
+
+    def test_delivery_references_reject_other_modes_and_paths(self):
+        run_id = "e2e-11111111-1111-4111-8111-111111111111"
+        cases = [["--scenario", "delivery-regression", "--playback-evidence-run", "../outside"],
+                 ["--scenario", "delivery-regression", "--playback-evidence-run", run_id, "--legacy-delivery-fixtures", "legacy.json"],
+                 ["--scenario", "queue-monitoring", "--playback-evidence-run", run_id]]
+        cases += [["--scenario", "delivery-regression", mode, "--playback-evidence-run", run_id]
+                  for mode in ("--full-suite", "--check", "--list", "--live-preflight")]
+        with patch.dict(GLOBALS, {"_settings": lambda mode: self.fail("must not validate or dispatch")}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            for args in cases:
+                with self.assertRaises(SystemExit) as error:
+                    MODULE["main"](args)
+                self.assertEqual(error.exception.code, 2)
 
     def test_full_suite_rejects_incomplete_evidence_before_playback(self):
         for fault in ("outstanding", "contradictory", "missing", "invalid", "run-mismatch", "scenario-mismatch"):
