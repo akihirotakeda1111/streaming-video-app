@@ -519,6 +519,8 @@ CloudFront + OAC、private Output S3、アプリ・DB・ネットワークのAWS
 
 ### Playback CloudFront URL Settings
 
+GitHub ActionsではRepository variablesの `PLAYBACK_BASE_URL` に、E2EのOutput bucketを配信するCloudFront HTTPS originを設定してください。値はTerraformの `playback_base_url` 出力で確認できます。`merge-tests.yml`、`agent-execute.yml`、`agent-review.yml` はこの値を起動処理とE2Eへ渡します。CIの `start-e2e-compose.sh` はTerraformを参照せず、未設定・不正値ならDocker操作前に停止します。E2Eは返されたmanifestのoriginがこの設定と一致することを検証します。
+
 APIは必須の `PLAYBACK_BASE_URL` に既存のHLSキーを連結します。S3への自動フォールバックはありません。ユーザー情報、パス、クエリ、フラグメントを含まないHTTPS originを指定してください。末尾のスラッシュは正規化します。APIのループバックHTTP許可はローカルテスト用です。
 
 統合セットアップは `--playback-url` → 環境変数 `PLAYBACK_BASE_URL` → Terraform出力 `playback_base_url` の順で取得し、コンテナ起動前に検証します。明示的に指定した空値・不正値はエラーになります。Terraform未適用などで出力を取得できない場合も起動を停止します。

@@ -239,6 +239,7 @@ jobs:
           VIDEO_ENCODING_QUEUE_URL: ${{ vars.VIDEO_ENCODING_QUEUE_URL }}
           VIDEO_INPUT_BUCKET: ${{ vars.VIDEO_INPUT_BUCKET }}
           VIDEO_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
+          PLAYBACK_BASE_URL: ${{ vars.PLAYBACK_BASE_URL }}
           FRONTEND_ORIGIN: http://localhost:5173
           API_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_API_ACCESS_KEY_ID }}
           API_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_API_SECRET_ACCESS_KEY }}
@@ -278,6 +279,7 @@ jobs:
           E2E_ENVIRONMENT: ${{ steps.environments.outputs.e2e == 'true' && 'disposable' || '' }}
           E2E_FRONTEND_URL: ${{ steps.environments.outputs.e2e == 'true' && 'http://localhost:5173' || '' }}
           E2E_API_URL: ${{ steps.environments.outputs.e2e == 'true' && 'http://127.0.0.1:8000' || '' }}
+          PLAYBACK_BASE_URL: ${{ vars.PLAYBACK_BASE_URL }}
           E2E_PROJECT: ${{ steps.environments.outputs.e2e == 'true' && 'chromium' || '' }}
           FFMPEG_PATH: ${{ steps.environments.outputs.e2e == 'true' && '/usr/bin/ffmpeg' || '' }}
         run: python "${{ runner.temp }}/orchestrator/agent/scripts/run-review.py" --repo-root "${{ github.workspace }}" --pull-number "${{ needs.prepare.outputs.pull_number }}" --head-sha "${{ needs.prepare.outputs.head_sha }}" --spec "${{ needs.prepare.outputs.spec_path }}"

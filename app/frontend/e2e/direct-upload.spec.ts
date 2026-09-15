@@ -1,4 +1,5 @@
 import { test, expect, type Page, type Request } from '@playwright/test'
+import { normalizePlaybackBaseURL } from '../../scripts/generate_reliability_env.mjs'
 import { e2eConfig } from './config.js'
 import { attachSafeDiagnostic, safeDiagnostic } from './diagnostics.js'
 import { withMp4Fixture, type VideoFixture } from './fixtures.js'
@@ -185,7 +186,7 @@ async function inspectHlsObjects(
   expect(playback.protocol).toBe('HLS')
   expect(playback.contentType).toBe('application/vnd.apple.mpegurl')
   expect(manifest.protocol).toBe('https:')
-  expect(manifest.hostname).not.toContain('cloudfront.net')
+  expect(manifest.origin).toBe(normalizePlaybackBaseURL(process.env.PLAYBACK_BASE_URL ?? ''))
   expect(manifest.origin).not.toBe(apiOrigin)
   expect(manifest.origin).not.toBe(frontendOrigin)
   expect(manifest.search).toBe('')
