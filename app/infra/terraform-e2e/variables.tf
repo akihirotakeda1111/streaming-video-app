@@ -30,3 +30,8 @@ variable "frontend_origin" {
   type    = string
   default = "http://localhost:5173"
 }
+
+variable "frontend_origins" {
+  type    = list(string)
+  default = ["http://localhost:5173"]
+}
