@@ -16,6 +16,7 @@ const (
 	envVideoInput  = "VIDEO_INPUT_BUCKET"
 	envVideoOutput = "VIDEO_OUTPUT_BUCKET"
 	envOutputS3    = "OUTPUT_S3_ENDPOINT"
+	envPlayback    = "PLAYBACK_BASE_URL"
 	envFrontend    = "FRONTEND_ORIGIN"
 )
 
@@ -30,6 +31,7 @@ type Config struct {
 	InputBucket      string
 	OutputBucket     string
 	OutputS3Endpoint string
+	PlaybackBaseURL  string
 	FrontendOrigin   string
 }
 
@@ -78,6 +80,14 @@ func Load(lookupEnv LookupEnvFunc) (Config, error) {
 	if err := validateS3EndpointURL(cfg.OutputS3Endpoint); err != nil {
 		return Config{}, wrapInvalid(envOutputS3, err)
 	}
+
+	if err := loadRequiredString(lookupEnv, envPlayback, &cfg.PlaybackBaseURL); err != nil {
+		return Config{}, err
+	}
+	if err := validatePlaybackBaseURL(cfg.PlaybackBaseURL); err != nil {
+		return Config{}, wrapInvalid(envPlayback, err)
+	}
+	cfg.PlaybackBaseURL = strings.TrimRight(cfg.PlaybackBaseURL, "/")
 
 	if err := loadRequiredString(lookupEnv, envFrontend, &cfg.FrontendOrigin); err != nil {
 		return Config{}, err
@@ -163,6 +173,31 @@ func validateOrigin(raw string) error {
 		return fmt.Errorf("must contain only a scheme and host")
 	}
 	return nil
+}
+
+func validatePlaybackBaseURL(raw string) error {
+	parsed, err := validateURL(raw)
+	if err != nil {
+		return err
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		return fmt.Errorf("must contain only a scheme and host")
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname()) {
+		return nil
+	}
+	return fmt.Errorf("must use https except for loopback local tests")
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func validateS3Bucket(name string) error {

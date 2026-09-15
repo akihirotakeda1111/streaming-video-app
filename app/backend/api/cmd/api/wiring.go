@@ -130,7 +130,7 @@ func buildRuntime(ctx context.Context, cfg config.Config, factories runtimeFacto
 
 	service := httpapi.NewVideoCreationService(repo, presigner, cfg.InputBucket)
 	status := httpapi.NewVideoStatusService(repo)
-	playback := httpapi.NewVideoPlaybackService(repo, cfg.OutputBucket, cfg.OutputS3Endpoint)
+	playback := httpapi.NewVideoPlaybackService(repo, cfg.PlaybackBaseURL)
 	handler := httpapi.WithCORS(httpapi.NewRouterWithServices(service, status, playback), cfg.FrontendOrigin)
 	server := factories.newHTTPServer(cfg.HTTPAddr, handler)
 	if server == nil {

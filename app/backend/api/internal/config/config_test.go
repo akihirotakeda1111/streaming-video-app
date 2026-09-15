@@ -10,6 +10,7 @@ func TestLoadConfigValid(t *testing.T) {
 		envVideoInput:  "streaming-video-input-dev",
 		envVideoOutput: "streaming-video-output-dev",
 		envOutputS3:    "http://localhost:4566",
+		envPlayback:    "http://localhost:4567/",
 		envFrontend:    "http://localhost:5173",
 	}))
 	if err != nil {
@@ -177,6 +178,9 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 func lookupEnvFromMap(values map[string]string) LookupEnvFunc {
 	return func(name string) (string, bool) {
 		value, ok := values[name]
+		if name == envPlayback && !ok {
+			return "http://localhost:4567", true
+		}
 		return value, ok
 	}
 }

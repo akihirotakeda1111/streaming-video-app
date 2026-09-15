@@ -28,7 +28,7 @@ func TestAPICompatibilityAcrossMigrations(t *testing.T) {
 				Method: http.MethodPut, URL: "https://example.test/upload", Headers: http.Header{"Content-Type": {"video/mp4"}},
 			}}
 			handler := NewRouterWithServices(testCreationService(repo, signer), NewVideoStatusService(repo),
-				NewVideoPlaybackService(repo, testOutputBucket, testOutputEndpoint))
+				NewVideoPlaybackService(repo, "https://video-output-test.cloudfront.net"))
 			request := func(method, path, body string, status int) []byte {
 				t.Helper()
 				rr := httptest.NewRecorder()
@@ -100,7 +100,7 @@ func TestAPICompatibilityAcrossMigrations(t *testing.T) {
 							t.Fatal(err)
 						}
 						if got.VideoID != testVideoID || got.JobID != testJobID || got.Protocol != "HLS" || got.ContentType != playbackContentType ||
-							got.ManifestURL != testOutputEndpoint+"/videos/"+string(testVideoID)+"/jobs/"+string(testJobID)+"/hls/index.m3u8" {
+							got.ManifestURL != "https://video-output-test.cloudfront.net/videos/"+string(testVideoID)+"/jobs/"+string(testJobID)+"/hls/index.m3u8" {
 							t.Fatalf("unexpected playback: %#v", got)
 						}
 					} else {

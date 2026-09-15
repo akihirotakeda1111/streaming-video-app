@@ -280,6 +280,6 @@ func completedPlaybackVideo() persistence.Video {
 func getPlayback(repo persistence.Repository, videoID, bucket, endpoint string) *httptest.ResponseRecorder {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/videos/"+videoID+"/playback", nil)
-	NewRouterWithVideoPlayback(repo, bucket, endpoint).ServeHTTP(rr, req)
+	NewRouterWithVideoPlayback(repo, endpoint).ServeHTTP(rr, req)
 	return rr
 }
