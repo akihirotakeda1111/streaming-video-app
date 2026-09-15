@@ -323,7 +323,8 @@ E2Eセットアップを `source` したシェルでは、AWS接続先・Worker�
 | `VIDEO_ENCODING_QUEUE_URL` | Worker | SQS queue URL |
 | `VIDEO_INPUT_BUCKET` | API / Worker | upload先とsource read元 |
 | `VIDEO_OUTPUT_BUCKET` | API / Worker | HLS write先 |
-| `OUTPUT_S3_ENDPOINT` | API | playback manifest URLのbase endpoint |
+| `OUTPUT_S3_ENDPOINT` | API | S3接続先。CloudFront URLを設定しない |
+| `PLAYBACK_BASE_URL` | API | 必須のCloudFront HTTPS origin。Terraformの `playback_base_url` を設定する |
 | `FRONTEND_ORIGIN` | API / S3 configuration | 許可するbrowser origin |
 | `VITE_API_BASE_URL` | Frontend | Go API base URL。既定は `http://localhost:8080/api/v1` |
 | `HTTP_ADDR` | API | listen address。Compose内は `0.0.0.0:8080` |
@@ -515,3 +516,11 @@ CloudFront + OAC、private Output S3、アプリ・DB・ネットワークのAWS
 - E2E環境は独立したlocal stateとComposeプロジェクトで分離します。共有remote stateとアプリのAWS deploymentは未整備です。
 
 アーキテクチャの背景とPhaseごとの判断理由は [ADR-001](./docs/adr/adr-001-video-streaming-mvp-architecture.md)、storageと状態遷移の厳密な規約は [storage conventions](./contracts/domain/storage-conventions.md) を参照してください。
+
+### Playback CloudFront URL Settings
+
+APIは必須の `PLAYBACK_BASE_URL` に既存のHLSキーを連結します。S3への自動フォールバックはありません。ユーザー情報、パス、クエリ、フラグメントを含まないHTTPS originを指定してください。末尾のスラッシュは正規化します。APIのループバックHTTP許可はローカルテスト用です。
+
+統合セットアップは `--playback-url` → 環境変数 `PLAYBACK_BASE_URL` → Terraform出力 `playback_base_url` の順で取得し、コンテナ起動前に検証します。明示的に指定した空値・不正値はエラーになります。Terraform未適用などで出力を取得できない場合も起動を停止します。
+
+単独の `generate_reliability_env.mjs` はTerraformを参照しないため、`--playback-url` または環境変数を指定してください。`OUTPUT_S3_ENDPOINT` には引き続きS3の接続先を設定します。

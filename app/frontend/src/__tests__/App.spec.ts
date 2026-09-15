@@ -71,7 +71,7 @@ function playbackResponse(): PlaybackResponse {
     videoId,
     jobId,
     protocol: 'HLS',
-    manifestUrl: 'https://cdn.example/index.m3u8',
+    manifestUrl: 'https://test.cloudfront.net/videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/hls/index.m3u8',
     contentType: 'application/vnd.apple.mpegurl',
   }
 }
@@ -341,7 +341,7 @@ describe('App workflow shell', () => {
       expect.any(HTMLVideoElement),
       expect.objectContaining({
         controls: true,
-        sources: [{ src: 'https://cdn.example/index.m3u8', type: 'application/vnd.apple.mpegurl' }],
+        sources: [{ src: 'https://test.cloudfront.net/videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/hls/index.m3u8', type: 'application/vnd.apple.mpegurl' }],
       }),
     )
     expect(wrapper.find('[aria-label="Uploaded video"]').exists()).toBe(true)

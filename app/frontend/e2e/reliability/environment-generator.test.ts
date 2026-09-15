@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   discoverEnvironment,
+  normalizePlaybackBaseURL,
   renderPowerShell,
   main,
 } from '../../../scripts/generate_reliability_env.mjs'
@@ -99,6 +100,7 @@ function fixture() {
     return JSON.stringify(result)
   })
   const options = {
+    playbackUrl: 'https://test.cloudfront.net/',
     worker: 'worker',
     database: 'database',
     account,
@@ -113,9 +115,20 @@ function fixture() {
     state,
   }
 }
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs() })
 
 describe('read-only environment command generator', () => {
+  it.each(['', 'http://localhost:4567', 'http://remote.example', 'https://user:private@test.cloudfront.net', 'https://test.cloudfront.net/path', 'https://test.cloudfront.net//', 'https://test.cloudfront.net?', 'https://test.cloudfront.net#', 'invalid'])('rejects invalid delivery origins: %s', (url) => {
+    expect(() => normalizePlaybackBaseURL(url)).toThrow('PLAYBACK_BASE_URL')
+  })
+  it('requires delivery configuration and supports an environment override', () => {
+    const f = fixture()
+    vi.stubEnv('PLAYBACK_BASE_URL', undefined)
+    expect(() => discoverEnvironment({ ...f.options, playbackUrl: undefined }, f.execute)).toThrow('PLAYBACK_BASE_URL')
+    vi.stubEnv('PLAYBACK_BASE_URL', 'https://environment.cloudfront.net/')
+    expect(discoverEnvironment({ ...f.options, playbackUrl: undefined }, f.execute).PLAYBACK_BASE_URL).toBe('https://environment.cloudfront.net')
+    expect(discoverEnvironment(f.options, f.execute).PLAYBACK_BASE_URL).toBe('https://test.cloudfront.net')
+  })
   it('derives exhaustion budgets from the actual short Worker and queue settings', () => {
     const f = fixture()
     Object.assign(f.settings, {
@@ -156,6 +169,7 @@ describe('read-only environment command generator', () => {
     expect(env.E2E_ALARM_IDENTIFIERS).toBe('age,backlog,dead')
     expect(env.VIDEO_INPUT_BUCKET).toBe(env.E2E_SOURCE_BUCKET)
     expect(env.VIDEO_OUTPUT_BUCKET).toBe(env.E2E_OUTPUT_BUCKET)
+    expect(env.PLAYBACK_BASE_URL).toBe('https://test.cloudfront.net')
     expect(env.OUTPUT_S3_ENDPOINT).toBe('https://output.s3.us-east-1.amazonaws.com')
     expect(env.FRONTEND_ORIGIN).toBe(new URL(env.E2E_FRONTEND_URL!).origin)
     expect(env.VITE_API_BASE_URL).toBe(env.E2E_API_URL + '/api/v1')
@@ -258,6 +272,7 @@ describe('read-only environment command generator', () => {
         'worker',
         '--database',
         'database',
+        '--playback-url', f.options.playbackUrl,
         '--fixture',
         mp4,
         '--invalid-fixture', invalid,

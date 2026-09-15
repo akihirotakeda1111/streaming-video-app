@@ -81,7 +81,7 @@ func buildDeliveryManifestURL(baseURL string, videoID, jobID persistence.Canonic
 	if err != nil || base.Scheme == "" || base.Host == "" {
 		return "", fmt.Errorf("playback base URL is invalid")
 	}
-	if base.User != nil || base.RawQuery != "" || base.Fragment != "" || (base.Path != "" && base.Path != "/") {
+	if base.User != nil || base.ForceQuery || base.RawQuery != "" || base.Fragment != "" || (base.Path != "" && base.Path != "/") {
 		return "", fmt.Errorf("playback base URL must contain only a scheme and host")
 	}
 	base.Path = "/videos/" + string(videoID) + "/jobs/" + string(jobID) + "/hls/index.m3u8"

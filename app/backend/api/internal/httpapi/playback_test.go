@@ -283,3 +283,18 @@ func getPlayback(repo persistence.Repository, videoID, bucket, endpoint string) 
 	NewRouterWithVideoPlayback(repo, endpoint).ServeHTTP(rr, req)
 	return rr
 }
+
+func TestBuildDeliveryManifestURL(t *testing.T) {
+	for _, origin := range []string{"https://test.cloudfront.net", "https://test.cloudfront.net/", "http://localhost:4567"} {
+		got, err := buildDeliveryManifestURL(origin, testVideoID, testJobID)
+		want := strings.TrimSuffix(origin, "/") + "/videos/" + string(testVideoID) + "/jobs/" + string(testJobID) + "/hls/index.m3u8"
+		if err != nil || got != want {
+			t.Errorf("origin %q: got %q, %v; want %q", origin, got, err, want)
+		}
+	}
+	for _, origin := range []string{"", "https://", "https://test.cloudfront.net//", "https://test.cloudfront.net/bucket", "https://user:pass@test.cloudfront.net", "https://test.cloudfront.net?key=value", "https://test.cloudfront.net?", "https://test.cloudfront.net#fragment"} {
+		if got, err := buildDeliveryManifestURL(origin, testVideoID, testJobID); err == nil || got != "" {
+			t.Errorf("invalid origin %q: got %q, %v", origin, got, err)
+		}
+	}
+}

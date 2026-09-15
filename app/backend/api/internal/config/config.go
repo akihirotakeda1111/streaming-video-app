@@ -180,7 +180,7 @@ func validatePlaybackBaseURL(raw string) error {
 	if err != nil {
 		return err
 	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+	if parsed.User != nil || parsed.ForceQuery || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
 		return fmt.Errorf("must contain only a scheme and host")
 	}
 	if parsed.Scheme == "https" {

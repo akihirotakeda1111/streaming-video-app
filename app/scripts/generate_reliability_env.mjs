@@ -22,6 +22,19 @@ class ConfigurationError extends Error {}
 function fail(message) {
   throw new ConfigurationError(message);
 }
+
+/** Validate deployed delivery configuration without echoing supplied values.
+ * @param {string} raw */
+export function normalizePlaybackBaseURL(raw) {
+  try {
+    const url = new URL(raw);
+    if (!/^https:\/\/[^/?#\\\s]+\/?$/.test(raw) || url.protocol !== "https:" ||
+        url.username || url.password || raw.includes("@") || url.pathname !== "/") throw Error();
+    return url.origin;
+  } catch {
+    return fail("PLAYBACK_BASE_URL must be an HTTPS origin without credentials, a path, a query, or a fragment");
+  }
+}
 const OUTPUT_NAMES = new Set([
   ...URL_NAMES,
   ...IDENTITY_NAMES,
@@ -391,18 +404,12 @@ export function discoverEnvironment(options, execute = execFileSync) {
     VIDEO_INPUT_BUCKET: env.E2E_SOURCE_BUCKET,
     VIDEO_OUTPUT_BUCKET: env.E2E_OUTPUT_BUCKET,
     OUTPUT_S3_ENDPOINT: `https://${env.E2E_OUTPUT_BUCKET}.s3.${region}.amazonaws.com`,
-    PLAYBACK_BASE_URL: options.playbackUrl || process.env.PLAYBACK_BASE_URL || "",
+    PLAYBACK_BASE_URL: normalizePlaybackBaseURL(options.playbackUrl ?? process.env.PLAYBACK_BASE_URL ?? ""),
     FRONTEND_ORIGIN: frontend.origin,
     VITE_API_BASE_URL: env.E2E_API_URL.replace(/\/$/, "") + "/api/v1",
     API_PORT: api.port || (api.protocol === "https:" ? "443" : "80"),
     FRONTEND_PORT: frontend.port || (frontend.protocol === "https:" ? "443" : "80"),
   });
-  if (env.PLAYBACK_BASE_URL) {
-    const playback = new URL(env.PLAYBACK_BASE_URL);
-    if (playback.protocol !== "https:" || playback.username || playback.password || playback.search || playback.hash || (playback.pathname !== "" && playback.pathname !== "/"))
-      fail("PLAYBACK_BASE_URL must be an HTTPS origin without credentials, a path, a query, or a fragment");
-    env.PLAYBACK_BASE_URL = env.PLAYBACK_BASE_URL.replace(/\/$/, "");
-  }
   return env;
 }
 
@@ -448,7 +455,7 @@ Usage: node app/scripts/generate_reliability_env.mjs --worker NAME --database NA
   --docker-host HOST    Direct local Docker socket (default: DOCKER_HOST or platform socket)
   --frontend-url URL    Default http://127.0.0.1:5173; set the actual URL if different
   --api-url URL         Default http://127.0.0.1:8000; set the actual URL if different
-  --playback-url URL    HTTPS CloudFront delivery origin; never use the S3 endpoint
+  --playback-url URL    HTTPS CloudFront origin; required unless PLAYBACK_BASE_URL is set
   --fixture PATH        Existing MP4; otherwise emit an empty setting for manual completion
   --invalid-fixture PATH Existing nonempty invalid .mp4 for FFmpeg exhaustion
   --clock-skew-ms MS     Clock skew upper bound, 1..5000; default 1000 ms

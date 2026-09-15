@@ -17,6 +17,9 @@ func TestLoadConfigValid(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
+	if cfg.PlaybackBaseURL != "http://localhost:4567" {
+		t.Fatalf("PlaybackBaseURL = %q", cfg.PlaybackBaseURL)
+	}
 	if cfg.HTTPAddr != "0.0.0.0:8080" {
 		t.Fatalf("HTTPAddr = %q, want %q", cfg.HTTPAddr, "0.0.0.0:8080")
 	}
@@ -48,6 +51,7 @@ func TestLoadConfigMissingRequiredValue(t *testing.T) {
 		envVideoInput,
 		envVideoOutput,
 		envOutputS3,
+		envPlayback,
 		envFrontend,
 	}
 
@@ -60,6 +64,7 @@ func TestLoadConfigMissingRequiredValue(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envPlayback:    "https://test.cloudfront.net",
 				envFrontend:    "http://localhost:5173",
 			}
 			delete(env, name)
@@ -89,6 +94,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envPlayback:    "https://test.cloudfront.net",
 				envFrontend:    "http://localhost:5173",
 			},
 		},
@@ -101,6 +107,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envPlayback:    "https://test.cloudfront.net",
 				envFrontend:    "http://localhost:5173",
 			},
 		},
@@ -113,6 +120,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-dev",
 				envVideoOutput: "streaming-video-dev",
 				envOutputS3:    "http://localhost:4566",
+				envPlayback:    "https://test.cloudfront.net",
 				envFrontend:    "http://localhost:5173",
 			},
 		},
@@ -125,6 +133,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "192.168.5.4",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envPlayback:    "https://test.cloudfront.net",
 				envFrontend:    "http://localhost:5173",
 			},
 		},
@@ -137,6 +146,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envPlayback:    "https://test.cloudfront.net",
 				envFrontend:    "http://localhost:5173",
 			},
 		},
@@ -149,6 +159,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "ftp://localhost:4566",
+				envPlayback:    "https://test.cloudfront.net",
 				envFrontend:    "http://localhost:5173",
 			},
 		},
@@ -161,6 +172,7 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 				envVideoInput:  "streaming-video-input-dev",
 				envVideoOutput: "streaming-video-output-dev",
 				envOutputS3:    "http://localhost:4566",
+				envPlayback:    "https://test.cloudfront.net",
 				envFrontend:    "http://localhost:5173/not-an-origin",
 			},
 		},
@@ -178,9 +190,19 @@ func TestLoadConfigRejectsMalformedValues(t *testing.T) {
 func lookupEnvFromMap(values map[string]string) LookupEnvFunc {
 	return func(name string) (string, bool) {
 		value, ok := values[name]
-		if name == envPlayback && !ok {
-			return "http://localhost:4567", true
-		}
 		return value, ok
+	}
+}
+
+func TestPlaybackBaseURLValidation(t *testing.T) {
+	for _, raw := range []string{"https://test.cloudfront.net", "https://test.cloudfront.net/", "http://localhost:4567", "http://127.0.0.1:4567", "http://[::1]:4567"} {
+		if err := validatePlaybackBaseURL(raw); err != nil {
+			t.Errorf("%q: %v", raw, err)
+		}
+	}
+	for _, raw := range []string{"", "https://", "http://remote.example", "ftp://test.cloudfront.net", "https://user:pass@test.cloudfront.net", "https://test.cloudfront.net/path", "https://test.cloudfront.net//", "https://test.cloudfront.net?x=1", "https://test.cloudfront.net?", "https://test.cloudfront.net#fragment"} {
+		if err := validatePlaybackBaseURL(raw); err == nil {
+			t.Errorf("accepted invalid origin %q", raw)
+		}
 	}
 }
