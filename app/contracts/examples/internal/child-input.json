@@ -1,0 +1,9 @@
+{
+  "video_id": "018f47a2-45c2-7a84-b84f-5f6dd7b5910a",
+  "job_id": "018f47a2-4699-7892-9fc0-fbe46d3bbd67",
+  "attempt": 1,
+  "execution_id": "job-018f47a2-4699-7892-9fc0-fbe46d3bbd67-a1",
+  "rendition": "720p",
+  "source_key": "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4",
+  "output_prefix": "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/hls/attempts/1/job-018f47a2-4699-7892-9fc0-fbe46d3bbd67-a1/720p"
+}

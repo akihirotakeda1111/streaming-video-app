@@ -178,6 +178,9 @@ environments). A local Phase 1 example is:
 ]
 ```
 
-CloudFront, Origin Access Control (OAC), and a private output bucket are Phase 2
-concerns. Introducing them later must not change the S3 key layout or the
-playback API response shape.
+CloudFront, Origin Access Control (OAC), and a private output bucket are the
+Phase 2 delivery baseline. The Phase 3 scalability contract consumes that
+baseline through the operator-supplied HTTPS `PLAYBACK_BASE_URL`; it does not
+change the S3 key layout or playback response shape. S3 SDK endpoints and the
+viewer delivery origin are separate configuration values. See
+`scalability-conventions.md` for the distributed attempt prefixes and rollout.
