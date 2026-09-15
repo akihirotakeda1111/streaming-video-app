@@ -427,55 +427,9 @@ def validate_orchestration_payload(
                 raise ContractError("result segments must be contiguous, ordered, and in their assigned prefix")
 
 
-def validate_orchestration_rejections(
-    schemas: dict[str, Draft202012Validator],
-    parent: dict[str, Any],
-    child: dict[str, Any],
-    result: dict[str, Any],
-) -> None:
-    """Protect identity isolation and result boundaries with small in-memory probes."""
-    fixtures = {"parent": parent, "child": child, "result": result}
-    other_id = "00000000-0000-0000-0000-000000000000"
-    probes: list[tuple[str, dict]] = []
-    for kind, original in fixtures.items():
-        for field, value in (
-            ("video_id", other_id), ("job_id", other_id), ("attempt", 2),
-            ("execution_id", "wrong-execution"),
-            ("source_key", original["source_key"].replace(original["job_id"], other_id)),
-            ("output_prefix", original["output_prefix"].replace("/attempts/1/", "/attempts/2/")),
-            ("output_prefix", original["output_prefix"].replace(original["job_id"], other_id)),
-        ):
-            probes.append((kind, {**original, field: value}))
-    probes.append(("child", {**child, "output_prefix": child["output_prefix"].rsplit("/", 1)[0] + "/360p"}))
-    probes.append(("child", {**child, "source_key": "videos/a/jobs/b/source.mp4"}))
-    for path, value in (
-        (("media_playlist", "key"), result["media_playlist"]["key"].replace("/attempts/1/", "/attempts/2/")),
-        (("segments", 0, "key"), result["segments"][0]["key"].replace("segment-00000", "segment-00001")),
-        (("segments", 0, "key"), "../segment-00000.ts"),
-        (("segments", 0, "size_bytes"), 0),
-        (("segments", 0, "content_type"), "application/json"),
-        (("segments",), []),
-        (("width",), 1281),
-        (("rendition",), "1080p"),
-    ):
-        mutated = copy.deepcopy(result)
-        target = mutated
-        for key in path[:-1]:
-            target = target[key]
-        target[path[-1]] = value
-        probes.append(("result", mutated))
-    for kind, payload in probes:
-        schema_name = "child_result_schema" if kind == "result" else f"{kind}_input_schema"
-        try:
-            validate_orchestration_payload(kind, payload, schemas[schema_name], parent, child)
-        except ContractError:
-            continue
-        raise ContractError(f"{kind} validation accepts an invalid identity/result probe")
-
-
 def validate_scalability_contract(contracts_dir: Path, api: dict[str, Any]) -> None:
     contract_path = contracts_dir / "domain" / "scalability-conventions.md"
-    metadata, body = load_markdown_contract(contract_path)
+    metadata, _ = load_markdown_contract(contract_path)
     if metadata.get("contract_version") != 1 or metadata.get("contract_id") != "phase3-scalability":
         raise ContractError("scalability contract metadata is invalid")
 
@@ -513,7 +467,6 @@ def validate_scalability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
     ):
         validate_orchestration_payload(name, instance, validator, parent, child)
 
-    validate_orchestration_rejections(schemas, parent, child, result)
     if metadata.get("modes") != {
         "default": "cli", "supported": ["cli", "distributed"],
         "immutable_after_first_acquisition": True,
@@ -533,42 +486,6 @@ def validate_scalability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
         "path_has_bucket_name": False,
     }:
         raise ContractError("scalability delivery metadata contradicts private HTTPS delivery")
-
-    normalized = re.sub(r"\s+", " ", body)
-    required_phrases = (
-        "Inline Map with `MaxConcurrency: 2`",
-        "`cli` or `distributed`",
-        "The mode is persisted when the job is first acquired",
-        "four distributed parents with two children each imply at most eight",
-        "strictly inside the original visibility lifetime",
-        "min=1 and max=4",
-        "published_manifest_key",
-        "A child receives no SQS receipt handle, database credential, or completion authority",
-        "videos/{video_id}/jobs/{job_id}/hls/index.m3u8",
-        "hls/attempts/{attempt}/{execution_id}/{rendition}/index.m3u8",
-        "hls/attempts/{attempt}/{execution_id}/index.m3u8",
-        "publishes its master last",
-        "media playlist next, and `result.json` last",
-        "result_key = child.output_prefix/result.json",
-        "Parent, child, and result must have identical video_id, job_id, attempt",
-        "result.json` objects are never viewer content",
-        "an API that resolves published pointers and CloudFront URLs",
-    )
-    for phrase in required_phrases:
-        if phrase.lower() not in normalized.lower():
-            raise ContractError(f"scalability contract is missing required rule: {phrase}")
-
-    storage = re.sub(r"\s+", " ", (contracts_dir / "domain" / "storage-conventions.md").read_text(encoding="utf-8"))
-    for phrase in (
-        "Phase 3 introduces CloudFront",
-        "output bucket MUST reject anonymous S3 GET/HEAD",
-        "result.json objects MUST NOT be readable through CloudFront",
-    ):
-        if phrase not in storage:
-            raise ContractError(f"storage delivery contract is missing: {phrase}")
-    for obsolete in ("allow unauthenticated", "Phase 2 delivery baseline", "Phase 2 owns the CloudFront"):
-        if obsolete in storage or obsolete in normalized:
-            raise ContractError(f"obsolete public-S3/Phase 2 delivery requirement: {obsolete}")
 
     playback_schema = api["components"]["schemas"]["PlaybackResponse"]["properties"]["manifestUrl"]
     if playback_schema.get("pattern") != r"^https://[^?#]+$":

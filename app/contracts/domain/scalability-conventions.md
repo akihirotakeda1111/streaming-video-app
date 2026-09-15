@@ -66,8 +66,33 @@ source of at least 720p. Each rendition retains six-second VOD segments,
 `application/vnd.apple.mpegurl` for playlists, `video/mp2t` for segments, and
 relative segment references.
 
-The parent deadline is measured from SQS receipt and is strictly inside the
-original visibility lifetime. Heartbeats do not make the deadline indefinite.
+The initial Visibility Timeout may be extended by heartbeats while processing
+continues. SQS limits visibility to 12 hours from when SQS receives the
+corresponding `ReceiveMessage` request; extensions do not restart that clock.
+The parent conservatively records the client request start time, before waiting
+for the receive response, and computes its immutable deadline as:
+
+```text
+deadline_at = receive_request_started_at + min(processing_budget, 12 hours) - completion_margin
+```
+
+`processing_budget` is the configured finite processing duration measured from
+that same request start, including time spent receiving and acquiring the job.
+`completion_margin` is a positive configured safety reserve for request latency,
+stopping child work, and acknowledging already committed completion; it
+must be smaller than the selected budget. Do not start work if the deadline
+has already passed. Child work, result validation, parent publication, and
+conditional database completion must finish before this deadline. Acknowledgement
+also requires valid ownership and must finish within the remaining SQS lifetime.
+Heartbeats do not extend `deadline_at` or reset the 12-hour limit. Each visibility
+extension must fit within the remaining SQS lifetime, allowing for request
+latency. A deadline or child failure still prevents publication and uses the
+existing retry policy; the reserve does not permit finalizing failed work.
+Even before `deadline_at`, failure to maintain either SQS visibility or the DB
+lease causes ownership loss under the existing reliability rules. Step Functions
+does not remove this limit because the parent retains the SQS message until
+durable completion. See the [SQS processing-time guidance](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/best-practices-processing-messages-timely-manner.html).
+
 StartExecution uses a deterministic `job_id`/`attempt` execution name and the
 same immutable input on retry. A lost response is resolved by looking up that
 name. Execution cancellation is best effort and is never the only ownership
