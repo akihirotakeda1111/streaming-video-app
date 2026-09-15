@@ -14,7 +14,9 @@ from pathlib import Path
 from dataclasses import dataclass
 from uuid import uuid4
 
+SUITE_ID = "phase3-cloudfront-delivery-e2e-regression"
 SCENARIOS = {
+    "delivery-preflight": ("@delivery-preflight", "read-only CloudFront/private S3 resource verification"),
     "preflight": ("@preflight", "local/browser/API readiness"),
     "runtime-authorization": ("@reliability", "reliability authorization"),
     "duplicate-delivery": ("@duplicate-delivery", "active and completed redelivery with correlated media and acknowledgement evidence"),
@@ -23,6 +25,7 @@ SCENARIOS = {
     "ffmpeg-exhaustion": ("@ffmpeg-exhaustion", "invalid media FFmpeg exhaustion and run-owned DLQ isolation"),
     "poison-isolation": ("@poison-isolation", "malformed and unknown-job poison DLQ isolation with a concurrently valid job"),
     "queue-monitoring": ("@queue-monitoring", "read-only source backlog, DLQ depth, and alarm observation correlated with failure evidence"),
+    "delivery-regression": ("@delivery-regression", "previously completed private output replay through CloudFront"),
 }
 FULL_LIVE_SCENARIOS = (
     "duplicate-delivery",
@@ -49,6 +52,8 @@ class LiveConfig:
     scenario: str
     ffmpeg_evidence_run: str | None = None
     poison_evidence_run: str | None = None
+    playback_evidence_run: str | None = None
+    legacy_delivery_fixtures: str | None = None
 
 
 def _settings(mode: str) -> dict:
@@ -99,16 +104,23 @@ def _check() -> int:
     return 0
 
 
-def _live_config(scenario: str, ffmpeg_evidence_run: str | None = None, poison_evidence_run: str | None = None) -> LiveConfig:
+def _live_config(scenario: str, ffmpeg_evidence_run: str | None = None, poison_evidence_run: str | None = None,
+                 playback_evidence_run: str | None = None, legacy_delivery_fixtures: str | None = None) -> LiveConfig:
     """Validate settings without observing targets or creating directories."""
     _settings("validate")
     return LiveConfig(Path(os.environ["E2E_EVIDENCE_DIR"].strip()).resolve() / f"e2e-{uuid4()}", scenario,
-                      ffmpeg_evidence_run, poison_evidence_run)
+                      ffmpeg_evidence_run, poison_evidence_run, playback_evidence_run, legacy_delivery_fixtures)
 
 
 def _preflight() -> int:
-    """Verify disposable targets without creating a run or dispatching Playwright."""
+    """Verify disposable targets and persist the read-only delivery gate evidence."""
     evidence = _settings("preflight")
+    config = _live_config("delivery-preflight")
+    code = _run(config)
+    if code != 0:
+        return code
+    _validate_evidence(config, config.evidence_dir / "delivery-preflight-evidence.json")
+    evidence["deliveryEvidenceDirectory"] = str(config.evidence_dir)
     record = {**evidence, "scenarioStarted": False}
     evidence_dir = Path(os.environ["E2E_EVIDENCE_DIR"].strip()) / f"preflight-{uuid4()}"
     evidence_dir.mkdir(parents=True, exist_ok=False)
@@ -132,10 +144,18 @@ def _dispatch(config: LiveConfig, selector: str, project: str, reliability: bool
     else:
         child_environment.pop("E2E_INCLUDE_RELIABILITY", None)
         child_environment["E2E_PROJECT"] = project
-    if config.scenario == "phase1-pipeline":
+    if config.scenario in ("phase1-pipeline", "delivery-regression", "delivery-preflight"):
         args.extend(["--retries", "0"])
     child_environment["E2E_RUN_ID"] = config.evidence_dir.name
     child_environment["E2E_EVIDENCE_DIR"] = str(config.evidence_dir)
+    # A full suite must never pick up a historical selection from the parent shell.
+    child_environment.pop("E2E_PLAYBACK_EVIDENCE_RUN", None)
+    child_environment.pop("E2E_LEGACY_DELIVERY_FIXTURES", None)
+    if config.scenario == "delivery-regression":
+        if config.playback_evidence_run is not None:
+            child_environment["E2E_PLAYBACK_EVIDENCE_RUN"] = config.playback_evidence_run
+        if config.legacy_delivery_fixtures is not None:
+            child_environment["E2E_LEGACY_DELIVERY_FIXTURES"] = config.legacy_delivery_fixtures
     # CLI arguments are authoritative; never inherit an earlier run's selection.
     for name, run_id in (("E2E_FFMPEG_EVIDENCE_RUN", config.ffmpeg_evidence_run),
                          ("E2E_POISON_EVIDENCE_RUN", config.poison_evidence_run)):
@@ -148,6 +168,8 @@ def _dispatch(config: LiveConfig, selector: str, project: str, reliability: bool
 
 def _run(config: LiveConfig) -> int:
     """Dispatch one registered reliability scenario."""
+    if config.scenario in ("delivery-preflight", "delivery-regression"):
+        return _dispatch(config, SCENARIOS[config.scenario][0], "chromium", False)
     if config.scenario == "preflight":
         return _dispatch(config, SCENARIOS[config.scenario][0],
                          os.environ.get("E2E_PROJECT", "").strip() or "chromium", False)
@@ -171,7 +193,7 @@ def _validate_evidence(config: LiveConfig, evidence_file: Path) -> None:
 
 
 def _full() -> int:
-    """Run every live failure scenario serially, then the fresh Phase 1 playback test."""
+    """Gate delivery resources, run all reliability scenarios, then verify playback."""
     _settings("validate")
     parent = Path(os.environ["E2E_EVIDENCE_DIR"].strip()).resolve()
     report_path = parent / f"full-suite-{uuid4()}.json"
@@ -180,12 +202,13 @@ def _full() -> int:
 
     def run_row(name: str, selector: str, project: str, reliability: bool,
                 ffmpeg_evidence_run: str | None = None,
-                poison_evidence_run: str | None = None, **extra: object) -> int:
+                poison_evidence_run: str | None = None,
+                playback_evidence_run: str | None = None, **extra: object) -> int:
         row = {"name": name, "selector": selector, "project": project,
                "status": "unexecuted", **extra}
         rows.append(row)
         try:
-            config = _live_config(name, ffmpeg_evidence_run, poison_evidence_run)
+            config = _live_config(name, ffmpeg_evidence_run, poison_evidence_run, playback_evidence_run)
             evidence_file = config.evidence_dir / f"{name}-evidence.json"
             row.update(runId=config.evidence_dir.name, evidenceDirectory=str(config.evidence_dir),
                        evidenceFile=str(evidence_file))
@@ -204,8 +227,10 @@ def _full() -> int:
             completed[name] = config.evidence_dir.name
         return code
 
-    failed = False
+    failed = run_row("delivery-preflight", "@delivery-preflight", "chromium", False) != 0
     for name in FULL_LIVE_SCENARIOS:
+        if failed:
+            break
         if name == "queue-monitoring":
             code = run_row(
                 name, SCENARIOS[name][0], "reliability", True,
@@ -224,6 +249,13 @@ def _full() -> int:
         run_row("phase1-pipeline", "@phase1-pipeline", "chromium", False)
         failed = rows[-1]["status"] != "passed"
 
+    if not failed:
+        run_row("delivery-regression", "@delivery-regression", "chromium", False,
+                playback_evidence_run=completed["phase1-pipeline"],
+                playbackEvidenceRun=completed["phase1-pipeline"],
+                verificationScope="completed-job-replay")
+        failed = rows[-1]["status"] != "passed"
+
     for name in FULL_LIVE_SCENARIOS:
         if not any(row["name"] == name for row in rows):
             rows.append({"name": name, "selector": SCENARIOS[name][0], "project": "reliability",
@@ -231,9 +263,12 @@ def _full() -> int:
     if not any(row["name"] == "phase1-pipeline" for row in rows):
         rows.append({"name": "phase1-pipeline", "selector": "@phase1-pipeline", "project": "chromium",
                      "status": "unexecuted", "reason": "failure or missing scenario prevented final upload"})
+    if not any(row["name"] == "delivery-regression" for row in rows):
+        rows.append({"name": "delivery-regression", "selector": "@delivery-regression", "project": "chromium",
+                     "status": "unexecuted", "reason": "failure prevented completed-output replay"})
 
     report = {
-        "suite": "phase2-reliability-e2e-playback-regression",
+        "suite": SUITE_ID,
         "status": "blocked" if any(row["status"] == "blocked" for row in rows) else "failed" if failed else "passed",
         "componentChecks": [{"command": command, "status": "declared; run by offline validation"}
                             for command in COMPONENT_CHECKS],
@@ -264,7 +299,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenario", choices=sorted(SCENARIOS), default="preflight")
     parser.add_argument("--ffmpeg-evidence-run", type=_evidence_run, help="FFmpeg evidence run directory under E2E_EVIDENCE_DIR (queue-monitoring only)")
     parser.add_argument("--poison-evidence-run", type=_evidence_run, help="poison evidence run directory under E2E_EVIDENCE_DIR (queue-monitoring only)")
+    delivery_source = parser.add_mutually_exclusive_group()
+    delivery_source.add_argument("--playback-evidence-run", type=_evidence_run,
+                                 help="successful Phase 1 playback run under E2E_EVIDENCE_DIR (delivery-regression only)")
+    delivery_source.add_argument("--legacy-delivery-fixtures", type=lambda value: str(Path(value).resolve()),
+                                 help="pre-cutover Phase 1/2 inventory JSON (delivery-regression only)")
     args = parser.parse_args(argv)
+    if (args.playback_evidence_run is not None or args.legacy_delivery_fixtures is not None) and (
+            args.scenario != "delivery-regression" or args.list or args.check or args.live_preflight or args.full):
+        parser.error("delivery source arguments require --scenario delivery-regression without other modes")
     if (args.ffmpeg_evidence_run is not None or args.poison_evidence_run is not None) and (
             args.scenario != "queue-monitoring" or args.list or args.check or args.live_preflight or args.full):
         parser.error("evidence run arguments require --scenario queue-monitoring without offline/preflight modes")
@@ -284,12 +327,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return _full()
         except (ValueError, OSError) as error:
-            print(json.dumps({"status": "blocked", "suite": "phase2-reliability-e2e-playback-regression",
+            print(json.dumps({"status": "blocked", "suite": SUITE_ID,
                               "message": str(error) if isinstance(error, ValueError) else "full-suite dispatch failed",
                               "liveResourcesVerified": False}), file=sys.stderr)
             return 2
     try:
-        return _run(_live_config(args.scenario, args.ffmpeg_evidence_run, args.poison_evidence_run))
+        return _run(_live_config(args.scenario, args.ffmpeg_evidence_run, args.poison_evidence_run,
+                                 args.playback_evidence_run, args.legacy_delivery_fixtures))
     except (ValueError, OSError) as error:
         # No environment values or unredacted service errors enter this evidence.
         print(json.dumps({"status": "blocked", "scenario": args.scenario,
