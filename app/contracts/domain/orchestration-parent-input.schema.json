@@ -3,15 +3,59 @@
   "title": "Distributed parent orchestration input",
   "type": "object",
   "additionalProperties": false,
-  "required": ["video_id", "job_id", "attempt", "execution_id", "source_key", "output_prefix", "renditions", "deadline_at"],
+  "required": [
+    "video_id",
+    "job_id",
+    "attempt",
+    "execution_id",
+    "source_key",
+    "output_prefix",
+    "renditions",
+    "deadline_at"
+  ],
   "properties": {
-    "video_id": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
-    "job_id": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
-    "attempt": {"type": "integer", "minimum": 1},
-    "execution_id": {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[A-Za-z0-9_-]+$"},
-    "source_key": {"type": "string", "pattern": "^videos/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/jobs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/source\\.mp4$"},
-    "output_prefix": {"type": "string", "pattern": "^videos/[^/]+/jobs/[^/]+/hls/attempts/[1-9][0-9]*/[^/]+$"},
-    "renditions": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true, "items": {"enum": ["360p", "720p"]}},
-    "deadline_at": {"type": "string", "format": "date-time"}
-  }
+    "video_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "execution_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "source_key": {
+      "type": "string",
+      "pattern": "^videos/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/jobs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/source\\.mp4$"
+    },
+    "output_prefix": {
+      "type": "string",
+      "pattern": "^videos/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/jobs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/hls/attempts/[1-9][0-9]*/[A-Za-z0-9_-]{1,80}$"
+    },
+    "renditions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "360p",
+          "720p"
+        ]
+      }
+    },
+    "deadline_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "description": "Validate field shapes here and enforce the identity/key equalities in scalability-conventions.md before any I/O."
 }

@@ -9,6 +9,7 @@ internal_fields:
   - attempt
   - lease_expires_at
   - published_manifest_key
+  - mode
 public_api_exposes_internal_fields: false
 publication:
   manifest_name: index.m3u8
@@ -30,6 +31,9 @@ custom queue events, or playback data.
 Phase 3 adds the nullable internal `published_manifest_key`. It is NULL for a
 legacy completed job and resolves to the original `hls/index.m3u8`; a
 distributed completed job must store its attempt-isolated parent manifest key.
+Phase 3 also adds internal `mode`, with values `cli` or `distributed`, persisted
+at first processing acquisition and unchanged on retry. Its rules and the S3
+child-result contract are defined in `scalability-conventions.md`.
 
 ## Lease fields and ownership
 
@@ -265,7 +269,9 @@ Legacy attempts use the HLS prefix and deterministic segment names in
 `storage-conventions.md`. Distributed attempts use the isolated prefixes in
 `scalability-conventions.md`; partial segments and manifests do not make a job
 playable through the API. A valid owner may overwrite only objects in its own
-attempt prefix. It uploads all segments first and `index.m3u8` last; the
+attempt prefix in distributed mode; legacy CLI retries retain their shared
+deterministic HLS prefix. It uploads all segments before the media playlist,
+then distributed children write internal `result.json` last; the
 distributed parent validates children, publishes its master last, and then
 conditionally persists the pointer and `COMPLETED`. Loss of either heartbeat
 signal stops further publication and terminal state changes. The playback API

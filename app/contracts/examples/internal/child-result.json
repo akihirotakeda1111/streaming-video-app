@@ -1,0 +1,26 @@
+{
+  "video_id": "018f47a2-45c2-7a84-b84f-5f6dd7b5910a",
+  "job_id": "018f47a2-4699-7892-9fc0-fbe46d3bbd67",
+  "attempt": 1,
+  "execution_id": "job-018f47a2-4699-7892-9fc0-fbe46d3bbd67-a1",
+  "rendition": "720p",
+  "source_key": "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4",
+  "output_prefix": "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/hls/attempts/1/job-018f47a2-4699-7892-9fc0-fbe46d3bbd67-a1/720p",
+  "schema_version": 1,
+  "media_playlist": {
+    "key": "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/hls/attempts/1/job-018f47a2-4699-7892-9fc0-fbe46d3bbd67-a1/720p/index.m3u8",
+    "size_bytes": 150,
+    "content_type": "application/vnd.apple.mpegurl"
+  },
+  "segments": [
+    {
+      "key": "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/hls/attempts/1/job-018f47a2-4699-7892-9fc0-fbe46d3bbd67-a1/720p/segment-00000.ts",
+      "size_bytes": 1500000,
+      "content_type": "video/mp2t"
+    }
+  ],
+  "width": 1280,
+  "height": 720,
+  "bandwidth": 2000000,
+  "codecs": "avc1.64001f,mp4a.40.2"
+}

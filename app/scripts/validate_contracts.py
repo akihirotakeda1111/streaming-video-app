@@ -30,6 +30,7 @@ EXPECTED_INTERNAL_FIELDS = [
     "attempt",
     "lease_expires_at",
     "published_manifest_key",
+    "mode",
 ]
 FORBIDDEN_PUBLIC_FIELDS = {
     "worker_id",
@@ -39,6 +40,7 @@ FORBIDDEN_PUBLIC_FIELDS = {
     "leaseExpiresAt",
     "published_manifest_key",
     "publishedManifestKey",
+    "mode",
 }
 CANONICAL_SOURCE_KEY = "videos/{video_id}/jobs/{job_id}/source.mp4"
 
@@ -338,7 +340,7 @@ def validate_reliability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
             raise ContractError(f"reliability contract {field} must reference {expected_path.name}")
 
     if metadata.get("internal_fields") != EXPECTED_INTERNAL_FIELDS:
-        raise ContractError("reliability contract must define the Phase 2 lease fields and Phase 3 manifest pointer")
+        raise ContractError("reliability contract must define lease fields, manifest pointer, and mode")
     if metadata.get("public_api_exposes_internal_fields") is not False:
         raise ContractError("reliability fields must remain internal")
 
@@ -350,7 +352,6 @@ def validate_reliability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
     }:
         raise ContractError("reliability publication metadata contradicts manifest-last ordering")
 
-    component_schemas = api.get("components", {}).get("schemas", {})
     public_property_names: set[str] = set()
 
     def collect_property_names(value: Any) -> None:
@@ -364,7 +365,7 @@ def validate_reliability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
             for item in value:
                 collect_property_names(item)
 
-    collect_property_names(component_schemas)
+    collect_property_names(api)
     exposed_fields = FORBIDDEN_PUBLIC_FIELDS & public_property_names
     if exposed_fields:
         raise ContractError(
@@ -388,6 +389,90 @@ def validate_reliability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
         )
 
 
+def validate_orchestration_payload(
+    kind: str,
+    payload: dict[str, Any],
+    validator: Draft202012Validator,
+    parent: dict[str, Any] | None = None,
+    child: dict[str, Any] | None = None,
+) -> None:
+    """Check schema plus semantic equalities also required of runtime consumers."""
+    errors = sorted(validator.iter_errors(payload), key=lambda error: str(list(error.path)))
+    if errors:
+        raise ContractError(f"{kind} orchestration payload is invalid: {errors[0].message}")
+    identity = ("video_id", "job_id", "attempt", "execution_id", "source_key")
+    source = f"videos/{payload['video_id']}/jobs/{payload['job_id']}/source.mp4"
+    execution = f"job-{payload['job_id']}-a{payload['attempt']}"
+    prefix = (
+        f"videos/{payload['video_id']}/jobs/{payload['job_id']}/hls/attempts/"
+        f"{payload['attempt']}/{payload['execution_id']}"
+    )
+    if payload["source_key"] != source or payload["execution_id"] != execution:
+        raise ContractError(f"{kind} source/execution must match declared identity")
+    if kind != "parent":
+        prefix += f"/{payload['rendition']}"
+        if parent is None or any(payload[field] != parent[field] for field in identity):
+            raise ContractError(f"{kind} identity must match parent")
+        if payload["rendition"] not in parent["renditions"]:
+            raise ContractError(f"{kind} rendition must be requested by parent")
+    if payload["output_prefix"] != prefix:
+        raise ContractError(f"{kind} output prefix must match declared identity")
+    if kind == "result":
+        if child is None or any(payload[field] != child[field] for field in (*identity, "rendition", "output_prefix")):
+            raise ContractError("result must match assigned child")
+        if payload["media_playlist"]["key"] != f"{prefix}/index.m3u8":
+            raise ContractError("result media playlist must be in its assigned prefix")
+        for index, segment in enumerate(payload["segments"]):
+            if segment["key"] != f"{prefix}/segment-{index:05d}.ts":
+                raise ContractError("result segments must be contiguous, ordered, and in their assigned prefix")
+
+
+def validate_orchestration_rejections(
+    schemas: dict[str, Draft202012Validator],
+    parent: dict[str, Any],
+    child: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    """Protect identity isolation and result boundaries with small in-memory probes."""
+    fixtures = {"parent": parent, "child": child, "result": result}
+    other_id = "00000000-0000-0000-0000-000000000000"
+    probes: list[tuple[str, dict]] = []
+    for kind, original in fixtures.items():
+        for field, value in (
+            ("video_id", other_id), ("job_id", other_id), ("attempt", 2),
+            ("execution_id", "wrong-execution"),
+            ("source_key", original["source_key"].replace(original["job_id"], other_id)),
+            ("output_prefix", original["output_prefix"].replace("/attempts/1/", "/attempts/2/")),
+            ("output_prefix", original["output_prefix"].replace(original["job_id"], other_id)),
+        ):
+            probes.append((kind, {**original, field: value}))
+    probes.append(("child", {**child, "output_prefix": child["output_prefix"].rsplit("/", 1)[0] + "/360p"}))
+    probes.append(("child", {**child, "source_key": "videos/a/jobs/b/source.mp4"}))
+    for path, value in (
+        (("media_playlist", "key"), result["media_playlist"]["key"].replace("/attempts/1/", "/attempts/2/")),
+        (("segments", 0, "key"), result["segments"][0]["key"].replace("segment-00000", "segment-00001")),
+        (("segments", 0, "key"), "../segment-00000.ts"),
+        (("segments", 0, "size_bytes"), 0),
+        (("segments", 0, "content_type"), "application/json"),
+        (("segments",), []),
+        (("width",), 1281),
+        (("rendition",), "1080p"),
+    ):
+        mutated = copy.deepcopy(result)
+        target = mutated
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        probes.append(("result", mutated))
+    for kind, payload in probes:
+        schema_name = "child_result_schema" if kind == "result" else f"{kind}_input_schema"
+        try:
+            validate_orchestration_payload(kind, payload, schemas[schema_name], parent, child)
+        except ContractError:
+            continue
+        raise ContractError(f"{kind} validation accepts an invalid identity/result probe")
+
+
 def validate_scalability_contract(contracts_dir: Path, api: dict[str, Any]) -> None:
     contract_path = contracts_dir / "domain" / "scalability-conventions.md"
     metadata, body = load_markdown_contract(contract_path)
@@ -400,8 +485,10 @@ def validate_scalability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
         "reliability_contract": contracts_dir / "domain" / "reliability-conventions.md",
         "parent_input_schema": contracts_dir / "domain" / "orchestration-parent-input.schema.json",
         "child_input_schema": contracts_dir / "domain" / "orchestration-child-input.schema.json",
+        "child_result_schema": contracts_dir / "domain" / "orchestration-child-result.schema.json",
         "parent_input_fixture": contracts_dir / "examples" / "internal" / "parent-input.json",
         "child_input_fixture": contracts_dir / "examples" / "internal" / "child-input.json",
+        "child_result_fixture": contracts_dir / "examples" / "internal" / "child-result.json",
     }
     for field, expected in expected_paths.items():
         reference = metadata.get(field)
@@ -411,25 +498,33 @@ def validate_scalability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
             raise ContractError(f"scalability contract reference is missing: {expected}")
 
     schemas = {}
-    for name in ("parent_input_schema", "child_input_schema"):
+    for name in ("parent_input_schema", "child_input_schema", "child_result_schema"):
         schema_path = expected_paths[name]
         schema = load_json(schema_path)
         Draft202012Validator.check_schema(schema)
         schemas[name] = Draft202012Validator(schema, format_checker=FormatChecker())
     parent = load_json(expected_paths["parent_input_fixture"])
     child = load_json(expected_paths["child_input_fixture"])
+    result = load_json(expected_paths["child_result_fixture"])
     for name, validator, instance in (
         ("parent", schemas["parent_input_schema"], parent),
         ("child", schemas["child_input_schema"], child),
+        ("result", schemas["child_result_schema"], result),
     ):
-        errors = sorted(validator.iter_errors(instance), key=lambda error: list(error.path))
-        if errors:
-            raise ContractError(f"{name} orchestration fixture is invalid: {errors[0].message}")
+        validate_orchestration_payload(name, instance, validator, parent, child)
 
-    if parent["attempt"] != child["attempt"] or parent["execution_id"] != child["execution_id"]:
-        raise ContractError("parent and child fixtures must identify the same attempt/execution")
-    if child["rendition"] not in parent["renditions"]:
-        raise ContractError("child fixture rendition is absent from parent renditions")
+    validate_orchestration_rejections(schemas, parent, child, result)
+    if metadata.get("modes") != {
+        "default": "cli", "supported": ["cli", "distributed"],
+        "immutable_after_first_acquisition": True,
+    }:
+        raise ContractError("scalability mode metadata is invalid")
+    if metadata.get("results") != {
+        "transport": "s3", "bucket": "VIDEO_OUTPUT_BUCKET", "filename": "result.json",
+        "content_type": "application/json", "ecs_integration": "ecs:runTask.sync",
+        "cloudfront_readable": False,
+    }:
+        raise ContractError("scalability results must use private S3 JSON and ECS sync")
     if metadata.get("delivery") != {
         "playback_base_url": "PLAYBACK_BASE_URL",
         "scheme": "https",
@@ -453,10 +548,27 @@ def validate_scalability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
         "hls/attempts/{attempt}/{execution_id}/{rendition}/index.m3u8",
         "hls/attempts/{attempt}/{execution_id}/index.m3u8",
         "publishes its master last",
+        "media playlist next, and `result.json` last",
+        "result_key = child.output_prefix/result.json",
+        "Parent, child, and result must have identical video_id, job_id, attempt",
+        "result.json` objects are never viewer content",
+        "an API that resolves published pointers and CloudFront URLs",
     )
     for phrase in required_phrases:
         if phrase.lower() not in normalized.lower():
             raise ContractError(f"scalability contract is missing required rule: {phrase}")
+
+    storage = re.sub(r"\s+", " ", (contracts_dir / "domain" / "storage-conventions.md").read_text(encoding="utf-8"))
+    for phrase in (
+        "Phase 3 introduces CloudFront",
+        "output bucket MUST reject anonymous S3 GET/HEAD",
+        "result.json objects MUST NOT be readable through CloudFront",
+    ):
+        if phrase not in storage:
+            raise ContractError(f"storage delivery contract is missing: {phrase}")
+    for obsolete in ("allow unauthenticated", "Phase 2 delivery baseline", "Phase 2 owns the CloudFront"):
+        if obsolete in storage or obsolete in normalized:
+            raise ContractError(f"obsolete public-S3/Phase 2 delivery requirement: {obsolete}")
 
     playback_schema = api["components"]["schemas"]["PlaybackResponse"]["properties"]["manifestUrl"]
     if playback_schema.get("pattern") != r"^https://[^?#]+$":

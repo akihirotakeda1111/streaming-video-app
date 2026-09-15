@@ -139,48 +139,41 @@ and FFmpeg execution. Lease recovery, visibility-timeout heartbeat, retry policy
 and DLQ handling remain Phase 2 concerns. Consequently, Phase 1 accepts that a
 worker crash after the atomic claim can leave a job in `QUEUED` or `PROCESSING`.
 
-## Phase 1 HLS delivery and playback URL
+## Phase 3 HLS delivery and playback URL
 
-For a completed job, the API resolves the manifest object:
+Phase 2 provides the completed reliability baseline. Phase 3 introduces
+CloudFront, Origin Access Control (OAC), and private output delivery. The
+Phase 1/2 public-S3 configuration is a migration source, not the target policy.
 
-```text
-s3://{VIDEO_OUTPUT_BUCKET}/videos/{video_id}/jobs/{job_id}/hls/index.m3u8
-```
+For a completed job, the API appends the published relative manifest key to
+the operator-supplied HTTPS PLAYBACK_BASE_URL, without inserting the bucket name.
+A NULL pointer on a legacy completed job resolves to
+videos/{video_id}/jobs/{job_id}/hls/index.m3u8. Distributed completed jobs require
+their attempt-scoped master pointer. S3 SDK endpoints are separate configuration.
 
-and returns the virtual-hosted S3 HTTPS URL as `manifestUrl`. The browser then
-loads `index.m3u8` and its relative `.ts` segment references directly from the
-output bucket. A presigned URL for the manifest alone is not sufficient because
-it does not authorize the segment requests.
+The output bucket MUST reject anonymous S3 GET/HEAD. Enable all S3 Block Public
+Access settings and remove public-read policies/ACLs in the final configuration.
+OAC signs requests to the S3 REST origin. Grant the CloudFront service principal
+s3:GetObject only for HLS media, restricted to the designated distribution ARN.
+Do not grant viewers S3 listing or writes, or public access to the input bucket.
+Internal result.json objects MUST NOT be readable through CloudFront; exclude
+them from OAC access as specified in scalability-conventions.md. Parent and child
+access to these objects uses separate authenticated IAM permissions.
 
-The Phase 1 output bucket must therefore allow unauthenticated `s3:GetObject`
-only for published HLS objects under this resource pattern:
+Viewers use public HTTPS at CloudFront for playlists and their relative media
+references. Preserve the HLS MIME types above. Viewer authentication and signed
+cookies are out of scope; the API's 409 not-ready gate is not authorization for
+guessed CloudFront paths. CORS is not authentication.
 
-```text
-arn:aws:s3:::{VIDEO_OUTPUT_BUCKET}/videos/*/jobs/*/hls/*
-```
+Configure CloudFront CORS for actual frontend origins, including cached
+responses for manifests and segments. Allow GET/HEAD and OPTIONS as needed;
+do not use a wildcard deployed origin. S3 CORS remains necessary for direct
+browser uploads to the input bucket and any explicitly supported direct SDK
+inspection; it does not provide viewer access to the private output bucket.
 
-Do not grant `s3:ListBucket`, write access, or any public access to the input
-bucket. The output bucket must return the content types defined above so both the
-playlist and segments are usable by an HLS player.
-
-Configure S3 CORS with each actual frontend origin (do not use `*` in deployed
-environments). A local Phase 1 example is:
-
-```json
-[
-  {
-    "AllowedOrigins": ["http://localhost:5173"],
-    "AllowedMethods": ["GET", "HEAD"],
-    "AllowedHeaders": ["*"],
-    "ExposeHeaders": ["ETag"],
-    "MaxAgeSeconds": 3000
-  }
-]
-```
-
-CloudFront, Origin Access Control (OAC), and a private output bucket are the
-Phase 2 delivery baseline. The Phase 3 scalability contract consumes that
-baseline through the operator-supplied HTTPS `PLAYBACK_BASE_URL`; it does not
-change the S3 key layout or playback response shape. S3 SDK endpoints and the
-viewer delivery origin are separate configuration values. See
-`scalability-conventions.md` for the distributed attempt prefixes and rollout.
+Prepare CloudFront/OAC, switch the API delivery origin, verify manifest/segment
+playback, then revoke anonymous S3 reads and enforce Block Public Access.
+Enable distributed processing after this cutover. Rollback retains private S3
+and a pointer-aware, CloudFront-capable API so distributed completed jobs remain
+playable. Existing source and completed-output keys are never moved or renamed.
+See scalability-conventions.md for attempt keys, result storage, and rollout.

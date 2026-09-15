@@ -3,14 +3,48 @@
   "title": "Distributed child encoder input",
   "type": "object",
   "additionalProperties": false,
-  "required": ["video_id", "job_id", "attempt", "execution_id", "rendition", "source_key", "output_prefix"],
+  "required": [
+    "video_id",
+    "job_id",
+    "attempt",
+    "execution_id",
+    "rendition",
+    "source_key",
+    "output_prefix"
+  ],
   "properties": {
-    "video_id": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
-    "job_id": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
-    "attempt": {"type": "integer", "minimum": 1},
-    "execution_id": {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[A-Za-z0-9_-]+$"},
-    "rendition": {"enum": ["360p", "720p"]},
-    "source_key": {"type": "string", "pattern": "^videos/[0-9a-f-]+/jobs/[0-9a-f-]+/source\\.mp4$"},
-    "output_prefix": {"type": "string", "pattern": "^videos/[^/]+/jobs/[^/]+/hls/attempts/[1-9][0-9]*/[^/]+/(360p|720p)$"}
-  }
+    "video_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "execution_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "rendition": {
+      "enum": [
+        "360p",
+        "720p"
+      ]
+    },
+    "source_key": {
+      "type": "string",
+      "pattern": "^videos/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/jobs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/source\\.mp4$"
+    },
+    "output_prefix": {
+      "type": "string",
+      "pattern": "^videos/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/jobs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/hls/attempts/[1-9][0-9]*/[A-Za-z0-9_-]{1,80}/(360p|720p)$"
+    }
+  },
+  "description": "Validate field shapes here and enforce the identity/key equalities in scalability-conventions.md before any I/O."
 }
