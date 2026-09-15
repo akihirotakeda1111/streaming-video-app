@@ -16,11 +16,24 @@ import {
 /** @typedef {{worker: string, database: string, dockerHost?: string, account?: string,
  * profile?: string, frontendUrl?: string, apiUrl?: string, fixture?: string,
  * invalidFixture?: string, clockSkewMs?: string, full?: boolean,
- * evidenceDir?: string, alarms?: string, disposable?: boolean}} Options */
+ * evidenceDir?: string, alarms?: string, disposable?: boolean, playbackUrl?: string}} Options */
 class ConfigurationError extends Error {}
 /** @param {string} message @returns {never} */
 function fail(message) {
   throw new ConfigurationError(message);
+}
+
+/** Validate deployed delivery configuration without echoing supplied values.
+ * @param {string} raw */
+export function normalizePlaybackBaseURL(raw) {
+  try {
+    const url = new URL(raw);
+    if (!/^https:\/\/[^/?#\\\s]+\/?$/.test(raw) || url.protocol !== "https:" ||
+        url.username || url.password || raw.includes("@") || url.pathname !== "/") throw Error();
+    return url.origin;
+  } catch {
+    return fail("PLAYBACK_BASE_URL must be an HTTPS origin without credentials, a path, a query, or a fragment");
+  }
 }
 const OUTPUT_NAMES = new Set([
   ...URL_NAMES,
@@ -44,6 +57,7 @@ const OUTPUT_NAMES = new Set([
   "VIDEO_INPUT_BUCKET",
   "VIDEO_OUTPUT_BUCKET",
   "OUTPUT_S3_ENDPOINT",
+  "PLAYBACK_BASE_URL",
   "FRONTEND_ORIGIN",
   "VITE_API_BASE_URL",
   "API_PORT",
@@ -390,6 +404,7 @@ export function discoverEnvironment(options, execute = execFileSync) {
     VIDEO_INPUT_BUCKET: env.E2E_SOURCE_BUCKET,
     VIDEO_OUTPUT_BUCKET: env.E2E_OUTPUT_BUCKET,
     OUTPUT_S3_ENDPOINT: `https://${env.E2E_OUTPUT_BUCKET}.s3.${region}.amazonaws.com`,
+    PLAYBACK_BASE_URL: normalizePlaybackBaseURL(options.playbackUrl ?? process.env.PLAYBACK_BASE_URL ?? ""),
     FRONTEND_ORIGIN: frontend.origin,
     VITE_API_BASE_URL: env.E2E_API_URL.replace(/\/$/, "") + "/api/v1",
     API_PORT: api.port || (api.protocol === "https:" ? "443" : "80"),
@@ -440,6 +455,7 @@ Usage: node app/scripts/generate_reliability_env.mjs --worker NAME --database NA
   --docker-host HOST    Direct local Docker socket (default: DOCKER_HOST or platform socket)
   --frontend-url URL    Default http://127.0.0.1:5173; set the actual URL if different
   --api-url URL         Default http://127.0.0.1:8000; set the actual URL if different
+  --playback-url URL    HTTPS CloudFront origin; required unless PLAYBACK_BASE_URL is set
   --fixture PATH        Existing MP4; otherwise emit an empty setting for manual completion
   --invalid-fixture PATH Existing nonempty invalid .mp4 for FFmpeg exhaustion
   --clock-skew-ms MS     Clock skew upper bound, 1..5000; default 1000 ms
@@ -465,6 +481,7 @@ export function main(args = process.argv.slice(2), execute = execFileSync) {
         "docker-host": { type: "string" },
         "frontend-url": { type: "string" },
         "api-url": { type: "string" },
+        "playback-url": { type: "string" },
         fixture: { type: "string" },
         "invalid-fixture": { type: "string" },
         "clock-skew-ms": { type: "string" },
@@ -495,7 +512,7 @@ export function main(args = process.argv.slice(2), execute = execFileSync) {
         invalidFixture: values["invalid-fixture"],
         clockSkewMs: values["clock-skew-ms"],
         full: values.full,
-        evidenceDir: values["evidence-dir"],
+        evidenceDir: values["evidence-dir"], playbackUrl: values["playback-url"],
         alarms: values.alarms,
         disposable: values.disposable,
       },

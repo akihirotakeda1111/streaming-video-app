@@ -4,7 +4,7 @@ import { statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { discoverEnvironment, validateGeneratedEnvironment } from './generate_reliability_env.mjs';
+import { discoverEnvironment, validateGeneratedEnvironment, normalizePlaybackBaseURL } from './generate_reliability_env.mjs';
 
 const scripts = dirname(fileURLToPath(import.meta.url));
 export const RUNTIME_NAMES = [
@@ -21,6 +21,7 @@ Required: --account ID --fixture PATH --invalid-fixture PATH
   --project NAME        Default: streaming-video-e2e
   --frontend-url URL    Default: http://localhost:5173
   --api-url URL         Default: http://localhost:8080
+  --playback-url URL    HTTPS delivery origin; overrides PLAYBACK_BASE_URL, then Terraform playback_base_url
   --evidence-dir PATH   Default: artifacts/reliability-e2e relative to the current directory
   --docker-host HOST    DOCKER_HOST or unix:///var/run/docker.sock; local Linux socket only
   --profile NAME        Runner AWS profile (Terraform uses the calling shell's credentials)
@@ -32,7 +33,7 @@ Does not apply Terraform or run E2E. --start-services can recreate existing cont
 
 /** @typedef {{account?: string, fixture?: string, 'invalid-fixture'?: string,
  * 'clock-skew-ms'?: string, 'terraform-directory'?: string, project?: string,
- * 'frontend-url'?: string, 'api-url'?: string, 'evidence-dir'?: string,
+ * 'frontend-url'?: string, 'api-url'?: string, 'playback-url'?: string, 'evidence-dir'?: string,
  * 'docker-host'?: string, profile?: string, alarms?: string,
  * 'start-services'?: boolean}} SetupOptions */
 /** @param {SetupOptions} values
@@ -91,6 +92,9 @@ export function setupEnvironment(values, execute = execFileSync, discover = disc
       throw Error();
     }
     runtime.FRONTEND_ORIGIN = new URL(frontendUrl).origin;
+    stage = 'playback URL (set --playback-url / PLAYBACK_BASE_URL or check Terraform playback_base_url)';
+    const playbackUrl = normalizePlaybackBaseURL(values['playback-url'] ?? process.env.PLAYBACK_BASE_URL ??
+      JSON.parse(command('terraform', [`-chdir=${terraformDirectory}`, 'output', '-json', 'playback_base_url'])));
     // All preparation stays in child environments. The parent Bash changes only on success.
     const childEnv = { ...process.env, ...runtime };
     const compose = ['--host', dockerHost, 'compose', '-p', project,
@@ -114,7 +118,7 @@ export function setupEnvironment(values, execute = execFileSync, discover = disc
     stage = 'E2E generation (check runner authentication, labels, alarms and inputs)';
     const settings = discover({
       worker, database, account, fixture: paths[0], invalidFixture: paths[1], clockSkewMs,
-      frontendUrl, apiUrl, dockerHost, evidenceDir: values['evidence-dir'],
+      frontendUrl, apiUrl, playbackUrl, dockerHost, evidenceDir: values['evidence-dir'],
       profile: values.profile, alarms: values.alarms, disposable: true, full: true,
     }, (tool, args, options) => execute(tool, args, { ...options, env: { ...options.env, ...runtime } }));
     // Reuse the generator's allowlist/value validation, without evaluating shell code.
@@ -136,7 +140,7 @@ export function setupEnvironment(values, execute = execFileSync, discover = disc
 export function main(args = process.argv.slice(2)) {
   try {
     const options = Object.fromEntries(['account', 'fixture', 'invalid-fixture', 'clock-skew-ms',
-      'terraform-directory', 'project', 'frontend-url', 'api-url', 'evidence-dir', 'docker-host',
+      'terraform-directory', 'project', 'frontend-url', 'api-url', 'playback-url', 'evidence-dir', 'docker-host',
       'profile', 'alarms'].map(name => [name, { type: 'string' }]));
     const { values } = parseArgs({ args, options: { ...options,
       'start-services': { type: 'boolean' }, help: { type: 'boolean' } } });

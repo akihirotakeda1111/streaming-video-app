@@ -35,7 +35,7 @@ const playbackResponse = {
   videoId,
   jobId,
   protocol: 'HLS',
-  manifestUrl: 'https://cdn.example/index.m3u8',
+  manifestUrl: 'https://test.cloudfront.net/videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/hls/index.m3u8',
   contentType: 'application/vnd.apple.mpegurl',
 }
 

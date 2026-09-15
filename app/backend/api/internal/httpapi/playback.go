@@ -15,13 +15,12 @@ const playbackContentType = "application/vnd.apple.mpegurl"
 
 // VideoPlaybackService resolves playback information for completed videos.
 type VideoPlaybackService struct {
-	repo           persistence.Repository
-	outputBucket   string
-	outputEndpoint string
+	repo            persistence.Repository
+	playbackBaseURL string
 }
 
-func NewVideoPlaybackService(repo persistence.Repository, outputBucket, outputEndpoint string) *VideoPlaybackService {
-	return &VideoPlaybackService{repo: repo, outputBucket: outputBucket, outputEndpoint: outputEndpoint}
+func NewVideoPlaybackService(repo persistence.Repository, playbackBaseURL string) *VideoPlaybackService {
+	return &VideoPlaybackService{repo: repo, playbackBaseURL: playbackBaseURL}
 }
 
 type playbackResponse struct {
@@ -62,7 +61,7 @@ func getVideoPlaybackHandler(service *VideoPlaybackService) http.HandlerFunc {
 			return
 		}
 
-		manifestURL, err := buildManifestURL(service.outputEndpoint, service.outputBucket, video.VideoID, video.Job.JobID)
+		manifestURL, err := buildDeliveryManifestURL(service.playbackBaseURL, video.VideoID, video.Job.JobID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "An unexpected error occurred.")
 			return
@@ -72,6 +71,21 @@ func getVideoPlaybackHandler(service *VideoPlaybackService) http.HandlerFunc {
 			ManifestURL: manifestURL, ContentType: playbackContentType,
 		})
 	}
+}
+
+func buildDeliveryManifestURL(baseURL string, videoID, jobID persistence.CanonicalUUID) (string, error) {
+	if !canonicalVideoIDPattern.MatchString(string(videoID)) || !canonicalVideoIDPattern.MatchString(string(jobID)) {
+		return "", fmt.Errorf("video and job IDs must be canonical UUIDs")
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return "", fmt.Errorf("playback base URL is invalid")
+	}
+	if base.User != nil || base.ForceQuery || base.RawQuery != "" || base.Fragment != "" || (base.Path != "" && base.Path != "/") {
+		return "", fmt.Errorf("playback base URL must contain only a scheme and host")
+	}
+	base.Path = "/videos/" + string(videoID) + "/jobs/" + string(jobID) + "/hls/index.m3u8"
+	return base.String(), nil
 }
 
 func buildManifestURL(endpoint, bucket string, videoID, jobID persistence.CanonicalUUID) (string, error) {
