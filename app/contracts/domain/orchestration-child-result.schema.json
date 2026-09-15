@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Distributed child encoder S3 success result",
+  "description": "Internal result.json stored after HLS uploads. Consumers must enforce identity, exact keys, ordered segments, and actual-media checks from scalability-conventions.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "video_id",
+    "job_id",
+    "attempt",
+    "execution_id",
+    "rendition",
+    "source_key",
+    "output_prefix",
+    "schema_version",
+    "media_playlist",
+    "segments",
+    "width",
+    "height",
+    "bandwidth",
+    "codecs"
+  ],
+  "properties": {
+    "video_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "execution_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "rendition": {
+      "enum": [
+        "360p",
+        "720p"
+      ]
+    },
+    "source_key": {
+      "type": "string",
+      "pattern": "^videos/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/jobs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/source\\.mp4$"
+    },
+    "output_prefix": {
+      "type": "string",
+      "pattern": "^videos/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/jobs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/hls/attempts/[1-9][0-9]*/[A-Za-z0-9_-]{1,80}/(360p|720p)$"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "media_playlist": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "size_bytes",
+        "content_type"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^videos/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/jobs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/hls/attempts/[1-9][0-9]*/[A-Za-z0-9_-]{1,80}/(360p|720p)/index\\.m3u8$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "content_type": {
+          "const": "application/vnd.apple.mpegurl"
+        }
+      }
+    },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "size_bytes",
+          "content_type"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^videos/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/jobs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/hls/attempts/[1-9][0-9]*/[A-Za-z0-9_-]{1,80}/(360p|720p)/segment-[0-9]{5}\\.ts$"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "content_type": {
+            "const": "video/mp2t"
+          }
+        }
+      }
+    },
+    "width": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1280
+    },
+    "height": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 720
+    },
+    "bandwidth": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "codecs": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "rendition": {
+            "const": "360p"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "width": {
+            "maximum": 640
+          },
+          "height": {
+            "maximum": 360
+          }
+        }
+      }
+    }
+  ]
+}
