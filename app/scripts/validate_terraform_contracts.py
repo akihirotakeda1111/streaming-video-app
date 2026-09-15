@@ -16,14 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# Mirrors the Phase 1 infra spec: application compute and PostgreSQL stay local,
-# while CloudFront, orchestration, retry infrastructure, and production hardening
-# are deferred. Change this boundary only when the task spec changes.
+# Mirrors the current infrastructure boundary. Application compute and PostgreSQL
+# stay local; delivery is now owned by CloudFront and OAC.
 FORBIDDEN_RESOURCE_PREFIXES = (
     "aws_alb",
     "aws_appautoscaling_",
     "aws_autoscaling_",
-    "aws_cloudfront_",
     "aws_db_",
     "aws_dynamodb_",
     "aws_ec2_",
@@ -254,6 +252,10 @@ def _attribute_is_false(text: str, name: str) -> bool:
     return value is not None and re.match(r"false\b", value, re.IGNORECASE) is not None
 
 
+def _assignment_is(text: str, name: str, value: str) -> bool:
+    return re.search(rf"\b{re.escape(name)}\s*=\s*{re.escape(value)}(?![A-Za-z0-9_])", text) is not None
+
+
 def _normalized_expression(value: str | None) -> str:
     return re.sub(r"\s+", "", value or "").lower()
 
@@ -284,6 +286,39 @@ def _policy_text(config: Configuration, block: Block) -> str:
         if document is not None:
             parts.append(document.body)
     return "\n".join(parts)
+
+
+def _nested_bodies(text: str, name: str) -> list[str]:
+    # Preserve quoted strings while removing comments from structural checks.
+    text = re.sub(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*|\#[^\n]*',
+                  lambda match: match.group() if match.group().startswith('"') else " ",
+                  text, flags=re.DOTALL)
+    return [text[match.end():_matching_brace(text, match.end() - 1, Path("policy"))]
+            for match in re.finditer(rf'\b{re.escape(name)}\s*\{{', text)]
+
+
+def _has_delivery_source_arn(config: Configuration, policy: str, output_name: str) -> bool:
+    distributions = {
+        block.name for block in config.resources("aws_cloudfront_distribution")
+        if any(_normalized_expression(_attribute(origin, "domain_name")) ==
+               f"aws_s3_bucket.{output_name}.bucket_regional_domain_name"
+               for origin in _nested_bodies(block.body, "origin"))
+    }
+    expected = {f"[aws_cloudfront_distribution.{name}.arn]" for name in distributions}
+    statements = [body for body in _nested_bodies(policy, "statement")
+                  if _assignment_is(body, "effect", '"Allow"')
+                  and "s3:getobject" in _policy_actions(body)]
+    return bool(statements) and all(
+        any(_assignment_is(principal, "type", '"Service"') and
+            _normalized_expression(_collection_attribute(principal, "identifiers")) ==
+            '["cloudfront.amazonaws.com"]'
+            for principal in _nested_bodies(statement, "principals")) and
+        any(_assignment_is(condition, "test", '"StringEquals"') and
+            _assignment_is(condition, "variable", '"AWS:SourceArn"') and
+            _normalized_expression(_collection_attribute(condition, "values")) in expected
+            for condition in _nested_bodies(statement, "condition"))
+        for statement in statements
+    )
 
 
 def _find_linked_block(
@@ -418,12 +453,12 @@ def check_storage_queue(config: Configuration, checks: Checks) -> tuple[str | No
         if (
             "s3:getobject" in actions
             and _has(policy, "videos/*/jobs/*/hls/*")
-            and _has_public_principal(policy)
+            and not _has_public_principal(policy)
         ):
             output_policy_candidates.append((block, policy, _bucket_reference(block)))
     checks.require(
         bool(output_policy_candidates),
-        "a public s3:GetObject policy restricted to Phase 1 HLS keys is required",
+        "a private s3:GetObject policy restricted to HLS keys is required",
     )
     if output_policy_candidates:
         policy_block, _, bucket_refs = output_policy_candidates[0]
@@ -502,9 +537,8 @@ def check_storage_queue(config: Configuration, checks: Checks) -> tuple[str | No
                 )
             for setting in ("block_public_policy", "restrict_public_buckets"):
                 checks.require(
-                    _attribute_is_false(block.body, setting),
-                    f"{block.location}: output bucket must set {setting} = false "
-                    "for direct HLS reads",
+                    _attribute_is_true(block.body, setting),
+                    f"{block.location}: output bucket must set {setting} = true",
                 )
 
         output_cors = _find_linked_block(cors_blocks, "aws_s3_bucket", output_name)
@@ -528,7 +562,7 @@ def check_storage_queue(config: Configuration, checks: Checks) -> tuple[str | No
         linked_policies = _find_linked_block(bucket_policies, "aws_s3_bucket", output_name)
         checks.require(
             bool(linked_policies),
-            "the public-read policy must be attached only to the output bucket",
+            "the private HLS policy must be attached only to the output bucket",
         )
         for linked_policy in linked_policies:
             policy = _policy_text(config, linked_policy)
@@ -536,19 +570,23 @@ def check_storage_queue(config: Configuration, checks: Checks) -> tuple[str | No
             actions = _policy_actions(policy)
             checks.require(
                 "s3:getobject" in actions,
-                f"{linked_policy.location}: output public policy must grant s3:GetObject",
+                f"{linked_policy.location}: output policy must grant s3:GetObject",
             )
             checks.require(
-                "*" in values,
-                f"{linked_policy.location}: output policy must grant unauthenticated reads",
+                "cloudfront.amazonaws.com" in values,
+                f"{linked_policy.location}: output policy must grant CloudFront only",
             )
             checks.require(
                 _has(policy, "videos/*/jobs/*/hls/*"),
-                f"{linked_policy.location}: public read must be limited to Phase 1 HLS keys",
+                f"{linked_policy.location}: CloudFront read must be limited to HLS keys",
+            )
+            checks.require(
+                _has_delivery_source_arn(config, policy, output_name),
+                f"{linked_policy.location}: each HLS Allow must restrict the CloudFront service to the linked distribution ARN using StringEquals AWS:SourceArn",
             )
             checks.reject(
                 bool(actions & WRITE_ACTIONS) or "s3:listbucket" in actions,
-                f"{linked_policy.location}: output public policy must not grant list or write",
+                f"{linked_policy.location}: output policy must not grant list or write",
             )
 
     if input_name is not None and encoding_queue_name is not None:
@@ -589,6 +627,57 @@ def _policy_actions(policy: str) -> set[str]:
     ):
         actions.update(value for value in _lower_strings(match.group(1)) if ":" in value)
     return actions
+
+
+def check_delivery(config: Configuration, checks: Checks, output_name: str | None) -> None:
+    """Check the private CloudFront/OAC delivery contract without evaluating HCL."""
+    distributions = config.resources("aws_cloudfront_distribution")
+    oacs = config.resources("aws_cloudfront_origin_access_control")
+    cache_policies = config.resources("aws_cloudfront_cache_policy")
+    response_policies = config.resources("aws_cloudfront_response_headers_policy")
+
+    checks.require(bool(distributions), "a CloudFront distribution is required for delivery")
+    checks.require(bool(oacs), "a CloudFront origin access control is required")
+    checks.require(bool(cache_policies), "a CloudFront cache policy is required")
+    checks.require(bool(response_policies), "a CloudFront response headers policy is required")
+
+    for block in oacs:
+        checks.require(_assignment_is(block.body, "origin_access_control_origin_type", '"s3"'), f"{block.location}: OAC must target an S3 REST origin")
+        checks.require(_assignment_is(block.body, "signing_protocol", '"sigv4"'), f"{block.location}: OAC must use SigV4")
+        checks.require(_assignment_is(block.body, "signing_behavior", '"always"'), f"{block.location}: OAC signing behavior must always sign")
+
+    for block in distributions:
+        checks.require(_has(block.body, "bucket_regional_domain_name"), f"{block.location}: CloudFront must use the S3 REST regional origin")
+        checks.require(_has(block.body, "origin_access_control_id"), f"{block.location}: distribution must attach an OAC")
+        checks.require(_has(block.body, "redirect-to-https"), f"{block.location}: viewer protocol must redirect to HTTPS")
+        checks.require(all(method in _strings(block.body) for method in ("GET", "HEAD", "OPTIONS")), f"{block.location}: delivery must support GET, HEAD, and OPTIONS")
+        checks.require(_has(block.body, "cache_policy_id") and _has(block.body, "response_headers_policy_id"), f"{block.location}: cache and response-header policies are required")
+        for behavior in _nested_bodies(block.body, "default_cache_behavior") + _nested_bodies(block.body, "ordered_cache_behavior"):
+            if "OPTIONS" not in _strings(_collection_attribute(behavior, "allowed_methods") or ""):
+                continue
+            policies = [policy for policy in config.resources()
+                        if policy.type_name in {"aws_cloudfront_origin_request_policy", "aws_cloudfront_cache_policy"}
+                        and _normalized_expression(_attribute(behavior, "origin_request_policy_id" if policy.type_name == "aws_cloudfront_origin_request_policy" else "cache_policy_id")) == f"{policy.type_name}.{policy.name}.id"]
+            forwarded = set()
+            for policy in policies:
+                for headers in _nested_bodies(policy.body, "headers_config"):
+                    if _assignment_is(headers, "header_behavior", '"whitelist"'):
+                        forwarded.update(_strings(headers))
+            checks.require({"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"} <= forwarded,
+                           f"{block.location}: OPTIONS requires the three CORS preflight headers in linked request/cache policies")
+        checks.require(_assignment_is(block.body, "error_code", "403") and _assignment_is(block.body, "error_code", "404") and len(re.findall(r"\berror_caching_min_ttl\s*=\s*0\b", block.body)) >= 2, f"{block.location}: 403/404 error caching must use the service minimum")
+
+    for block in cache_policies:
+        checks.require(_attribute(block.body, "default_ttl") == "0" and _attribute(block.body, "min_ttl") == "0" and _attribute(block.body, "max_ttl") == "0", f"{block.location}: legacy HLS cache TTLs must start at zero")
+
+    for block in response_policies:
+        checks.require(_has(block.body, "access_control_allow_origins") and _has(block.body, "local.frontend_origins"), f"{block.location}: CloudFront CORS must use approved frontend origins")
+        checks.require(_has(block.body, "origin_override") and _attribute_is_true(block.body, "origin_override"), f"{block.location}: CORS must apply on cache hits")
+
+    outputs = [block for block in config.blocks if block.kind == "output"]
+    checks.require(any((block.name or block.type_name).lower() == "playback_base_url" for block in outputs), "PLAYBACK_BASE_URL output is required")
+    checks.require(any("cloudfront_distribution" in block.body and ".domain_name" in block.body for block in outputs), "CloudFront domain output is required")
+    checks.require(any("cloudfront_distribution" in block.body and ".id" in block.body for block in outputs), "CloudFront ID output is required")
 
 
 def check_iam_separation(
@@ -996,15 +1085,14 @@ def validate(config: Configuration, stage: str) -> list[str]:
 
     input_name: str | None = None
     output_name: str | None = None
-    if stage in {"storage-queue", "reliability", "complete"}:
+    if stage in {"storage-queue", "reliability", "delivery", "complete"}:
         input_name, output_name = check_storage_queue(config, checks)
-    if stage == "reliability":
+    if stage in {"reliability", "delivery", "complete"}:
         check_iam_separation(config, checks, input_name, output_name)
         check_outputs(config, checks, input_name, output_name)
         check_reliability(config, checks, input_name, output_name)
-    if stage == "complete":
-        check_iam_separation(config, checks, input_name, output_name)
-        check_outputs(config, checks, input_name, output_name)
+    if stage in {"delivery", "complete"}:
+        check_delivery(config, checks, output_name)
     return checks.errors
 
 
@@ -1019,7 +1107,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("foundation", "storage-queue", "reliability", "complete"),
+        choices=("foundation", "storage-queue", "reliability", "delivery", "complete"),
         default="complete",
         help="Task completion stage to validate (default: complete)",
     )
