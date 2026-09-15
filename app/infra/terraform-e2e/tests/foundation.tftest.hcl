@@ -10,6 +10,53 @@ mock_provider "aws" {
   }
 }
 
+run "legacy_frontend_origin" {
+  command = plan
+  module { source = "../terraform" }
+  variables { frontend_origin = "https://legacy.example.com" }
+  assert {
+    condition     = local.frontend_origins == tolist(["https://legacy.example.com"])
+    error_message = "An omitted frontend_origins must preserve the legacy origin without adding localhost."
+  }
+  assert {
+    condition = alltrue([
+      for rule in aws_s3_bucket_cors_configuration.video_input.cors_rule :
+      toset(rule.allowed_origins) == toset(local.frontend_origins)
+    ]) && alltrue([
+      for rule in aws_s3_bucket_cors_configuration.video_output.cors_rule :
+      toset(rule.allowed_origins) == toset(local.frontend_origins)
+    ]) && toset(aws_cloudfront_response_headers_policy.video_output.cors_config[0].access_control_allow_origins[0].items) == toset(local.frontend_origins)
+    error_message = "Upload, output S3 and CloudFront must use the resolved origin allowlist."
+  }
+}
+
+run "explicit_frontend_origins" {
+  command = plan
+  module { source = "../terraform" }
+  variables {
+    frontend_origin  = "https://legacy.example.com"
+    frontend_origins = ["https://one.example.com", "https://two.example.com"]
+  }
+  assert {
+    condition     = toset(local.frontend_origins) == toset(["https://one.example.com", "https://two.example.com"])
+    error_message = "An explicit allowlist must not silently include the legacy origin or localhost."
+  }
+}
+
+run "empty_frontend_origins" {
+  command = plan
+  module { source = "../terraform" }
+  variables { frontend_origins = [] }
+  expect_failures = [var.frontend_origins]
+}
+
+run "wildcard_frontend_origins" {
+  command = plan
+  module { source = "../terraform" }
+  variables { frontend_origins = ["https://*.example.com"] }
+  expect_failures = [var.frontend_origins]
+}
+
 run "fixed_suite_foundation" {
   # Mock apply resolves the DLQ ARN embedded in redrive_policy; no AWS calls.
   command = apply

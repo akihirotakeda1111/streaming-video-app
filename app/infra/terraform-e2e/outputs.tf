@@ -5,7 +5,6 @@ output "compose_environment" {
     VIDEO_INPUT_BUCKET                  = module.foundation.video_input_bucket_name
     VIDEO_OUTPUT_BUCKET                 = module.foundation.video_output_bucket_name
     VIDEO_ENCODING_QUEUE_URL            = module.foundation.video_encoding_queue_url
-    PLAYBACK_BASE_URL                   = module.foundation.PLAYBACK_BASE_URL
     WORKER_HEARTBEAT_INTERVAL_SECONDS   = tostring(module.foundation.runtime_configuration.worker_heartbeat_interval_seconds)
     WORKER_VISIBILITY_EXTENSION_SECONDS = tostring(module.foundation.runtime_configuration.worker_visibility_extension_seconds)
     WORKER_LEASE_DURATION_SECONDS       = tostring(module.foundation.runtime_configuration.worker_lease_duration_seconds)

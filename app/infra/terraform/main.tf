@@ -250,7 +250,7 @@ resource "aws_s3_bucket_cors_configuration" "video_input" {
   cors_rule {
     allowed_headers = ["Content-Type"]
     allowed_methods = ["PUT"]
-    allowed_origins = var.frontend_origins
+    allowed_origins = local.frontend_origins
     expose_headers  = ["ETag"]
     max_age_seconds = 3000
   }
@@ -262,7 +262,7 @@ resource "aws_s3_bucket_cors_configuration" "video_output" {
   cors_rule {
     allowed_headers = ["*"]
     allowed_methods = ["GET", "HEAD"]
-    allowed_origins = var.frontend_origins
+    allowed_origins = local.frontend_origins
     expose_headers  = ["ETag"]
     max_age_seconds = 3000
   }
@@ -284,7 +284,7 @@ resource "aws_cloudfront_origin_access_control" "video_output" {
 
 resource "aws_cloudfront_cache_policy" "video_output" {
   name        = "${local.name_prefix}-video-output"
-  comment     = "No negative caching for legacy deterministic HLS keys."
+  comment     = "Disable successful-response caching for mutable legacy HLS keys."
   default_ttl = 0
   max_ttl     = 0
   min_ttl     = 0
@@ -298,6 +298,16 @@ resource "aws_cloudfront_cache_policy" "video_output" {
   }
 }
 
+resource "aws_cloudfront_origin_request_policy" "video_output" {
+  name = "${local.name_prefix}-video-output-preflight"
+  cookies_config { cookie_behavior = "none" }
+  query_strings_config { query_string_behavior = "none" }
+  headers_config {
+    header_behavior = "whitelist"
+    headers { items = ["Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"] }
+  }
+}
+
 resource "aws_cloudfront_response_headers_policy" "video_output" {
   name    = "${local.name_prefix}-video-output-cors"
   comment = "CORS for approved browser frontend origins, including cache hits."
@@ -307,7 +317,7 @@ resource "aws_cloudfront_response_headers_policy" "video_output" {
     origin_override                  = true
     access_control_allow_headers { items = ["*"] }
     access_control_allow_methods { items = ["GET", "HEAD", "OPTIONS"] }
-    access_control_allow_origins { items = var.frontend_origins }
+    access_control_allow_origins { items = local.frontend_origins }
     access_control_expose_headers { items = ["ETag"] }
   }
 }
@@ -329,6 +339,7 @@ resource "aws_cloudfront_distribution" "video_output" {
     allowed_methods          = ["GET", "HEAD", "OPTIONS"]
     cached_methods            = ["GET", "HEAD", "OPTIONS"]
     cache_policy_id           = aws_cloudfront_cache_policy.video_output.id
+    origin_request_policy_id  = aws_cloudfront_origin_request_policy.video_output.id
     response_headers_policy_id = aws_cloudfront_response_headers_policy.video_output.id
   }
 

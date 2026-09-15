@@ -13,6 +13,7 @@ override_module {
     video_input_bucket_name  = "streaming-video-e2e-check-123456789012-ap-northeast-1-input"
     video_output_bucket_name = "streaming-video-e2e-check-123456789012-ap-northeast-1-output"
     video_encoding_queue_url = "https://sqs.ap-northeast-1.amazonaws.com/123456789012/actual-created-queue"
+    playback_base_url        = "https://example.cloudfront.net"
     api_local_execution      = { user_name = "api-user", policy_arn = "arn:aws:iam::123456789012:policy/api" }
     worker_local_execution   = { user_name = "worker-user", policy_arn = "arn:aws:iam::123456789012:policy/worker" }
     runtime_configuration = {
@@ -34,6 +35,19 @@ variables {
 
 run "dedicated_environment" {
   command = plan
+  assert {
+    condition = toset(keys(output.compose_environment)) == toset([
+      "AWS_REGION", "VIDEO_INPUT_BUCKET", "VIDEO_OUTPUT_BUCKET", "VIDEO_ENCODING_QUEUE_URL",
+      "WORKER_HEARTBEAT_INTERVAL_SECONDS", "WORKER_VISIBILITY_EXTENSION_SECONDS",
+      "WORKER_LEASE_DURATION_SECONDS", "WORKER_RETRY_DELAY_SECONDS",
+      "WORKER_MAXIMUM_ATTEMPTS", "FRONTEND_ORIGIN",
+    ])
+    error_message = "Compose output must preserve the strict reliability setup allowlist."
+  }
+  assert {
+    condition     = output.playback_base_url == "https://example.cloudfront.net"
+    error_message = "Playback must be exported separately from the reliability environment."
+  }
   assert {
     condition     = aws_iam_policy.runner.name == "streaming-video-e2e-check-e2e-runner"
     error_message = "E2E names must never use the ordinary deployment prefix."

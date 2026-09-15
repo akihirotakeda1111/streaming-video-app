@@ -288,6 +288,39 @@ def _policy_text(config: Configuration, block: Block) -> str:
     return "\n".join(parts)
 
 
+def _nested_bodies(text: str, name: str) -> list[str]:
+    # Preserve quoted strings while removing comments from structural checks.
+    text = re.sub(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*|\#[^\n]*',
+                  lambda match: match.group() if match.group().startswith('"') else " ",
+                  text, flags=re.DOTALL)
+    return [text[match.end():_matching_brace(text, match.end() - 1, Path("policy"))]
+            for match in re.finditer(rf'\b{re.escape(name)}\s*\{{', text)]
+
+
+def _has_delivery_source_arn(config: Configuration, policy: str, output_name: str) -> bool:
+    distributions = {
+        block.name for block in config.resources("aws_cloudfront_distribution")
+        if any(_normalized_expression(_attribute(origin, "domain_name")) ==
+               f"aws_s3_bucket.{output_name}.bucket_regional_domain_name"
+               for origin in _nested_bodies(block.body, "origin"))
+    }
+    expected = {f"[aws_cloudfront_distribution.{name}.arn]" for name in distributions}
+    statements = [body for body in _nested_bodies(policy, "statement")
+                  if _assignment_is(body, "effect", '"Allow"')
+                  and "s3:getobject" in _policy_actions(body)]
+    return bool(statements) and all(
+        any(_assignment_is(principal, "type", '"Service"') and
+            _normalized_expression(_collection_attribute(principal, "identifiers")) ==
+            '["cloudfront.amazonaws.com"]'
+            for principal in _nested_bodies(statement, "principals")) and
+        any(_assignment_is(condition, "test", '"StringEquals"') and
+            _assignment_is(condition, "variable", '"AWS:SourceArn"') and
+            _normalized_expression(_collection_attribute(condition, "values")) in expected
+            for condition in _nested_bodies(statement, "condition"))
+        for statement in statements
+    )
+
+
 def _find_linked_block(
     blocks: list[Block], resource_type: str, resource_name: str
 ) -> list[Block]:
@@ -548,8 +581,8 @@ def check_storage_queue(config: Configuration, checks: Checks) -> tuple[str | No
                 f"{linked_policy.location}: CloudFront read must be limited to HLS keys",
             )
             checks.require(
-                _has(policy, "AWS:SourceArn") and _has(policy, "aws_cloudfront_distribution"),
-                f"{linked_policy.location}: CloudFront read must use the distribution SourceArn",
+                _has_delivery_source_arn(config, policy, output_name),
+                f"{linked_policy.location}: each HLS Allow must restrict the CloudFront service to the linked distribution ARN using StringEquals AWS:SourceArn",
             )
             checks.reject(
                 bool(actions & WRITE_ACTIONS) or "s3:listbucket" in actions,
@@ -619,13 +652,26 @@ def check_delivery(config: Configuration, checks: Checks, output_name: str | Non
         checks.require(_has(block.body, "redirect-to-https"), f"{block.location}: viewer protocol must redirect to HTTPS")
         checks.require(all(method in _strings(block.body) for method in ("GET", "HEAD", "OPTIONS")), f"{block.location}: delivery must support GET, HEAD, and OPTIONS")
         checks.require(_has(block.body, "cache_policy_id") and _has(block.body, "response_headers_policy_id"), f"{block.location}: cache and response-header policies are required")
+        for behavior in _nested_bodies(block.body, "default_cache_behavior") + _nested_bodies(block.body, "ordered_cache_behavior"):
+            if "OPTIONS" not in _strings(_collection_attribute(behavior, "allowed_methods") or ""):
+                continue
+            policies = [policy for policy in config.resources()
+                        if policy.type_name in {"aws_cloudfront_origin_request_policy", "aws_cloudfront_cache_policy"}
+                        and _normalized_expression(_attribute(behavior, "origin_request_policy_id" if policy.type_name == "aws_cloudfront_origin_request_policy" else "cache_policy_id")) == f"{policy.type_name}.{policy.name}.id"]
+            forwarded = set()
+            for policy in policies:
+                for headers in _nested_bodies(policy.body, "headers_config"):
+                    if _assignment_is(headers, "header_behavior", '"whitelist"'):
+                        forwarded.update(_strings(headers))
+            checks.require({"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"} <= forwarded,
+                           f"{block.location}: OPTIONS requires the three CORS preflight headers in linked request/cache policies")
         checks.require(_assignment_is(block.body, "error_code", "403") and _assignment_is(block.body, "error_code", "404") and len(re.findall(r"\berror_caching_min_ttl\s*=\s*0\b", block.body)) >= 2, f"{block.location}: 403/404 error caching must use the service minimum")
 
     for block in cache_policies:
         checks.require(_attribute(block.body, "default_ttl") == "0" and _attribute(block.body, "min_ttl") == "0" and _attribute(block.body, "max_ttl") == "0", f"{block.location}: legacy HLS cache TTLs must start at zero")
 
     for block in response_policies:
-        checks.require(_has(block.body, "access_control_allow_origins") and _has(block.body, "var.frontend_origins"), f"{block.location}: CloudFront CORS must use approved frontend origins")
+        checks.require(_has(block.body, "access_control_allow_origins") and _has(block.body, "local.frontend_origins"), f"{block.location}: CloudFront CORS must use approved frontend origins")
         checks.require(_has(block.body, "origin_override") and _attribute_is_true(block.body, "origin_override"), f"{block.location}: CORS must apply on cache hits")
 
     outputs = [block for block in config.blocks if block.kind == "output"]
@@ -1041,15 +1087,11 @@ def validate(config: Configuration, stage: str) -> list[str]:
     output_name: str | None = None
     if stage in {"storage-queue", "reliability", "delivery", "complete"}:
         input_name, output_name = check_storage_queue(config, checks)
-    if stage == "reliability":
+    if stage in {"reliability", "delivery", "complete"}:
         check_iam_separation(config, checks, input_name, output_name)
         check_outputs(config, checks, input_name, output_name)
         check_reliability(config, checks, input_name, output_name)
-    if stage == "complete":
-        check_iam_separation(config, checks, input_name, output_name)
-        check_outputs(config, checks, input_name, output_name)
-        check_delivery(config, checks, output_name)
-    if stage == "delivery":
+    if stage in {"delivery", "complete"}:
         check_delivery(config, checks, output_name)
     return checks.errors
 

@@ -54,10 +54,10 @@ variable "frontend_origin" {
 
 variable "frontend_origins" {
   type        = list(string)
-  description = "Approved browser origins for CloudFront CORS response headers."
-  default     = ["http://localhost:5173"]
+  description = "Approved browser origins for S3 and CloudFront CORS. Null preserves frontend_origin."
+  default     = null
   validation {
-    condition     = length(var.frontend_origins) > 0 && alltrue([for origin in var.frontend_origins : can(regex("^https?://[^/]+$", origin))])
+    condition     = var.frontend_origins == null ? true : length(var.frontend_origins) > 0 && alltrue([for origin in var.frontend_origins : can(regex("^https?://[^/*?#@[:space:]]+$", origin))])
     error_message = "frontend_origins must contain one or more explicit HTTP(S) origins."
   }
 }
