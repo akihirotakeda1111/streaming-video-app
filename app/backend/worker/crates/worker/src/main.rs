@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 use worker::{
     acquisition::WorkerIdentityProvider, completion::MessageCompletionProcessor,
-    heartbeat::HeartbeatSettings, runtime::PHASE1_MAX_CONCURRENCY,
+    heartbeat::HeartbeatSettings,
 };
 
 async fn shutdown_requested() -> std::io::Result<()> {
@@ -143,9 +143,10 @@ async fn main() {
         let _ = stop.send(true);
     });
 
-    info!(region = %config.aws_region, queue_url = %config.queue_url, max_concurrency = PHASE1_MAX_CONCURRENCY, "worker started");
+    // PHASE1_MAX_CONCURRENCY is retained as the local default in Config.
+    info!(region = %config.aws_region, queue_url = %config.queue_url, max_concurrency = config.max_concurrency, "worker started");
     let result = supervise_database(
-        worker::runtime::run(queue, processor, shutdown, PHASE1_MAX_CONCURRENCY),
+        worker::runtime::run(queue, processor, shutdown, config.max_concurrency),
         connection_stopped,
         database_stop,
     )

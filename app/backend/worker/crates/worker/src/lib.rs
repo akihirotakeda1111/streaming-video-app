@@ -25,6 +25,9 @@ const VISIBILITY_EXTENSION_SECONDS: &str = "WORKER_VISIBILITY_EXTENSION_SECONDS"
 const LEASE_DURATION_SECONDS: &str = "WORKER_LEASE_DURATION_SECONDS";
 const RETRY_DELAY_SECONDS: &str = "WORKER_RETRY_DELAY_SECONDS";
 const MAXIMUM_ATTEMPTS: &str = "WORKER_MAXIMUM_ATTEMPTS";
+const MAX_CONCURRENCY: &str = "WORKER_MAX_CONCURRENCY";
+const DEFAULT_MAX_CONCURRENCY: usize = 2;
+const MAX_ALLOWED_CONCURRENCY: usize = 32;
 
 /// All runtime settings required by the worker.
 #[derive(Clone, PartialEq, Eq)]
@@ -41,6 +44,7 @@ pub struct Config {
     pub lease_duration_seconds: u64,
     pub retry_delay_seconds: u64,
     pub maximum_attempts: u32,
+    pub max_concurrency: usize,
 }
 
 impl Config {
@@ -65,6 +69,12 @@ impl Config {
         let lease_duration_seconds = positive_seconds(&lookup, LEASE_DURATION_SECONDS)?;
         let retry_delay_seconds = positive_seconds(&lookup, RETRY_DELAY_SECONDS)?;
         let maximum_attempts = positive_u32(&lookup, MAXIMUM_ATTEMPTS)?;
+        let max_concurrency = optional_bounded_usize(
+            &lookup,
+            MAX_CONCURRENCY,
+            DEFAULT_MAX_CONCURRENCY,
+            MAX_ALLOWED_CONCURRENCY,
+        )?;
         if maximum_attempts > 10 {
             return Err(ConfigError::invalid(MAXIMUM_ATTEMPTS, "must not exceed 10"));
         }
@@ -121,6 +131,7 @@ impl Config {
             lease_duration_seconds,
             retry_delay_seconds,
             maximum_attempts,
+            max_concurrency,
         })
     }
 }
@@ -147,6 +158,7 @@ impl fmt::Debug for Config {
             .field("lease_duration_seconds", &self.lease_duration_seconds)
             .field("retry_delay_seconds", &self.retry_delay_seconds)
             .field("maximum_attempts", &self.maximum_attempts)
+            .field("max_concurrency", &self.max_concurrency)
             .finish()
     }
 }
@@ -212,6 +224,31 @@ where
         return Err(ConfigError::invalid(variable, "must be a positive integer"));
     }
     Ok(attempts)
+}
+
+fn optional_bounded_usize<F>(
+    lookup: &F,
+    variable: &'static str,
+    default: usize,
+    maximum: usize,
+) -> Result<usize, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(value) = lookup(variable).filter(|value| !value.trim().is_empty()) else {
+        return Ok(default);
+    };
+    let value = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| ConfigError::invalid(variable, "must be a positive integer"))?;
+    if value == 0 || value > maximum {
+        return Err(ConfigError::invalid(
+            variable,
+            "must be between 1 and 32",
+        ));
+    }
+    Ok(value)
 }
 
 fn validate_postgres_url(value: &str) -> Result<(), ConfigError> {
