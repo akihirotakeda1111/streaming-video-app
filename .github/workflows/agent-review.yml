@@ -60,6 +60,7 @@
 #   VIDEO_INPUT_BUCKET, and VIDEO_OUTPUT_BUCKET repository variables plus the
 #   API and worker AWS E2E repository secrets. They are injected only into the
 #   API and worker containers; the frontend container never receives them.
+# - Host E2E inspection uses OIDC and AWS_E2E_RUNNER_ROLE_ARN / E2E_AWS_ACCOUNT_ID.
 #
 # Official references:
 # - https://github.com/openai/codex-action
@@ -136,6 +137,7 @@ jobs:
       group: ${{ github.workflow }}-${{ needs.prepare.outputs.pull_number }}
       cancel-in-progress: false
     permissions:
+      id-token: write
       contents: write
       pull-requests: write
       issues: write
@@ -269,6 +271,17 @@ jobs:
           codex-version: ${{ steps.codex-cli.outputs.version }}
           allow-bot-users: ${{ needs.prepare.outputs.coderabbit_actor }}
 
+      - name: Authenticate E2E runner with AWS OIDC
+        if: ${{ steps.environments.outputs.e2e == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_E2E_RUNNER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.E2E_AWS_ACCOUNT_ID }}
+          role-session-name: e2e-${{ github.job }}-${{ github.run_id }}
+          role-duration-seconds: 3600
+          unset-current-credentials: true
+
       - name: Run review orchestrator
         env:
           CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
@@ -279,6 +292,9 @@ jobs:
           E2E_ENVIRONMENT: ${{ steps.environments.outputs.e2e == 'true' && 'disposable' || '' }}
           E2E_FRONTEND_URL: ${{ steps.environments.outputs.e2e == 'true' && 'http://localhost:5173' || '' }}
           E2E_API_URL: ${{ steps.environments.outputs.e2e == 'true' && 'http://127.0.0.1:8000' || '' }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          E2E_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
+          E2E_AWS_ACCOUNT_ID: ${{ vars.E2E_AWS_ACCOUNT_ID }}
           PLAYBACK_BASE_URL: ${{ vars.PLAYBACK_BASE_URL }}
           E2E_PROJECT: ${{ steps.environments.outputs.e2e == 'true' && 'chromium' || '' }}
           FFMPEG_PATH: ${{ steps.environments.outputs.e2e == 'true' && '/usr/bin/ffmpeg' || '' }}

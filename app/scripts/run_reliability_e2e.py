@@ -142,6 +142,9 @@ def _dispatch(config: LiveConfig, selector: str, project: str, reliability: bool
     cli = SAFETY_CLI.parents[2] / "node_modules/@playwright/test/cli.js"
     args = [node, str(cli), "test", "--grep", selector, "--project", project]
     child_environment = os.environ.copy()
+    child_environment.pop("E2E_INCLUDE_DELIVERY_REPLAY", None)
+    if config.scenario == "delivery-regression":
+        child_environment["E2E_INCLUDE_DELIVERY_REPLAY"] = "true"
     if reliability:
         child_environment["E2E_INCLUDE_RELIABILITY"] = "true"
     else:

@@ -5,7 +5,7 @@
 ### 構成要素と責務
 
 Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・PostgreSQLを使う。
-準備、設定生成、実体確認、シナリオ実行を分ける。CIはオフライン検証のみとし、Terraformや実環境シナリオは手動で実行する。
+準備、設定生成、実体確認、シナリオ実行を分ける。ReliabilityのCI検証はオフラインのみとし、Terraformや障害注入シナリオは手動で実行する。通常のブラウザE2Eは下記の分担でCI実行する。
 
 | 要素 | 実装・設定 | 役割 |
 | --- | --- | --- |
@@ -48,7 +48,51 @@ runnerは各dispatch前に共通事前確認を行う。Reliabilityの操作シ�
 
 ## 事前準備
 
+### 通常CIと専用runnerの分担
+
+通常の `npm --prefix app/frontend run test:e2e` はブラウザ/API/FFmpegと配信設定のpreflightを先に実行し、成功した場合だけ新規アップロード・CloudFront再生などの通常テストに進む。`delivery-regression` と6つのReliabilityシナリオは通常選択から除外し、専用runnerが明示選択する。`--list` は実AWSへ接続せず全体を列挙する。明示的なPlaywright引数を渡した場合は、その選択を維持する。
+
+merge-tests、agent-execute、agent-reviewのテスト実行プロセスには、起動ステップとは別に次を渡す。
+
+- Repository Variables：`AWS_REGION`、`VIDEO_OUTPUT_BUCKET`（`E2E_OUTPUT_BUCKET`へ渡す）、`E2E_AWS_ACCOUNT_ID`、`PLAYBACK_BASE_URL`、`AWS_E2E_RUNNER_ROLE_ARN`。
+- ホストrunnerはGitHub OIDCでIAMロールを引き受ける。runner用アクセスキー・シークレットキー・セッショントークンのSecretsは不要。API/Workerの認証は既存の設定を維持する。
+- OIDCロールには、下記のS3/CloudFront読み取り権限を付与する。
+
+これらのGitHub設定は別途登録が必要。設定不足はskipせず失敗させる。通常CIは過去の `legacy.json` やDBに依存せず、移行前互換性は専用runnerで別途検証する。
+
 ### ツールと実行場所
+
+#### CIホストのOIDC認証
+
+AWS側に `https://token.actions.githubusercontent.com` のOIDC provider（audience `sts.amazonaws.com`）とE2E参照用IAMロールを用意する。既存providerがある場合は再利用する。信頼ポリシー例は以下。`<ACCOUNT_ID>` を対象アカウントに置き換える。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+      "StringLike": { "token.actions.githubusercontent.com:sub": [
+        "repo:akihirotakeda1111/streaming-video-app:ref:refs/heads/main",
+        "repo:akihirotakeda1111/streaming-video-app:ref:refs/heads/dev*"
+      ] }
+    }
+  }]
+}
+```
+
+許可するrefは実際の運用に限定する。信頼条件はcheckout先ではなく、ワークフローイベントが発行するOIDCの `sub` に適用される。手動実行のref・default branchが例と異なる場合は実際のrefを追加する。GitHub Environmentやカスタムsubjectを使う場合も条件を合わせる。
+
+ロールARNをGitHub Variable `AWS_E2E_RUNNER_ROLE_ARN` に設定し、`E2E_AWS_ACCOUNT_ID` に対象アカウントを設定する。信頼ポリシーとは別にS3/CloudFront参照権限を付与する。AWS側の作成・ポリシー適用は手動で行う。
+
+E2Eを実行する4ジョブだけに `id-token: write` を付与し、実行直前に `aws-actions/configure-aws-credentials` で認証する。agent系はE2Eが必要な場合のみ認証する。一時認証は後続プロセスへ環境変数で渡し、`allowed-account-ids` でアカウントを照合する。有効期間は3600秒で自動更新しないため、長時間のorchestrator実行には再認証の分割かIAMロール上限内の期間調整が必要。
+
+参考：[GitHubのAWS OIDC設定](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws)、[AWS認証Action](https://github.com/aws-actions/configure-aws-credentials)。
+
+#### ローカル実行
 
 コマンドはリポジトリルートで実行する。本ガイドは **WSL / LinuxのBash** を対象とする。
 1行ずつ実行し、失敗した場合は後続へ進まない。

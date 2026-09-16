@@ -2,6 +2,10 @@ import process from 'node:process'
 import { defineConfig, devices } from '@playwright/test'
 import { e2eConfig, reliabilityDiscoveryConfig } from './e2e/config.js'
 
+const browserTestIgnore = ['**/*.test.ts', '**/reliability/**/*.spec.ts',
+  ...(process.env.E2E_INCLUDE_DELIVERY_REPLAY === 'true' || process.env.E2E_DISCOVERY === 'true'
+    ? [] : ['**/delivery-regression.spec.ts'])]
+
 /**
  * Read environment variables from file.
  * https://github.com/motdotla/dotenv
@@ -54,21 +58,21 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      testIgnore: ['**/*.test.ts', '**/reliability/**/*.spec.ts'],
+      testIgnore: browserTestIgnore,
       use: {
         ...devices['Desktop Chrome'],
       },
     },
     {
       name: 'firefox',
-      testIgnore: ['**/*.test.ts', '**/reliability/**/*.spec.ts'],
+      testIgnore: browserTestIgnore,
       use: {
         ...devices['Desktop Firefox'],
       },
     },
     {
       name: 'webkit',
-      testIgnore: ['**/*.test.ts', '**/reliability/**/*.spec.ts'],
+      testIgnore: browserTestIgnore,
       use: {
         ...devices['Desktop Safari'],
       },

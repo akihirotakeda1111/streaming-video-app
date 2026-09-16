@@ -396,6 +396,19 @@ class RunnerChecks(unittest.TestCase):
             with patch.dict(GLOBALS, {"_dispatch": lambda c, s, p, r: (s, p, r)}):
                 self.assertEqual(MODULE["_run"](config), ("@" + scenario, "chromium", False))
 
+    def test_delivery_replay_selection_is_explicit_and_not_inherited(self):
+        for scenario in ("delivery-regression", "delivery-preflight", "phase1-pipeline"):
+            with tempfile.TemporaryDirectory() as root, \
+                    patch.dict(os.environ, {"E2E_INCLUDE_DELIVERY_REPLAY": "true"}), \
+                    patch.dict(GLOBALS, {"_settings": lambda mode: {"status": "verified"}}), \
+                    patch("shutil.which", return_value="node"), \
+                    patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                config = MODULE["LiveConfig"](Path(root) / "e2e-new", scenario)
+                MODULE["_dispatch"](config, "@" + scenario, "chromium", False)
+                self.assertEqual(run.call_args.kwargs["env"].get("E2E_INCLUDE_DELIVERY_REPLAY"),
+                                 "true" if scenario == "delivery-regression" else None)
+
     def test_outer_blocked_report_uses_same_suite(self):
         output = io.StringIO()
         with patch.dict(GLOBALS, {"_full": lambda: (_ for _ in ()).throw(ValueError("unavailable"))}), \

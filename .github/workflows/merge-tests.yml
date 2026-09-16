@@ -211,6 +211,9 @@ jobs:
 
   e2e:
     name: E2E tests
+    permissions:
+      contents: read
+      id-token: write
     needs: changes
     if: ${{ needs.changes.outputs.e2e == 'true' }}
     runs-on: ubuntu-latest
@@ -271,12 +274,25 @@ jobs:
           WORKER_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_WORKER_SECRET_ACCESS_KEY }}
         run: bash app/scripts/start-e2e-compose.sh
 
+      - name: Authenticate E2E runner with AWS OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_E2E_RUNNER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.E2E_AWS_ACCOUNT_ID }}
+          role-session-name: e2e-${{ github.job }}-${{ github.run_id }}
+          role-duration-seconds: 3600
+          unset-current-credentials: true
+
       - name: Run E2E tests
         working-directory: app/frontend
         env:
           E2E_ENVIRONMENT: disposable
           E2E_FRONTEND_URL: http://localhost:5173
           E2E_API_URL: http://127.0.0.1:8000
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          E2E_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
+          E2E_AWS_ACCOUNT_ID: ${{ vars.E2E_AWS_ACCOUNT_ID }}
           PLAYBACK_BASE_URL: ${{ vars.PLAYBACK_BASE_URL }}
           E2E_PROJECT: chromium
           FFMPEG_PATH: /usr/bin/ffmpeg
