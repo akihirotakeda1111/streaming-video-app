@@ -1,7 +1,8 @@
 //! PostgreSQL implementation of the job-state port.
 
-use std::{future::Future, time::SystemTime};
+use std::{env, future::Future, time::SystemTime};
 
+use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::{Client, NoTls, types::ToSql};
 
 use crate::{
@@ -87,16 +88,42 @@ pub struct PostgresJobState<D = Client> {
 
 impl PostgresJobState<Client> {
     pub async fn connect(database_url: &str) -> Result<Self, PersistenceError> {
-        let (database, connection) = tokio_postgres::connect(database_url, NoTls)
-            .await
-            .map_err(map_error)?;
+        let local = env::var("WORKER_RUNTIME_MODE").as_deref() == Ok("local");
+        let ca = env::var("DATABASE_CA_CERT_PATH").ok();
+        Self::connect_with_tls(database_url, local, ca.as_deref()).await
+    }
+
+    pub async fn connect_with_tls(
+        database_url: &str,
+        local: bool,
+        ca: Option<&str>,
+    ) -> Result<Self, PersistenceError> {
+        let (config, url_ca) = crate::tls::configuration(database_url, local)?;
+        let ca = ca
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .or(url_ca.as_deref());
         let (stopped, connection_stopped) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::error!(%error, "postgres connection stopped");
-            }
-            let _ = stopped.send(true);
-        });
+        let database = if config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable {
+            let (database, connection) = config.connect(NoTls).await.map_err(map_error)?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::error!(%error, "postgres connection stopped");
+                }
+                let _ = stopped.send(true);
+            });
+            database
+        } else {
+            let tls = MakeTlsConnector::new(crate::tls::connector(ca)?);
+            let (database, connection) = config.connect(tls).await.map_err(map_error)?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::error!(%error, "postgres connection stopped");
+                }
+                let _ = stopped.send(true);
+            });
+            database
+        };
         Ok(Self {
             database,
             connection_stopped,

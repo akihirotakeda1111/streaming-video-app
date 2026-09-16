@@ -95,6 +95,11 @@ impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q> {
         })
     }
 
+    pub fn with_limits(mut self, limits: encoding::limits::Limits) -> Self {
+        self.processing = self.processing.with_limits(limits);
+        self
+    }
+
     // Only canonical IDs and fixed outcome labels enter this log. Never format
     // event bodies, receipt handles, or adapter error payloads here.
     fn log_record(

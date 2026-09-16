@@ -5,6 +5,21 @@
 pub struct ObjectError(pub String);
 
 pub trait Read {
+    fn read_bounded(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        maximum: u64,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, ObjectError>> + Send {
+        let read = self.read(bucket, key);
+        async move {
+            let bytes = read.await?;
+            if bytes.len() as u64 > maximum {
+                return Err(ObjectError("source size exceeds limit".into()));
+            }
+            Ok(bytes)
+        }
+    }
     fn read(
         &mut self,
         bucket: &str,

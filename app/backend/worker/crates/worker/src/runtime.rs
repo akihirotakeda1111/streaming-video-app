@@ -46,6 +46,7 @@ pub enum RunError<E> {
     Receive(QueueError),
     Process(E),
     Task(tokio::task::JoinError),
+    Protection(String),
 }
 
 impl<E: fmt::Display> fmt::Display for RunError<E> {
@@ -54,6 +55,7 @@ impl<E: fmt::Display> fmt::Display for RunError<E> {
             Self::Receive(error) => write!(formatter, "receive message: {}", error.0),
             Self::Process(error) => write!(formatter, "process message: {error}"),
             Self::Task(error) => write!(formatter, "message task: {error}"),
+            Self::Protection(error) => write!(formatter, "task protection: {error}"),
         }
     }
 }
@@ -65,29 +67,77 @@ impl<E: Error + 'static> Error for RunError<E> {}
 /// Receipt never implies deletion; only the downstream processor receives the
 /// message (including its receipt handle).
 pub async fn run<R, P>(
-    mut receiver: R,
+    receiver: R,
     processor: P,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     max_concurrency: usize,
 ) -> Result<(), RunError<P::Error>>
 where
     R: Receive + Send,
     P: MessageProcessor,
 {
+    run_protected(
+        receiver,
+        processor,
+        shutdown,
+        max_concurrency,
+        crate::protection::Local,
+    )
+    .await
+}
+
+pub async fn run_protected<R, P, T>(
+    mut receiver: R,
+    processor: P,
+    mut shutdown: watch::Receiver<bool>,
+    max_concurrency: usize,
+    mut protection: T,
+) -> Result<(), RunError<P::Error>>
+where
+    R: Receive + Send,
+    P: MessageProcessor,
+    T: crate::protection::Protection,
+{
     assert!(max_concurrency > 0, "worker concurrency must be nonzero");
     let mut tasks = JoinSet::new();
     let mut result = Ok(());
     let (stop_processing, processing_shutdown) = watch::channel(false);
+    let cloud = protection.enabled();
+    let mut protected = false;
+    let mut renew_at = tokio::time::Instant::now();
 
     'receiving: loop {
         if *shutdown.borrow() {
             break;
+        }
+        if cloud && (!protected || tokio::time::Instant::now() >= renew_at) {
+            let acquired = tokio::select! {
+                biased;
+                _ = cancellation_requested(&mut shutdown) => break 'receiving,
+                result = crate::protection::update(&mut protection, true) => result,
+            };
+            match acquired {
+                Ok(deadline) => {
+                    renew_at = deadline;
+                    protected = true;
+                }
+                Err(error) => {
+                    result = Err(RunError::Protection(error));
+                    break;
+                }
+            }
         }
 
         while tasks.len() >= max_concurrency {
             tokio::select! {
                 biased;
                 _ = shutdown.changed() => break 'receiving,
+                _ = tokio::time::sleep_until(renew_at), if cloud => {
+                    match crate::protection::update(&mut protection, true).await {
+                        Ok(deadline) => renew_at = deadline,
+                        Err(error) => { result = Err(RunError::Protection(error)); break 'receiving; }
+                    }
+                }
                 completed = tasks.join_next() => {
                     if let Some(completed) = completed {
                         record_completion(completed, &mut result);
@@ -108,6 +158,12 @@ where
             tokio::select! {
                 biased;
                 _ = shutdown.changed() => break 'receiving,
+                _ = tokio::time::sleep_until(renew_at), if cloud => {
+                    match crate::protection::update(&mut protection, true).await {
+                        Ok(deadline) => renew_at = deadline,
+                        Err(error) => { result = Err(RunError::Protection(error)); break 'receiving; }
+                    }
+                }
                 completed = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(completed) = completed {
                         record_completion(completed, &mut result);
@@ -131,7 +187,28 @@ where
                         .await
                 });
             }
-            Ok(None) => tokio::task::yield_now().await,
+            Ok(None) => {
+                // No receive is outstanding here. Reap finished work before testing idle.
+                while let Some(completed) = tasks.try_join_next() {
+                    record_completion(completed, &mut result);
+                }
+                if result.is_err() {
+                    break;
+                }
+                if cloud && tasks.is_empty() {
+                    if let Err(error) = crate::protection::update(&mut protection, false).await {
+                        result = Err(RunError::Protection(error));
+                        break;
+                    }
+                    protected = false;
+                    tokio::select! {
+                        _ = cancellation_requested(&mut shutdown) => break,
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    }
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
             Err(error) => {
                 result = Err(RunError::Receive(error));
                 break;
@@ -154,6 +231,13 @@ where
                 continue;
             }
             record_completion(completed, &mut result);
+        }
+    }
+    if protected {
+        if let Err(error) = crate::protection::update(&mut protection, false).await {
+            if result.is_ok() {
+                result = Err(RunError::Protection(error));
+            }
         }
     }
     result
@@ -519,6 +603,37 @@ mod tests {
         stop.send(true).unwrap();
         processor.gate.notify_waiters();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrency_accepts_one_and_the_configuration_maximum() {
+        for bound in [1, 32] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let receiver = ScriptedReceiver {
+                replies: (0..bound + 1)
+                    .map(|n| Ok(Some(message(&n.to_string()))))
+                    .collect(),
+                calls: calls.clone(),
+            };
+            let processor = GatedProcessor {
+                active: Arc::new(AtomicUsize::new(0)),
+                maximum: Arc::new(AtomicUsize::new(0)),
+                gate: Arc::new(Notify::new()),
+            };
+            let (stop, shutdown) = watch::channel(false);
+            let task = tokio::spawn(run(receiver, processor.clone(), shutdown, bound));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while processor.active.load(Ordering::SeqCst) < bound {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), bound);
+            assert_eq!(processor.maximum.load(Ordering::SeqCst), bound);
+            stop.send_replace(true);
+            task.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]

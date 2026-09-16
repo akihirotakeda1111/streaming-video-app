@@ -1,4 +1,4 @@
-use encoding::runtime::ProcessExecutor;
+use encoding::limits::BoundedExecutor;
 use persistence::postgres::PostgresJobState;
 use queue::sqs::SqsQueue;
 use storage::s3::S3Storage;
@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 use worker::{
     acquisition::WorkerIdentityProvider, completion::MessageCompletionProcessor,
-    heartbeat::HeartbeatSettings, runtime::PHASE1_MAX_CONCURRENCY,
+    heartbeat::HeartbeatSettings,
 };
 
 async fn shutdown_requested() -> std::io::Result<()> {
@@ -80,7 +80,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let jobs = match PostgresJobState::connect(&config.database_url).await {
+    let jobs = match PostgresJobState::connect_with_tls(
+        &config.database_url,
+        config.runtime_mode == "local",
+        std::env::var("DATABASE_CA_CERT_PATH").ok().as_deref(),
+    )
+    .await
+    {
         Ok(jobs) => jobs,
         Err(error) => {
             error!(%error, "database initialization failed");
@@ -115,7 +121,9 @@ async fn main() {
     let processor = match MessageCompletionProcessor::new(
         jobs,
         storage,
-        ProcessExecutor,
+        BoundedExecutor {
+            limits: config.limits.clone(),
+        },
         acknowledgements,
         WorkerIdentityProvider::new().identity(),
         config.input_bucket.clone(),
@@ -127,7 +135,7 @@ async fn main() {
         config.retry_delay_seconds,
         heartbeat,
     ) {
-        Ok(processor) => processor,
+        Ok(processor) => processor.with_limits(config.limits.clone()),
         Err(error) => {
             error!(%error, "worker processing configuration rejected");
             std::process::exit(1);
@@ -143,9 +151,25 @@ async fn main() {
         let _ = stop.send(true);
     });
 
-    info!(region = %config.aws_region, queue_url = %config.queue_url, max_concurrency = PHASE1_MAX_CONCURRENCY, "worker started");
+    info!(region = %config.aws_region, queue_url = %config.queue_url, max_concurrency = config.max_concurrency, "worker started");
     let result = supervise_database(
-        worker::runtime::run(queue, processor, shutdown, PHASE1_MAX_CONCURRENCY),
+        async {
+            if config.runtime_mode == "local" {
+                worker::runtime::run(queue, processor, shutdown, config.max_concurrency).await
+            } else {
+                let protection =
+                    worker::protection::Agent::new(config.ecs_agent_uri.as_deref().unwrap())
+                        .map_err(worker::runtime::RunError::Protection)?;
+                worker::runtime::run_protected(
+                    queue,
+                    processor,
+                    shutdown,
+                    config.max_concurrency,
+                    protection,
+                )
+                .await
+            }
+        },
         connection_stopped,
         database_stop,
     )
@@ -162,6 +186,119 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess helper for real SIGTERM acceptance"]
+    async fn signal_child() {
+        use encoding::{Command, Execute, runtime::ProcessExecutor};
+        use worker::runtime::MessageProcessor;
+        #[derive(Clone)]
+        struct Processor(String);
+        impl MessageProcessor for Processor {
+            type Error = std::convert::Infallible;
+            async fn process(&self, _: queue::Message) -> Result<(), Self::Error> {
+                ProcessExecutor
+                    .execute(Command::new(
+                        "/usr/bin/ffmpeg",
+                        vec![
+                            "-v".into(),
+                            "error".into(),
+                            "-re".into(),
+                            "-f".into(),
+                            "lavfi".into(),
+                            "-i".into(),
+                            "color=size=64x64:rate=10".into(),
+                            "-t".into(),
+                            "30".into(),
+                            "-f".into(),
+                            "null".into(),
+                            self.0.clone(),
+                        ],
+                    ))
+                    .await
+                    .unwrap();
+                panic!("unfinished encode must be cancelled");
+            }
+        }
+        struct Receiver;
+        impl queue::Receive for Receiver {
+            async fn receive(&mut self) -> Result<Option<queue::Message>, queue::QueueError> {
+                Ok(Some(queue::Message {
+                    message_id: None,
+                    delivery_id: String::new(),
+                    receipt_handle: "unacked".into(),
+                    body: String::new(),
+                    receive_count: 1,
+                    visibility_deadline: None,
+                }))
+            }
+        }
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            super::shutdown_requested().await.unwrap();
+            stop.send_replace(true);
+        });
+        worker::runtime::run(
+            Receiver,
+            Processor(std::env::var("TEST_SIGNAL_OUTPUT").unwrap()),
+            shutdown,
+            1,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires FFmpeg and /proc; run tests/run-local.sh"]
+    async fn sigterm_stops_receive_and_terminates_real_ffmpeg() {
+        use std::{path::Path, time::Duration};
+        let root = tempfile::tempdir().unwrap();
+        let output_path = root.path().join("signal-output");
+        let needle = output_path.to_string_lossy().into_owned();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "tests::signal_child"])
+            .env("TEST_SIGNAL_OUTPUT", &output_path)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                for entry in std::fs::read_dir("/proc").unwrap().filter_map(Result::ok) {
+                    if let Ok(cmd) = std::fs::read(entry.path().join("cmdline")) {
+                        let cmd = String::from_utf8_lossy(&cmd);
+                        if cmd.starts_with("/usr/bin/ffmpeg\0") && cmd.contains(&needle) {
+                            return entry.file_name().to_string_lossy().parse::<u32>().unwrap();
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-TERM", &child.id().unwrap().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(6), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("SIGTERM must terminate FFmpeg");
+    }
     #[tokio::test]
     async fn normal_shutdown_does_not_require_database_disconnect() {
         let (stop, _) = tokio::sync::watch::channel(false);
@@ -233,10 +370,10 @@ mod tests {
         assert!(production.contains("worker::Config::from_env"));
         assert!(production.contains("tracing_subscriber::fmt"));
         assert!(production.contains(".json()"));
-        assert!(production.contains("PHASE1_MAX_CONCURRENCY"));
+
         assert!(production.contains("MessageCompletionProcessor::new"));
-        assert!(production.contains("ProcessExecutor"));
-        assert!(production.contains("PostgresJobState::connect(&config.database_url).await"));
+        assert!(production.contains("BoundedExecutor"));
+        assert!(production.contains("PostgresJobState::connect_with_tls"));
         assert!(!production.contains("block_on"));
         assert!(!production.contains("password"));
     }

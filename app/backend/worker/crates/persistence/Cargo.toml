@@ -6,4 +6,10 @@ edition = "2024"
 [dependencies]
 tokio.workspace = true
 tokio-postgres.workspace = true
+postgres-native-tls = "0.5"
+native-tls = "0.2"
 tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
