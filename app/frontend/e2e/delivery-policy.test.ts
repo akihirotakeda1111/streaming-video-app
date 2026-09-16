@@ -24,12 +24,22 @@ describe('delivery bucket grant', () => {
       { ...grant(), Condition: {} }] }, 'output', arn)).toThrow()
   })
 })
-it('requires explicit zero error TTLs and rejects status rewriting', () => {
+it('accepts empty custom response fields returned by CloudFront', () => {
+  validateDeliveryErrorCaching({ Quantity: 2, Items: [403, 404].map(ErrorCode => ({
+    ErrorCode, ResponsePagePath: '', ResponseCode: '', ErrorCachingMinTTL: 0,
+  })) })
+})
+it('requires explicit zero error TTLs and rejects response rewriting or malformed fields', () => {
   const Items = [403, 404].map(ErrorCode => ({ ErrorCode, ErrorCachingMinTTL: 0 }))
   validateDeliveryErrorCaching({ Items })
   for (const value of [{}, { Items: Items.slice(1) }, { Items: [...Items, Items[0]] },
     { Items: Items.map(item => ({ ...item, ErrorCachingMinTTL: 60 })) },
-    { Items: Items.map(item => ({ ...item, ResponseCode: '200' })) }]) {
+    { Items: Items.map(item => ({ ...item, ErrorCachingMinTTL: undefined })) },
+    ...['ResponseCode', 'ResponsePagePath'].flatMap(field =>
+      ['200', '/error.html', ' ', null, false, 0].map(value => ({
+        Items: Items.map(item => ({ ...item, [field]: value })),
+      }))),
+  ]) {
     expect(() => validateDeliveryErrorCaching(value)).toThrow()
   }
 })

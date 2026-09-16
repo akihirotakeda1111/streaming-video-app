@@ -39,13 +39,18 @@ export function validateDeliveryBucketPolicy(value: unknown, bucket: string, dis
   if (!grants) throw new Error('Missing CloudFront HLS GetObject Allow grant')
 }
 
+// CloudFront may return empty strings for unset custom error response fields.
+function isUnsetErrorResponse(value: unknown): boolean {
+  return value === undefined || value === ''
+}
+
 export function validateDeliveryErrorCaching(value: unknown): void {
   const errors = record(value)
   const items = Array.isArray(errors.Items) ? errors.Items.map(record) : []
   for (const code of [403, 404]) {
     const matches = items.filter(item => item.ErrorCode === code)
     if (matches.length !== 1 || matches[0]!.ErrorCachingMinTTL !== 0
-      || matches[0]!.ResponseCode !== undefined || matches[0]!.ResponsePagePath !== undefined) {
+      || !isUnsetErrorResponse(matches[0]!.ResponseCode) || !isUnsetErrorResponse(matches[0]!.ResponsePagePath)) {
       throw new Error('403/404 require zero error TTL without status or page rewriting')
     }
   }
