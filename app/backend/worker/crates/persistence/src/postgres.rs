@@ -1,8 +1,7 @@
 //! PostgreSQL implementation of the job-state port.
 
-use std::{env, future::Future, fs, time::SystemTime};
+use std::{env, future::Future, time::SystemTime};
 
-use native_tls::{Certificate, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::{Client, NoTls, types::ToSql};
 
@@ -89,15 +88,24 @@ pub struct PostgresJobState<D = Client> {
 
 impl PostgresJobState<Client> {
     pub async fn connect(database_url: &str) -> Result<Self, PersistenceError> {
+        let local = env::var("WORKER_RUNTIME_MODE").as_deref() == Ok("local");
+        let ca = env::var("DATABASE_CA_CERT_PATH").ok();
+        Self::connect_with_tls(database_url, local, ca.as_deref()).await
+    }
+
+    pub async fn connect_with_tls(
+        database_url: &str,
+        local: bool,
+        ca: Option<&str>,
+    ) -> Result<Self, PersistenceError> {
+        let (config, url_ca) = crate::tls::configuration(database_url, local)?;
+        let ca = ca
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .or(url_ca.as_deref());
         let (stopped, connection_stopped) = tokio::sync::watch::channel(false);
-        let database = if database_url
-            .split_once('?')
-            .map(|(_, query)| query.split('&').any(|part| part == "sslmode=disable"))
-            .unwrap_or(false)
-        {
-            let (database, connection) = tokio_postgres::connect(database_url, NoTls)
-                .await
-                .map_err(map_error)?;
+        let database = if config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable {
+            let (database, connection) = config.connect(NoTls).await.map_err(map_error)?;
             tokio::spawn(async move {
                 if let Err(error) = connection.await {
                     tracing::error!(%error, "postgres connection stopped");
@@ -106,21 +114,8 @@ impl PostgresJobState<Client> {
             });
             database
         } else {
-            let mut builder = TlsConnector::builder();
-            if let Ok(path) = env::var("DATABASE_CA_CERT_PATH") {
-                let pem = fs::read(path).map_err(|error| PersistenceError(error.to_string()))?;
-                let certificate = Certificate::from_pem(&pem)
-                    .map_err(|error| PersistenceError(error.to_string()))?;
-                builder.add_root_certificate(certificate);
-            }
-            let tls = MakeTlsConnector::new(
-                builder
-                    .build()
-                    .map_err(|error| PersistenceError(error.to_string()))?,
-            );
-            let (database, connection) = tokio_postgres::connect(database_url, tls)
-                .await
-                .map_err(map_error)?;
+            let tls = MakeTlsConnector::new(crate::tls::connector(ca)?);
+            let (database, connection) = config.connect(tls).await.map_err(map_error)?;
             tokio::spawn(async move {
                 if let Err(error) = connection.await {
                     tracing::error!(%error, "postgres connection stopped");

@@ -100,6 +100,8 @@ pub struct OwnedAttemptProcessor<J, S, E> {
     temporary_directory: PathBuf,
     settings: RetrySettings,
     activity: Option<Arc<AtomicBool>>,
+    limits: encoding::limits::Limits,
+    disk_budget: encoding::limits::DiskBudget,
 }
 
 impl<J, S, E> Clone for OwnedAttemptProcessor<J, S, E> {
@@ -113,6 +115,8 @@ impl<J, S, E> Clone for OwnedAttemptProcessor<J, S, E> {
             temporary_directory: self.temporary_directory.clone(),
             settings: self.settings,
             activity: self.activity.clone(),
+            limits: self.limits.clone(),
+            disk_budget: self.disk_budget.clone(),
         }
     }
 }
@@ -137,6 +141,8 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
             temporary_directory: temporary_directory.into(),
             settings,
             activity: None,
+            limits: encoding::limits::Limits::default(),
+            disk_budget: encoding::limits::DiskBudget::default(),
         }
     }
 
@@ -158,7 +164,14 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
             temporary_directory: temporary_directory.into(),
             settings,
             activity: None,
+            limits: encoding::limits::Limits::default(),
+            disk_budget: encoding::limits::DiskBudget::default(),
         }
+    }
+
+    pub fn with_limits(mut self, limits: encoding::limits::Limits) -> Self {
+        self.limits = limits;
+        self
     }
 
     fn owned(cancelled: &watch::Receiver<bool>) -> bool {
@@ -228,7 +241,21 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
                     .await;
             }
         };
-        let result = self.run_pipeline(acquired, cancelled, &directory).await;
+        let reservation = self.disk_budget.reserve(directory.path(), &self.limits);
+        let result = match &reservation {
+            Err(error) => Err(error.clone()),
+            Ok(_reservation) => {
+                match tokio::time::timeout(
+                    Duration::from_secs(self.limits.wall_seconds),
+                    self.run_pipeline(acquired, cancelled, &directory),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("job wall time exceeded".into()),
+                }
+            }
+        };
         if let Err(error) = cleanup(directory) {
             // Cleanup must not suppress the durable outcome of published work.
             tracing::warn!(job_id = %acquired.item.job_id, error_kind = ?error.kind(), "remove work directory failed");
@@ -281,10 +308,18 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         }
         tracing::info!(operation = "download", outcome = "start", "media operation");
         let source = storage
-            .read(&acquired.item.bucket, &acquired.item.key)
+            .read_bounded(
+                &acquired.item.bucket,
+                &acquired.item.key,
+                self.limits.source_bytes,
+            )
             .await
             .map_err(|e: ObjectError| format!("download source: {}", e.0))?;
-        tracing::info!(operation = "download", outcome = "success", "media operation");
+        tracing::info!(
+            operation = "download",
+            outcome = "success",
+            "media operation"
+        );
         drop(storage);
         if !Self::owned(cancelled) {
             return Err("ownership lost".into());
@@ -546,6 +581,30 @@ mod tests {
             }
         } else {
             ProcessingOutcome::FinalFailed
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_rejection_never_encodes_or_completes() {
+        for disk in [false, true] {
+            for attempt in [1, 5] {
+                let mut f = Fixture::new();
+                if disk {
+                    f.processor.limits.disk_reserve_bytes = u64::MAX;
+                } else {
+                    f.processor.limits.source_bytes = 1;
+                }
+                assert_eq!(f.run(attempt).await, retry_outcome(attempt));
+                assert!(!f.log.calls().iter().any(|call| matches!(
+                    call,
+                    crate::fakes::Call::Execute(_) | crate::fakes::Call::Write { .. }
+                )));
+                assert_eq!(
+                    f.processor.jobs.lock().await.calls,
+                    [if attempt == 5 { "fail" } else { "release" }]
+                );
+                assert!(std::fs::read_dir(f.root.path()).unwrap().next().is_none());
+            }
         }
     }
 

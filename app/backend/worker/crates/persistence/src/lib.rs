@@ -128,3 +128,4 @@ pub trait JobState: Send {
 }
 
 pub mod postgres;
+pub mod tls;

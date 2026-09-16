@@ -5,6 +5,9 @@ pub mod completion;
 pub mod event;
 pub mod fakes;
 pub mod heartbeat;
+pub mod protection;
+#[cfg(test)]
+mod protection_tests;
 pub mod publish;
 pub mod retry;
 pub mod runtime;
@@ -45,6 +48,9 @@ pub struct Config {
     pub retry_delay_seconds: u64,
     pub maximum_attempts: u32,
     pub max_concurrency: usize,
+    pub runtime_mode: String,
+    pub ecs_agent_uri: Option<String>,
+    pub limits: encoding::limits::Limits,
 }
 
 impl Config {
@@ -75,6 +81,37 @@ impl Config {
             DEFAULT_MAX_CONCURRENCY,
             MAX_ALLOWED_CONCURRENCY,
         )?;
+        let runtime_mode = lookup("WORKER_RUNTIME_MODE").unwrap_or_else(|| "ecs".into());
+        if !matches!(runtime_mode.as_str(), "local" | "ecs") {
+            return Err(ConfigError::invalid(
+                "WORKER_RUNTIME_MODE",
+                "must be local or ecs",
+            ));
+        }
+        let ecs_agent_uri = lookup("ECS_AGENT_URI");
+        if runtime_mode == "ecs" {
+            crate::protection::Agent::new(ecs_agent_uri.as_deref().unwrap_or("")).map_err(
+                |_| {
+                    ConfigError::invalid(
+                        "ECS_AGENT_URI",
+                        "is required and must identify the ECS agent",
+                    )
+                },
+            )?;
+        }
+        validate_postgres_url(&database_url)?;
+        persistence::tls::configuration(&database_url, runtime_mode == "local").map_err(|_| {
+            ConfigError::invalid(
+                DATABASE_URL,
+                "requires explicit TLS policy; disable is local only",
+            )
+        })?;
+        let limits = encoding::limits::Limits::from_lookup(&lookup).map_err(|_| {
+            ConfigError::invalid(
+                "WORKER resource limits",
+                "must be positive and within documented bounds",
+            )
+        })?;
         if maximum_attempts > 10 {
             return Err(ConfigError::invalid(MAXIMUM_ATTEMPTS, "must not exceed 10"));
         }
@@ -132,6 +169,9 @@ impl Config {
             retry_delay_seconds,
             maximum_attempts,
             max_concurrency,
+            runtime_mode,
+            ecs_agent_uri,
+            limits,
         })
     }
 }
@@ -243,10 +283,7 @@ where
         .parse::<usize>()
         .map_err(|_| ConfigError::invalid(variable, "must be a positive integer"))?;
     if value == 0 || value > maximum {
-        return Err(ConfigError::invalid(
-            variable,
-            "must be between 1 and 32",
-        ));
+        return Err(ConfigError::invalid(variable, "must be between 1 and 32"));
     }
     Ok(value)
 }
@@ -350,9 +387,10 @@ mod tests {
 
     fn valid() -> HashMap<&'static str, String> {
         HashMap::from([
+            ("WORKER_RUNTIME_MODE", "local".into()),
             (
                 DATABASE_URL,
-                "postgres://user:password@localhost/video".into(),
+                "postgres://user:password@localhost/video?sslmode=disable".into(),
             ),
             (AWS_REGION, "ap-northeast-1".into()),
             (QUEUE_URL, "https://sqs.example.test/queue".into()),
@@ -374,6 +412,33 @@ mod tests {
         let config = Config::from_lookup(|name| values.get(name).cloned()).unwrap();
         assert_eq!(config.input_bucket, "video-input");
         assert!(!format!("{config:?}").contains("password"));
+    }
+
+    #[test]
+    fn concurrency_and_cloud_mode_are_validated() {
+        let mut values = valid();
+        assert_eq!(load(&values).unwrap().max_concurrency, 2);
+        for value in ["1", "2", "32"] {
+            values.insert(MAX_CONCURRENCY, value.into());
+            assert_eq!(
+                load(&values).unwrap().max_concurrency,
+                value.parse::<usize>().unwrap()
+            );
+        }
+        for value in ["0", "33", "-1", "1.5", "18446744073709551616"] {
+            values.insert(MAX_CONCURRENCY, value.into());
+            assert!(load(&values).is_err());
+        }
+        values.remove(MAX_CONCURRENCY);
+        values.remove("WORKER_RUNTIME_MODE");
+        assert!(load(&values).is_err());
+        values.insert("ECS_AGENT_URI", "http://127.0.0.1:1234".into());
+        assert!(load(&values).is_err(), "cloud must reject disable");
+        values.insert(
+            DATABASE_URL,
+            "postgres://localhost/video?sslmode=verify-full".into(),
+        );
+        assert_eq!(load(&values).unwrap().runtime_mode, "ecs");
     }
 
     #[test]
@@ -512,13 +577,13 @@ mod tests {
         let mut values = valid();
         values.insert(
             DATABASE_URL,
-            "  postgres://user:password@localhost/video  ".into(),
+            "  postgres://user:password@localhost/video?sslmode=disable  ".into(),
         );
         values.insert(QUEUE_URL, "\thttps://sqs.example.test/queue\n".into());
         let config = load(&values).unwrap();
         assert_eq!(
             config.database_url,
-            "postgres://user:password@localhost/video"
+            "postgres://user:password@localhost/video?sslmode=disable"
         );
         assert_eq!(config.queue_url, "https://sqs.example.test/queue");
 
@@ -566,7 +631,10 @@ mod tests {
         }
 
         let mut values = valid();
-        values.insert(DATABASE_URL, "postgresql://localhost/video".into());
+        values.insert(
+            DATABASE_URL,
+            "postgresql://localhost/video?sslmode=disable".into(),
+        );
         load(&values).unwrap();
         values.insert(QUEUE_URL, "http://sqs.example.test/queue".into());
         load(&values).unwrap();

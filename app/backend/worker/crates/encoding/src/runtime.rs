@@ -12,18 +12,57 @@ pub struct ProcessExecutor;
 
 impl Execute for ProcessExecutor {
     async fn execute(&mut self, command: Command) -> Result<Output, ProcessError> {
-        let output = tokio::process::Command::new(&command.executable)
+        use tokio::io::AsyncReadExt;
+        let mut process = tokio::process::Command::new(&command.executable);
+        process
             .args(&command.argv)
             // Dropping the execution future on shutdown or lease loss must
             // also terminate FFmpeg instead of leaving it running in the background.
             .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|error| ProcessError(format!("execute {:?}: {error}", command.executable)))?;
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        if let Some(maximum) = command.maximum_file_bytes {
+            // Only an async-signal-safe syscall runs between fork and exec.
+            unsafe {
+                process.pre_exec(move || {
+                    let limit = libc::rlimit {
+                        rlim_cur: maximum as libc::rlim_t,
+                        rlim_max: maximum as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::last_os_error())
+                    }
+                });
+            }
+        }
+        let mut child = process
+            .spawn()
+            .map_err(|_| ProcessError("cannot start media process".into()))?;
+        async fn capture(mut pipe: impl tokio::io::AsyncRead + Unpin) -> io::Result<Vec<u8>> {
+            let mut result = Vec::new();
+            let mut buffer = [0u8; 8192];
+            loop {
+                let count = pipe.read(&mut buffer).await?;
+                if count == 0 {
+                    return Ok(result);
+                }
+                let keep = count.min(65536usize.saturating_sub(result.len()));
+                result.extend_from_slice(&buffer[..keep]);
+            }
+        }
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (status, stdout, stderr) =
+            tokio::try_join!(child.wait(), capture(stdout), capture(stderr))
+                .map_err(|_| ProcessError("media process failed".into()))?;
         Ok(Output {
-            status: output.status.code().unwrap_or(-1),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            status: status.code().unwrap_or(-1),
+            stdout,
+            stderr,
         })
     }
 }

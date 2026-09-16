@@ -1,37 +1,120 @@
 # Worker runtime handoff
 
-The worker reads `WORKER_MAX_CONCURRENCY` as a positive integer from 1 through
-32. It defaults to `2` for local Compose. The later ECS service deployment may
-set it to `1`; CPU, memory, ephemeral storage, desired count, and scaling
-policies are owned by the infrastructure tasks.
+Task 10 implements the application runtime. Tasks 11–13 own infrastructure,
+IAM, deployment resource allocation, and scaling policies.
 
-## Database TLS
+## Runtime configuration
 
-`DATABASE_URL` is passed unchanged to both the Rust worker and the Go API
-driver. Local Compose explicitly uses `sslmode=disable`, which is the only
-configuration in which the Rust adapter uses `NoTls`. Every other mode uses
-hostname-verified TLS. Set `DATABASE_CA_CERT_PATH` to a PEM CA bundle for a
-private cloud CA; an unreadable, malformed, expired, or mismatched certificate
-fails startup and is never downgraded to plaintext. The Go `pgx` driver uses
-the URL's standard `sslmode` and `sslrootcert` parameters, so the API and
-worker must receive the same database TLS configuration.
+All numeric settings are decimal positive integers; invalid values fail startup.
 
-Cloud deployments must use `sslmode=verify-full` and provide the CA through
-the task's credential/configuration boundary. Do not put database passwords,
-CA material, or static AWS keys in this file.
+| Variable | Default | Range / meaning |
+| --- | --- | --- |
+| `WORKER_RUNTIME_MODE` | `ecs` | `local` or `ecs`; Compose explicitly sets `local` |
+| `WORKER_MAX_CONCURRENCY` | `2` | 1–32 messages; empty uses default; Task 12 should initially set 1 |
+| `ECS_AGENT_URI` | none | Required in ECS mode; ECS-injected HTTP agent URI; loopback supported for tests |
+| `WORKER_MAX_SOURCE_BYTES` | 67108864 | 1–1073741824 bytes |
+| `WORKER_MAX_TEMP_BYTES` | 536870912 | 1–17179869184 bytes per job, greater than source limit |
+| `WORKER_DISK_RESERVE_BYTES` | 268435456 | 1–17179869184 bytes of disk headroom |
+| `WORKER_FFMPEG_THREADS` | 1 | 1–16 decoder, encoder, and filter threads |
+| `WORKER_MAX_DURATION_SECONDS` | 3600 | 1–14400 seconds of source media |
+| `WORKER_MAX_WALL_SECONDS` | 7200 | 1–43200 seconds per pipeline, including waits and publication |
+| `DATABASE_CA_CERT_PATH` | unset | Optional PEM CA bundle; empty/whitespace means unset |
 
-## Runtime bounds and shutdown
+Existing heartbeat, visibility, lease, retry, and maximum-attempt settings are
+preserved. Database connections remain bounded at one per worker process,
+shared by acquisition, heartbeat, and completion. Initial connection timeout
+is ten seconds. Concurrency does not create additional database connections.
 
-Concurrency is bounded by `WORKER_MAX_CONCURRENCY`. Lease and SQS heartbeat
-settings remain bounded by their existing validation. Temporary files are
-created below `TMPDIR`, one isolated directory per job, and are removed on
-completion or cancellation; FFmpeg is terminated when its owning task is
-cancelled. SIGTERM stops receives, cancels active work, and joins for the
-worker shutdown grace period (5 seconds); incomplete messages are not
-acknowledged and are recovered by lease expiry/redelivery.
+## Database TLS and credentials
 
-The application layer does not create IAM policies or ECS resources. An ECS
-service-mode protection adapter, when supplied by the deployment integration,
-must acquire protection before receives, renew it while work is active, and
-release it only while idle. Local mode must not call an ECS endpoint; cloud
-mode must fail closed when that integration is unavailable.
+Supply a shared `DATABASE_URL` with `sslmode=verify-full`. Go passes the URL to
+pgx unchanged. Rust parses it and maps `verify-full` to the driver's `require`
+mode with CA and hostname verification enabled. Rust also accepts `require`
+with the same verification, but do not downgrade a shared Go URL to `require`.
+
+Use `sslrootcert=/path/to/ca.pem` in the URL for a private CA in both drivers.
+URL-encode paths as needed. The Worker optionally accepts
+`DATABASE_CA_CERT_PATH`; a nonempty value overrides `sslrootcert`. The API does
+not read that environment variable. With no custom path, Worker uses system
+roots. PEM bundles can contain multiple certificates. Paths must exist inside
+each container; an environment variable does not mount a certificate file.
+Unreadable/malformed CAs, untrusted servers, hostname mismatches, and expired
+server certificates fail without plaintext fallback.
+
+Only explicit `WORKER_RUNTIME_MODE=local` plus `sslmode=disable` permits
+plaintext. `prefer`, omitted mode, duplicate mode/CA parameters, and unsupported
+modes are rejected. Compose retains its explicit local disable configuration.
+
+S3/SQS use the SDK default credential chain, including task-role credentials.
+Task protection uses the ECS agent, which uses the task role on behalf of the
+worker. Task 12 supplies the role and appropriate `ecs:UpdateTaskProtection`
+and `ecs:GetTaskProtection` permissions plus existing scoped S3/SQS access.
+This task creates no IAM resources. Do not inject static cloud keys or log
+credentials, database URLs, or tokens.
+
+## Task protection and shutdown
+
+ECS mode confirms protection before receiving, through PUT
+`/task-protection/v1/state` with two-minute expiry. HTTP success is insufficient:
+the response must confirm the state and a future expiration. Each update has a
+four-second overall bound. Renewal occurs at half the remaining lifetime while
+receiving or processing, including when concurrency is full. Failure stops
+new receives and cancels work. Local mode makes no agent calls.
+
+After an empty receive with zero active tasks and no pending receive, protection
+is released for ten seconds, then reacquired before polling. Completion during
+an outstanding receive never releases protection or cancels that receive.
+
+SIGTERM stops receives, cancels processing/heartbeats/FFmpeg, and allows five
+seconds to join before aborting remaining processors. An in-progress protection
+request and final release may each add four seconds: Task 12 should allow at
+least 13 seconds plus margin in `stopTimeout` (30 seconds recommended). Release
+occurs only after processors finish; failed release leaves protection to expire.
+Incomplete messages remain unacknowledged and recover through lease expiry and
+redelivery. Protection cannot prevent crashes or forced stops.
+
+## Resource enforcement
+
+S3 checks both declared length and actual streamed bytes before growing the
+input buffer beyond the source limit. The API retains a bounded in-memory
+buffer; allow memory for its limit and allocator overhead. The storage and
+encoder are shared/serialized, so message concurrency overlaps pipeline stages
+and can retain multiple temporary directories without launching that many
+simultaneous FFmpeg processes.
+
+Each job reserves its maximum temporary budget against free space and other
+reservations before downloading. Admission is conservative and may count
+already-written bytes twice. FFprobe rejects invalid/unknown/excessive duration
+within ten seconds. FFmpeg has explicit thread/duration limits, a wall-time
+bound, and bounded captured output (64 KiB per stream). Linux also applies a
+per-file size limit before exec. Total temporary usage and free space are
+checked every 100 ms during encoding and again before publication.
+
+The sampled total-size check is not a filesystem quota: writes can cross the
+threshold between checks. Preserve disk headroom for that interval and other
+processes. Task 12 must size resources for the selected limits. Limit failures
+use the existing retry/terminal-failure policy and never mark an incomplete job
+completed. Temporary directories are removed on completion/cancellation;
+cleanup errors are logged without overwriting a durable completed outcome.
+
+## Local acceptance
+
+From the repository root:
+
+```sh
+docker build -t worker-runtime-tests -f app/backend/worker/tests/Dockerfile app/backend/worker/tests
+docker run --rm -v "$PWD:/source" -v worker-runtime-cargo:/usr/local/cargo/registry -v worker-runtime-target:/source/app/backend/worker/target worker-runtime-tests bash app/backend/worker/tests/run-local.sh
+```
+
+The script creates disposable PostgreSQL instances and valid/expired server
+certificates with an explicit `TEST_DATABASE_URL`. It runs the Rust suite,
+real TLS, FFmpeg limits/cancellation, SIGTERM tests, and the contract validator,
+then stops its databases and removes temporary fixtures. The ordinary suite
+also tests a fake ECS agent and SDK task-role credentials through an isolated
+subprocess and local HTTP endpoint. No AWS resources are required.
+
+Separately run `go test -C app/backend/api ./...`. Plain test runs without an
+explicit database do not count as live database evidence. TLS/media acceptance
+tests are ignored in ordinary runs and explicitly executed by the script;
+subprocess helper tests are invoked by their parent tests. Actual Fargate role,
+protection, and scaling acceptance remains with Tasks 12 and 13.

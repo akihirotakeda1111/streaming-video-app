@@ -15,7 +15,7 @@ ENV FFMPEG_PATH=/usr/local/bin/ffmpeg \
     TMPDIR=/tmp/video-worker
 RUN mkdir -p "$TMPDIR" \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && /usr/local/bin/ffmpeg -version \
     && /usr/local/bin/ffprobe -version \
