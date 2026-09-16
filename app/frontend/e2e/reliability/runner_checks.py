@@ -21,6 +21,66 @@ RUN = subprocess.run
 
 
 class RunnerChecks(unittest.TestCase):
+    def test_historical_acceptance_validates_target_scope_and_both_phases(self):
+        run_id = "e2e-11111111-1111-4111-8111-111111111111"
+        target = {"outputBucket": "output", "account": "123456789012", "region": "us-east-1",
+                  "playbackOrigin": "https://example.cloudfront.net"}
+        jobs = []
+        for phase, digit in (("phase1", "1"), ("phase2", "2")):
+            video = digit * 8 + "-1111-4111-8111-111111111111"
+            job_id = "33333333-3333-4333-8333-333333333333"
+            jobs.append({"videoId": video, "jobId": job_id, "phase": phase,
+                         "path": f"/videos/{video}/jobs/{job_id}/hls/index.m3u8",
+                         "manifestETag": '"abcd"', "advancement": 0.2})
+        replay = {**target, "evidenceVersion": 1, "verificationScope": "pre-cutover-compatibility",
+                  "capturedAt": "2025-01-01T00:00:00Z", "cutoverAt": "2025-02-01T00:00:00Z", "checked": jobs}
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "E2E_OUTPUT_BUCKET": "output", "E2E_AWS_ACCOUNT_ID": "123456789012",
+            "AWS_REGION": "us-east-1", "PLAYBACK_BASE_URL": target["playbackOrigin"]
+        }):
+            parent = Path(root).resolve()
+            folder = parent / run_id
+            folder.mkdir()
+            file = folder / "delivery-regression-evidence.json"
+            evidence = {"runId": run_id, "scenario": "delivery-regression", "status": "passed",
+                        "observedAt": "2025-03-01T00:00:00Z", "diagnostics": {"cloudfront-completed-replay": replay}}
+            file.write_text(json.dumps(evidence))
+            self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "passed")
+            for changes in ({"checked": jobs[:1]}, {"verificationScope": "completed-job-replay"},
+                            {"outputBucket": "other"}, {"playbackOrigin": "https://other.cloudfront.net"},
+                            {"cutoverAt": "2025-04-01T00:00:00Z"}, {"evidenceVersion": 0},
+                            {"checked": [{**job, "advancement": 0} for job in jobs]}):
+                bad = {**evidence, "diagnostics": {"cloudfront-completed-replay": {**replay, **changes}}}
+                file.write_text(json.dumps(bad))
+                self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "blocked")
+            for changes in ({"status": "failed"}, {"runId": "another-run"}, {"diagnostics": None}):
+                file.write_text(json.dumps({**evidence, **changes}))
+                self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "blocked")
+            file.unlink()
+            self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "blocked")
+            self.assertEqual(MODULE["_historical_acceptance"](parent, None)["status"], "unexecuted")
+
+    def test_historical_option_requires_full_suite(self):
+        output = io.StringIO()
+        run_id = "e2e-11111111-1111-4111-8111-111111111111"
+        with patch.dict(GLOBALS, {"_full": lambda selected: 0 if selected == run_id else 1}), \
+                contextlib.redirect_stderr(output):
+            self.assertEqual(MODULE["main"](["--full-suite", "--historical-evidence-run", run_id]), 0)
+            with self.assertRaises(SystemExit):
+                MODULE["main"](["--historical-evidence-run", run_id])
+
+    def test_full_suite_acceptance_is_separate_from_execution(self):
+        for state, expected_code in (("passed", 0), ("blocked", 2)):
+            with patch.dict(GLOBALS, {"_historical_acceptance": lambda parent, run, state=state:
+                                     {"name": "historical-compatibility", "status": state}}):
+                code, report, calls = self.full_suite()
+            self.assertEqual(code, expected_code)
+            self.assertEqual(report["executionStatus"], "passed")
+            self.assertEqual(report["acceptanceStatus"], state)
+            self.assertEqual(report["acceptanceChecks"][0]["status"], state)
+            self.assertEqual(report["unexecutedLiveChecks"], [])
+            self.assertEqual(len(calls), 9)
+
     def full_suite(self, fault=None):
         """Exercise real dispatch and reporting with only external operations replaced."""
         with tempfile.TemporaryDirectory() as root:
@@ -99,7 +159,10 @@ class RunnerChecks(unittest.TestCase):
         monitoring = calls[6][1]
         self.assertEqual(monitoring["E2E_FFMPEG_EVIDENCE_RUN"], calls[4][1]["E2E_RUN_ID"])
         self.assertEqual(monitoring["E2E_POISON_EVIDENCE_RUN"], calls[5][1]["E2E_RUN_ID"])
-        self.assertEqual(report["unexecutedLiveChecks"], [])
+        self.assertEqual(report["unexecutedLiveChecks"], ["historical-compatibility"])
+        self.assertEqual(report["executionStatus"], "passed")
+        self.assertEqual(report["acceptanceStatus"], "incomplete")
+        self.assertEqual(report["statusScope"], "current-regression")
         self.assertEqual(report["liveEvidence"][-1]["playbackEvidenceRun"], calls[-2][1]["E2E_RUN_ID"])
         self.assertEqual(report["liveEvidence"][-1]["verificationScope"], "completed-job-replay")
 
@@ -142,7 +205,7 @@ class RunnerChecks(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(report["status"], "failed")
                 self.assertEqual(report["liveEvidence"][6]["status"], "failed")
-                self.assertEqual(report["unexecutedLiveChecks"], ["phase1-pipeline", "delivery-regression"])
+                self.assertEqual(report["unexecutedLiveChecks"], ["phase1-pipeline", "delivery-regression", "historical-compatibility"])
                 self.assertEqual(len(calls), 7)
 
     def test_full_suite_requires_playback_artifact(self):
@@ -163,7 +226,7 @@ class RunnerChecks(unittest.TestCase):
                 self.assertEqual(report["liveEvidence"][0]["status"], "passed")
                 self.assertEqual(report["liveEvidence"][1]["status"], "blocked" if blocked else "failed")
                 self.assertEqual(report["unexecutedLiveChecks"],
-                                 [*MODULE["FULL_LIVE_SCENARIOS"][1:], "phase1-pipeline", "delivery-regression"])
+                                 [*MODULE["FULL_LIVE_SCENARIOS"][1:], "phase1-pipeline", "delivery-regression", "historical-compatibility"])
 
     def test_preflight_selects_browser_project(self):
         for project in ("", "firefox"):
@@ -303,7 +366,7 @@ class RunnerChecks(unittest.TestCase):
             self.assertEqual([name for name, _ in calls], ["delivery-preflight"])
             self.assertEqual(report["suite"], MODULE["SUITE_ID"])
             self.assertEqual(report["unexecutedLiveChecks"],
-                             [*MODULE["FULL_LIVE_SCENARIOS"], "phase1-pipeline", "delivery-regression"])
+                             [*MODULE["FULL_LIVE_SCENARIOS"], "phase1-pipeline", "delivery-regression", "historical-compatibility"])
 
     def test_delivery_single_scenarios_select_chromium(self):
         for scenario in ("delivery-regression", "delivery-preflight"):

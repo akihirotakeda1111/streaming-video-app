@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from dataclasses import dataclass
 from uuid import uuid4
+from datetime import datetime
+import math
 
 SUITE_ID = "phase3-cloudfront-delivery-e2e-regression"
 SCENARIOS = {
@@ -192,7 +194,56 @@ def _validate_evidence(config: LiveConfig, evidence_file: Path) -> None:
         raise ValueError("queue monitoring evidence remains outstanding")
 
 
-def _full() -> int:
+def _historical_acceptance(parent: Path, run_id: str | None) -> dict:
+    row = {"name": "historical-compatibility", "status": "unexecuted",
+           "reason": "separate pre-cutover Phase 1/2 replay evidence is required"}
+    if run_id is None:
+        return row
+    row.update(runId=run_id)
+    try:
+        _evidence_run(run_id)
+        file = parent / run_id / "delivery-regression-evidence.json"
+        if file.resolve() != file:
+            raise ValueError("redirected evidence")
+        _validate_evidence(LiveConfig(parent / run_id, "delivery-regression"), file)
+        evidence = json.loads(file.read_text(encoding="utf-8"))
+        replay = evidence["diagnostics"]["cloudfront-completed-replay"]
+        expected = {"outputBucket": os.environ.get("E2E_OUTPUT_BUCKET"),
+                    "account": os.environ.get("E2E_AWS_ACCOUNT_ID"),
+                    "region": os.environ.get("AWS_REGION"),
+                    "playbackOrigin": os.environ.get("PLAYBACK_BASE_URL", "").rstrip("/")}
+        if (replay["evidenceVersion"] != 1 or replay["verificationScope"] != "pre-cutover-compatibility"
+                or any(not value or replay.get(key) != value for key, value in expected.items())):
+            raise ValueError("historical scope or target mismatch")
+        captured, cutover, observed = (datetime.fromisoformat(value.replace("Z", "+00:00"))
+                                       for value in (replay["capturedAt"], replay["cutoverAt"], evidence["observedAt"]))
+        if any(value.tzinfo is None for value in (captured, cutover, observed)) or not (captured < cutover <= observed <= datetime.now(observed.tzinfo)):
+            raise ValueError("invalid historical chronology")
+        jobs = replay["checked"]
+        if not isinstance(jobs, list) or not 2 <= len(jobs) <= 10:
+            raise ValueError("missing historical jobs")
+        phases, videos = set(), set()
+        uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+        for job in jobs:
+            video, job_id = job["videoId"], job["jobId"]
+            advancement = job["advancement"]
+            if (not re.fullmatch(uuid, video, re.I) or not re.fullmatch(uuid, job_id, re.I)
+                    or video in videos or job["phase"] not in ("phase1", "phase2")
+                    or job["path"] != f"/videos/{video}/jobs/{job_id}/hls/index.m3u8"
+                    or not re.fullmatch(r'"[a-fA-F0-9]+(?:-\d+)?"', job["manifestETag"])
+                    or type(advancement) not in (int, float) or not math.isfinite(advancement) or advancement <= 0.05):
+                raise ValueError("invalid historical playback proof")
+            phases.add(job["phase"])
+            videos.add(video)
+        if phases != {"phase1", "phase2"}:
+            raise ValueError("both phases required")
+        return {"name": "historical-compatibility", "status": "passed", "runId": run_id,
+                "evidenceFile": str(file), "observedAt": evidence["observedAt"]}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, argparse.ArgumentTypeError):
+        return {**row, "status": "blocked", "reason": "historical evidence is invalid, incomplete, or targets another deployment"}
+
+
+def _full(historical_evidence_run: str | None = None) -> int:
     """Gate delivery resources, run all reliability scenarios, then verify playback."""
     _settings("validate")
     parent = Path(os.environ["E2E_EVIDENCE_DIR"].strip()).resolve()
@@ -267,17 +318,27 @@ def _full() -> int:
         rows.append({"name": "delivery-regression", "selector": "@delivery-regression", "project": "chromium",
                      "status": "unexecuted", "reason": "failure prevented completed-output replay"})
 
+    historical = _historical_acceptance(parent, historical_evidence_run)
+    execution_status = "blocked" if any(row["status"] == "blocked" for row in rows) else "failed" if failed else "passed"
+    acceptance_status = ("blocked" if historical["status"] == "blocked" else
+                         execution_status if execution_status != "passed" else
+                         "passed" if historical["status"] == "passed" else "incomplete")
     report = {
         "suite": SUITE_ID,
-        "status": "blocked" if any(row["status"] == "blocked" for row in rows) else "failed" if failed else "passed",
+        "status": "blocked" if historical["status"] == "blocked" else execution_status,
+        "statusScope": "current-regression",
+        "executionStatus": execution_status,
+        "acceptanceStatus": acceptance_status,
+        "acceptanceChecks": [historical],
         "componentChecks": [{"command": command, "status": "declared; run by offline validation"}
                             for command in COMPONENT_CHECKS],
         "liveEvidence": rows,
-        "unexecutedLiveChecks": [row["name"] for row in rows if row["status"] == "unexecuted"],
+        "unexecutedLiveChecks": [row["name"] for row in [*rows, historical] if row["status"] == "unexecuted"],
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
-    print(json.dumps({"status": report["status"], "report": str(report_path)}, sort_keys=True), flush=True)
+    print(json.dumps({"status": report["status"], "executionStatus": execution_status,
+                      "acceptanceStatus": acceptance_status, "report": str(report_path)}, sort_keys=True), flush=True)
     return 2 if report["status"] == "blocked" else 1 if failed else 0
 
 
@@ -297,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--live-preflight", action="store_true", help="verify disposable resources without dispatching a scenario")
     modes.add_argument("--full", "--full-suite", action="store_true", help="run all reliability scenarios serially and finish with Phase 1 playback")
     parser.add_argument("--scenario", choices=sorted(SCENARIOS), default="preflight")
+    parser.add_argument("--historical-evidence-run", type=_evidence_run,
+                        help="completed pre-cutover replay evidence to aggregate (full-suite only)")
     parser.add_argument("--ffmpeg-evidence-run", type=_evidence_run, help="FFmpeg evidence run directory under E2E_EVIDENCE_DIR (queue-monitoring only)")
     parser.add_argument("--poison-evidence-run", type=_evidence_run, help="poison evidence run directory under E2E_EVIDENCE_DIR (queue-monitoring only)")
     delivery_source = parser.add_mutually_exclusive_group()
@@ -305,6 +368,8 @@ def main(argv: list[str] | None = None) -> int:
     delivery_source.add_argument("--legacy-delivery-fixtures", type=lambda value: str(Path(value).resolve()),
                                  help="pre-cutover Phase 1/2 inventory JSON (delivery-regression only)")
     args = parser.parse_args(argv)
+    if args.historical_evidence_run is not None and not args.full:
+        parser.error("historical evidence requires --full-suite")
     if (args.playback_evidence_run is not None or args.legacy_delivery_fixtures is not None) and (
             args.scenario != "delivery-regression" or args.list or args.check or args.live_preflight or args.full):
         parser.error("delivery source arguments require --scenario delivery-regression without other modes")
@@ -325,9 +390,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if args.full:
         try:
-            return _full()
+            return _full(args.historical_evidence_run) if args.historical_evidence_run else _full()
         except (ValueError, OSError) as error:
             print(json.dumps({"status": "blocked", "suite": SUITE_ID,
+                              "statusScope": "current-regression", "executionStatus": "blocked", "acceptanceStatus": "blocked",
                               "message": str(error) if isinstance(error, ValueError) else "full-suite dispatch failed",
                               "liveResourcesVerified": False}), file=sys.stderr)
             return 2

@@ -27,7 +27,7 @@ test.describe('@delivery-regression', () => {
     const origin = normalizePlaybackBaseURL(process.env.PLAYBACK_BASE_URL ?? '')
     const frontendOrigin = new URL(e2eConfig.frontendUrl).origin
     const api = e2eConfig.apiUrl.replace(/\/$/, '').replace(/\/api\/v1$/, '') + '/api/v1'
-    const checked: { videoId: string; jobId: string; phase: string; path: string; advancement: number }[] = []
+    const checked: { videoId: string; jobId: string; phase: string; path: string; advancement: number; manifestETag: string }[] = []
     let passed = false
     try {
       for (const job of inventory.jobs) {
@@ -90,7 +90,7 @@ test.describe('@delivery-regression', () => {
           }
           expect(objectETag(job.manifestKey)).toBe(job.manifestETag)
           checked.push({ videoId: job.videoId, jobId: job.jobId, phase: job.phase,
-            path: `/${job.manifestKey}`, advancement: current - initial })
+            path: `/${job.manifestKey}`, advancement: current - initial, manifestETag: job.manifestETag })
         } finally {
           page.off('response', observe)
         }
@@ -98,6 +98,8 @@ test.describe('@delivery-regression', () => {
       passed = true
     } finally {
       await persistPlaybackEvidence({ 'cloudfront-completed-replay': { checked,
+        evidenceVersion: 1, outputBucket: process.env.E2E_OUTPUT_BUCKET,
+        account: process.env.E2E_AWS_ACCOUNT_ID, region: process.env.AWS_REGION, playbackOrigin: origin,
         verificationScope: inventory.verificationScope, sourceRunId: inventory.sourceRunId,
         capturedAt: inventory.capturedAt, cutoverAt: inventory.cutoverAt } }, passed, process.env, 'delivery-regression')
     }

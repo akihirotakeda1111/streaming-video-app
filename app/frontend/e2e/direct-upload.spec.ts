@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { observePublication, privateManifestExists, type PublicationEvidence, type PublicationSample } from './publication-probe.js'
 import { test, expect, type Page, type Request, type APIRequestContext } from '@playwright/test'
 import { normalizePlaybackBaseURL } from '../../scripts/generate_reliability_env.mjs'
 import { e2eConfig } from './config.js'
@@ -501,6 +502,10 @@ test.describe('@phase1-pipeline', () => {
     let playbackEvidence: BrowserPlaybackEvidence | undefined
     let playbackManifest: URL | undefined
     let missingBeforePublication: number | undefined
+    const publicationAbort = new AbortController()
+    let publicationResult: Promise<{ evidence?: PublicationEvidence; error?: string }> | undefined
+    let publication: { evidence?: PublicationEvidence; error?: string } | undefined
+    let publicationSample: PublicationSample | undefined
     const observedStatuses: JobStatus[] = []
     const statusResponses: Promise<StatusObservation>[] = []
     const playbackResponses: Promise<PlaybackObservation>[] = []
@@ -514,8 +519,20 @@ test.describe('@phase1-pipeline', () => {
         const match = path.match(/\/videos\/([^/]+)\/jobs\/([^/]+)\//)
         if (match) {
           const futureManifest = `${normalizePlaybackBaseURL(process.env.PLAYBACK_BASE_URL ?? '')}/videos/${match[1]}/jobs/${match[2]}/hls/index.m3u8`
-          const response = await request.get(futureManifest)
+          const key = new URL(futureManifest).pathname.slice(1)
+          const absentAt = performance.now()
+          expect(await privateManifestExists(key), 'manifest must not exist before upload').toBe(false)
+          const response = await request.get(futureManifest, { timeout: 2_000, maxRedirects: 0 })
           missingBeforePublication = response.status()
+          expect([403, 404]).toContain(missingBeforePublication)
+          publicationResult = observePublication({
+            exists: () => privateManifestExists(key),
+            status: async () => (await request.get(futureManifest, { timeout: 2_000, maxRedirects: 0 })).status(),
+            signal: publicationAbort.signal,
+            timeoutMs: e2eConfig.timeouts.upload + e2eConfig.timeouts.processing,
+            initialObservation: { absentAt, negativeAt: performance.now() },
+            onObservation: sample => { publicationSample = sample },
+          }).then(evidence => ({ evidence }), () => ({ error: 'Publication or bounded CloudFront recovery verification failed' }))
         }
       }
       await route.continue()
@@ -696,6 +713,9 @@ test.describe('@phase1-pipeline', () => {
         )
         if (!playback) throw new Error('a successful playback response was not observed')
         playbackManifest = new URL(playback.manifestUrl)
+        if (!publicationResult) throw new Error('Missing independent publication observer')
+        publication = await publicationResult
+        if (publication.error) throw new Error(publication.error)
         const segmentCount = await inspectHlsObjects(
           page,
           playback,
@@ -739,6 +759,8 @@ test.describe('@phase1-pipeline', () => {
       })
       passed = true
     } finally {
+      publicationAbort.abort()
+      if (publicationResult) publication = await publicationResult
       const network = {
         videoId,
         jobId,
@@ -775,6 +797,8 @@ test.describe('@phase1-pipeline', () => {
         currentTime: playbackEvidence?.currentTime,
         advancement: playbackEvidence?.advancement,
         delivery: playbackEvidence?.delivery,
+        publication,
+        publicationSample,
         failures: failuresForMedia(mediaNetworkFailures, playbackManifest, mediaPrefix),
       }
       const diagnostics = {

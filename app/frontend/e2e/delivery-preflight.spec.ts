@@ -3,6 +3,7 @@ import { test, expect } from '@playwright/test'
 import { normalizePlaybackBaseURL } from '../../scripts/generate_reliability_env.mjs'
 import { e2eConfig } from './config.js'
 import { persistPlaybackEvidence } from './playback-evidence.js'
+import { validateDeliveryBucketPolicy, validateDeliveryErrorCaching } from './delivery-policy.js'
 
 function aws(args: string[]): unknown {
   const region = process.env.AWS_REGION?.trim()
@@ -59,16 +60,9 @@ test.describe('@preflight @delivery-preflight', () => {
       expect(bpa[setting]).toBe(true)
     }
     const policyResult = record(aws(['s3api', 'get-bucket-policy', '--bucket', bucket]))
-    const policy = JSON.parse(String(policyResult.Policy)) as { Statement?: Record<string, unknown>[] }
-    const statements = policy.Statement ?? []
-    expect(statements.some((statement) => statement.Principal === '*')).toBe(false)
     const distributionArn = `arn:aws:cloudfront::${account}:distribution/${id}`
-    expect(statements.some((statement) => {
-      const principal = record(statement.Principal)
-      const condition = record(statement.Condition)
-      const equals = record(condition.StringEquals)
-      return principal.Service === 'cloudfront.amazonaws.com' && equals['AWS:SourceArn'] === distributionArn
-    }), 'bucket policy must scope CloudFront access to this distribution').toBe(true)
+    validateDeliveryBucketPolicy(JSON.parse(String(policyResult.Policy)), bucket, distributionArn)
+    validateDeliveryErrorCaching(config.CustomErrorResponses)
 
     const behavior = record(config.DefaultCacheBehavior)
     const responsePolicy = record(aws(['cloudfront', 'get-response-headers-policy', '--id', String(behavior.ResponseHeadersPolicyId)]))

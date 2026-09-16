@@ -84,7 +84,9 @@ configuration; never reopen the bucket to anonymous S3 reads.
 
 Use the dedicated E2E runner identity; it needs read-only CloudFront
 distribution/OAC/response-policy inspection and output bucket policy/BPA access,
-plus the existing scoped `s3:GetObject` inspection permission. Generate and
+plus scoped `s3:GetObject` and `s3:ListBucket` inspection permissions (ListBucket
+is required for missing HeadObject responses to be distinguishable as 404).
+Generate and
 review the disposable environment as described by the reliability runner, then
 run the offline commands from the task independently. Offline helper,
 discovery, type-check, and contract results are not live evidence.
@@ -97,10 +99,16 @@ Deployed distribution, its regional S3 origin and SigV4 OAC, all four BPA
 settings, the distribution-scoped bucket policy, and the frontend origin in the
 CloudFront response-headers policy.
 
+The bucket-policy validator accepts the repository's distribution-scoped
+CloudFront `Allow s3:GetObject` on `videos/*/jobs/*/hls/*` and non-granting Deny
+statements. Other Allow forms, including additional broader grants, fail closed.
+Dedicated SDK permissions should be identity-based. Both 403/404 custom error
+TTLs must be explicitly zero, without status/page rewriting.
+
 Finally run `python app/scripts/run_reliability_e2e.py --full-suite`. It keeps
 all six Phase 2 scenarios, creates a fresh Phase 1 completion, proves that a
 403/404 requested before publication becomes a CloudFront 200 within the
-existing processing/playback bounds, and checks repeated HTTPS delivery,
+independent publication recovery bound, and checks repeated HTTPS delivery,
 manifest/segment MIME types, relative segment references, allowed and denied
 CORS origins, anonymous S3 rejection, SDK-only private-object inspection, and
 positive browser media-time advancement. The final delivery-regression step
@@ -112,6 +120,17 @@ before and after playback. Preserve the emitted
 run directories and `full-suite-*.json`; a missing/failed/unexecuted row is not
 a PASS. Cache-hit headers are deliberately not required while successful TTLs
 remain zero.
+
+Publication is observed by continuous S3 HeadObject and CloudFront polling from
+before upload. The recovery upper bound starts at the last confirmed S3 absence
+request's start, not at a later CDN error or after encoding finishes. CloudFront
+must return 200 within 10 seconds of that fixed point; recent S3 absence and CDN
+negative observations must bracket publication within 5 seconds. Requests have
+2-second timeouts and polls pause 250 ms. These test bounds include the documented
+S3-origin error caching floor and observation overhead; they are not an AWS SLA.
+Slow/failed observations fail rather than claiming an unmeasured recovery.
+The playback evidence retains monotonic observation times and the latest sample,
+including failures. Long upload/encoding time uses the separate processing budget.
 
 ### Continuous full suite and isolated replay
 
@@ -143,6 +162,28 @@ or the full suite's automatic handoff is authoritative.
 Full-suite success proves current completed-job replay, not pre-cutover
 compatibility. Task 04's historical acceptance still requires the separate
 inventory run below; preserve both sets of evidence for completion.
+
+The report separates `executionStatus` for the current regression from
+`acceptanceStatus` for combined live acceptance. Without historical evidence,
+successful regression has `status: passed`, `statusScope: current-regression`,
+`executionStatus: passed`, but `acceptanceStatus: incomplete` and
+`historical-compatibility` in `unexecutedLiveChecks`. Exit code 0 in this case
+means only the current regression succeeded. Acceptance automation must require
+`acceptanceStatus: passed` as well as the independently recorded offline checks.
+
+After a successful historical replay, aggregate its run ID with a fresh suite:
+
+```text
+python app/scripts/run_reliability_e2e.py --full-suite --historical-evidence-run e2e-<UUID>
+```
+
+The referenced `delivery-regression-evidence.json` must be successful, match its
+run ID and the current account, region, bucket and CloudFront origin, and contain
+pre-cutover chronology and positive browser advancement for both phases with
+original manifest keys/ETags. Missing, mismatched, or old-format evidence blocks
+acceptance and exits 2. Valid evidence appears under `acceptanceChecks`; it is
+referenced, not re-executed. Re-run historical playback after a delivery change;
+the aggregate checks target identity, not unchanged deployment configuration.
 
 ### Previously completed job inventory
 
