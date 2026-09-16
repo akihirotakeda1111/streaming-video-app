@@ -292,6 +292,7 @@ jobs:
           E2E_API_URL: http://127.0.0.1:8000
           AWS_REGION: ${{ vars.AWS_REGION }}
           E2E_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
+          OUTPUT_S3_ENDPOINT: https://${{ vars.VIDEO_OUTPUT_BUCKET }}.s3.${{ vars.AWS_REGION }}.amazonaws.com
           E2E_AWS_ACCOUNT_ID: ${{ vars.E2E_AWS_ACCOUNT_ID }}
           PLAYBACK_BASE_URL: ${{ vars.PLAYBACK_BASE_URL }}
           E2E_PROJECT: chromium

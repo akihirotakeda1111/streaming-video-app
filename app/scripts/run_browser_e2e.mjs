@@ -24,11 +24,16 @@ export function runBrowserE2E(args, env = process.env, execute = spawnSync) {
   }
   // Preserve explicit selectors and offline discovery. The default command is the CI suite.
   if (args.length) return run(args)
-  for (const name of ['AWS_REGION', 'E2E_OUTPUT_BUCKET', 'E2E_AWS_ACCOUNT_ID', 'PLAYBACK_BASE_URL']) {
+  for (const name of ['AWS_REGION', 'E2E_OUTPUT_BUCKET', 'E2E_AWS_ACCOUNT_ID', 'PLAYBACK_BASE_URL', 'OUTPUT_S3_ENDPOINT']) {
     if (!child[name]?.trim()) throw new Error(`${name} is required for browser delivery E2E`)
   }
   if (!/^\d{12}$/.test(child.E2E_AWS_ACCOUNT_ID ?? '')) throw new Error('E2E_AWS_ACCOUNT_ID must contain 12 digits')
   child.PLAYBACK_BASE_URL = normalizePlaybackBaseURL(child.PLAYBACK_BASE_URL ?? '')
+  const outputEndpoint = `https://${child.E2E_OUTPUT_BUCKET}.s3.${child.AWS_REGION}.amazonaws.com`
+  if (child.OUTPUT_S3_ENDPOINT?.replace(/\/$/, '') !== outputEndpoint) {
+    throw new Error('OUTPUT_S3_ENDPOINT must match the dedicated regional output bucket')
+  }
+  child.OUTPUT_S3_ENDPOINT = outputEndpoint
   delete child.E2E_DISCOVERY
   delete child.E2E_INCLUDE_RELIABILITY
   delete child.E2E_INCLUDE_DELIVERY_REPLAY

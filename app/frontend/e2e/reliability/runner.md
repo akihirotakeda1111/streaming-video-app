@@ -58,6 +58,10 @@ merge-tests、agent-execute、agent-reviewのテスト実行プロセスには�
 - ホストrunnerはGitHub OIDCでIAMロールを引き受ける。runner用アクセスキー・シークレットキー・セッショントークンのSecretsは不要。API/Workerの認証は既存の設定を維持する。
 - OIDCロールには、下記のS3/CloudFront読み取り権限を付与する。
 
+`OUTPUT_S3_ENDPOINT` もテスト実行プロセスに必要。merge-testsでは `VIDEO_OUTPUT_BUCKET` と `AWS_REGION` から `https://<bucket>.s3.<region>.amazonaws.com` を組み立てて渡すため、同名のRepository Variableは不要。起動スクリプト内のexportは後続ステップへ引き継がれない。通常実行入口で未設定・別バケット・CloudFront URLの誤指定を拒否する。
+
+agentの検証プロセスは独自の環境変数許可リストを維持する。ワークフローで設定した配信変数・OIDC認証がそのまま検証子プロセスへ渡るわけではないため、agent経由の実AWS配信E2Eは本対応の動作保証対象に含めない。merge-testsは通常E2Eを直接起動するため、この制約を受けない。
+
 これらのGitHub設定は別途登録が必要。設定不足はskipせず失敗させる。通常CIは過去の `legacy.json` やDBに依存せず、移行前互換性は専用runnerで別途検証する。
 
 ### ツールと実行場所

@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { runBrowserE2E } from '../../scripts/run_browser_e2e.mjs'
 
 const settings = { AWS_REGION: 'us-east-1', E2E_OUTPUT_BUCKET: 'output',
-  E2E_AWS_ACCOUNT_ID: '123456789012', PLAYBACK_BASE_URL: 'https://example.cloudfront.net/' }
+  E2E_AWS_ACCOUNT_ID: '123456789012', PLAYBACK_BASE_URL: 'https://example.cloudfront.net/',
+  OUTPUT_S3_ENDPOINT: 'https://output.s3.us-east-1.amazonaws.com/' }
 
 describe('default browser E2E entry point', () => {
   it('gates uploads and removes inherited replay/discovery selections', () => {
@@ -17,6 +18,7 @@ describe('default browser E2E entry point', () => {
       expect(env[key]).toBeUndefined()
     }
     expect(env.PLAYBACK_BASE_URL).toBe('https://example.cloudfront.net')
+    expect(env.OUTPUT_S3_ENDPOINT).toBe('https://output.s3.us-east-1.amazonaws.com')
   })
   it('stops before uploads when the preflight fails or cannot start', () => {
     for (const result of [{ status: 1 }, { status: null, signal: 'SIGTERM' }, { error: new Error('missing') }]) {
@@ -39,5 +41,13 @@ describe('default browser E2E entry point', () => {
     execute.mockClear()
     expect(runBrowserE2E(['--project', 'reliability'], {}, execute)).toBe(0)
     expect(execute.mock.calls[0]![2].env.E2E_INCLUDE_RELIABILITY).toBe('true')
+  })
+  it('rejects a different S3 target or CloudFront URL before dispatch', () => {
+    for (const endpoint of ['https://other.s3.us-east-1.amazonaws.com', settings.PLAYBACK_BASE_URL,
+      'https://output.s3.us-east-1.amazonaws.com/path']) {
+      const execute = vi.fn()
+      expect(() => runBrowserE2E([], { ...settings, OUTPUT_S3_ENDPOINT: endpoint }, execute)).toThrow('OUTPUT_S3_ENDPOINT')
+      expect(execute).not.toHaveBeenCalled()
+    }
   })
 })
