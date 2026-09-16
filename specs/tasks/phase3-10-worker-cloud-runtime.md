@@ -22,6 +22,8 @@ forbidden_paths:
   - .agent/**
   - agent/**
   - .github/**
+  - app/infra/**
+  - app/scripts/validate_terraform_contracts.py
 
 repair_attempt_limit: 3
 review_attempt_limit: 3
@@ -29,7 +31,7 @@ review_attempt_limit: 3
 
 # Objective
 
-Prepare the existing worker for multiple Fargate instances with verified database TLS, bounded concurrency, scale-in protection, and safe shutdown.
+Prepare application-side TLS, bounded concurrency, ECS protection integration, and shutdown behavior for later Fargate deployment. This task does not modify infrastructure definitions or deploy AWS resources.
 
 **Priority:** P1. This Markdown is one Work Unit / Task Spec and contains exactly one task.
 
@@ -37,6 +39,7 @@ Prepare the existing worker for multiple Fargate instances with verified databas
 
 - **Out of Scope:** Reimplementing Phase 1/2, exposing attempt/lease fields publicly, replacing the queue platform, EKS/Kubernetes, GPU clusters, multi-region DR, and unnecessary service decomposition.
 - Random S3 hash-prefix sharding, multipart upload for small HLS segments, segment-level massive parallelism, Distributed Map, AWS Batch, and Lambda as the long-running encoder.
+- Do not create or modify Terraform, CloudFormation/CDK, IAM, ECS deployment definitions, or autoscaling configuration. Tasks 11-13 own that work. Local Compose/env examples are application-development configuration only.
 - Do not implement another task's work early. Only Task 99 may implement FFmpeg C API work. Viewer authentication, signed URLs/cookies, DRM, frontend hosting, and custom-domain issuance are outside scope.
 
 
@@ -68,11 +71,17 @@ depends_on: []
 
 ### Requirement
 
-**Scope / Allowed Changes:** Replace the Rust PostgreSQL adapter's fixed NoTls connection with CA- and hostname-verified TLS support. Retain explicit non-TLS local Compose operation; never fall back after a cloud TLS failure. Check TLS configuration propagation through the existing Go API driver. Replace fixed `PHASE1_MAX_CONCURRENCY=2` with bounded configuration retaining the local default, and configure Fargate initially at one. Bound database connections, FFmpeg threads, source size/duration, ephemeral storage, and wall time.
+**Scope / Allowed Changes:** Replace the Rust PostgreSQL adapter's fixed NoTls connection with CA- and hostname-verified TLS support. Retain explicit non-TLS local Compose operation; never fall back after a cloud TLS failure. Check TLS configuration propagation through the existing Go API driver. Replace fixed `PHASE1_MAX_CONCURRENCY=2` with bounded configuration retaining the local default, and accept a concurrency value of one for the later Fargate deployment; Task 12 supplies that deployment value. Implement application-side bounds for database connections, FFmpeg threads, source size/duration, temporary-file usage, and wall time. Validate configuration and fail safely on insufficient disk space; do not allocate or resize Fargate CPU, memory, or ephemeral storage here.
 
-In ECS service mode, acquire task scale-in protection before receiving work and renew it before expiry. Coordinate outstanding receives and active work to avoid protection races. Release protection only with no active work, and stop new receives if protection cannot be acquired. After an empty receive, release protection for a bounded idle interval so idle tasks do not remain continuously protected. Preserve shutdown behavior: stop receiving, cancel heartbeat/FFmpeg work, and join within a bound without acknowledging incomplete messages. Protection does not prevent crashes or forced stops; existing lease expiry and redelivery remain the recovery mechanism.
+Implement and component-test the application adapter that, when later deployed in ECS service mode, acquires task scale-in protection before receiving work and renews it before expiry. Coordinate outstanding receives and active work to avoid protection races. Release protection only with no active work, and stop new receives if protection cannot be acquired. After an empty receive, release protection for a bounded idle interval so idle tasks do not remain continuously protected. Preserve shutdown behavior: stop receiving, cancel heartbeat/FFmpeg work, and join within a bound without acknowledging incomplete messages. Protection does not prevent crashes or forced stops; existing lease expiry and redelivery remain the recovery mechanism.
 
-**Allowed Changes:** Frontmatter paths are the maximum scope for this requirement, adjacent tests, and named runbooks. A broad glob does not authorize unrelated functionality.
+**Ownership boundary:** Task 10 owns application code, configuration parsing/validation, local Compose examples, component tests, and runtime documentation only. It does not create or change AWS infrastructure definitions, IAM policies/roles, ECS task definitions/services, capacity settings, or autoscaling policies. Do not place infrastructure definitions in application directories to bypass the path restriction.
+
+Task 11 owns the cloud network, database, and API infrastructure. Task 12 owns worker IAM, task definition/service, deployment environment values, CPU/memory/ephemeral-storage allocation, and stopTimeout. Task 13 owns scaling targets/policies, metric wiring, and cooldowns. Document the runtime configuration names, types, units, defaults, valid ranges, local/cloud mode selection, protection integration requirements, credential/CA inputs, and shutdown grace period in `worker-scaling.md` so these tasks consume the implemented interface rather than invent a second one. Document required permissions without creating IAM policy artifacts.
+
+Task 10 must be implementable and verifiable before Tasks 11-13. Exercise ECS integration through a fake/local endpoint and credential-provider boundary. Use dedicated local PostgreSQL for real database tests, including a local TLS configuration; no RDS instance, ECS cluster, task role, or deployed scaling policy is a prerequisite. Local mode must not call ECS protection endpoints. Cloud mode must fail closed if required protection/configuration is unavailable, rather than silently selecting local behavior.
+
+**Allowed Changes:** Limit edits to the listed application files, local Compose/env examples, tests, and runtime documentation. `app/infra/**` and the Terraform validator are explicitly forbidden.
 
 ### Acceptance Criteria
 
@@ -81,8 +90,9 @@ In ECS service mode, acquire task scale-in protection before receiving work and 
 - Reject invalid CAs, hostname mismatches, and expired certificates. Permit NoTls only in explicitly local configuration.
 - Reuse acquisition/heartbeat tests to show that two or more distinct worker identities produce one valid owner for the same job and increment attempts only on successful acquisition.
 - Test concurrency limits, protection renewal/expiry/failure, idle release, SIGTERM, and actual FFmpeg child termination.
-- Use ECS task-role credential discovery without injecting static cloud access keys.
+- Support the SDK task-role credential provider at the application boundary and test it without a real AWS role. Task 12 creates and attaches the role; this task neither creates IAM resources nor injects static cloud keys.
 - Preserve API/local configuration compatibility and existing database transaction/lease predicates.
+- Provide the runtime configuration handoff for Tasks 11-13 and show that Task 10 tests do not require those tasks to be deployed. No infrastructure-definition files are changed.
 
 ### Validation
 
@@ -104,4 +114,4 @@ go test -C app/backend/api ./...
 python app/scripts/validate_contracts.py
 ```
 
-**Live acceptance:** Set TEST_DATABASE_URL explicitly for dedicated PostgreSQL race and lease tests, and verify a TLS database connection. Skipped database tests do not satisfy live acceptance.
+**Local integration acceptance:** Set TEST_DATABASE_URL explicitly for dedicated local PostgreSQL race/lease tests and verify a local TLS database connection. Include valid and invalid TLS cases; skipped database tests are not acceptance evidence. This requires no AWS deployment. Task 11 verifies cloud database/API connectivity, Task 12 verifies actual worker task-role/protection wiring and forced-stop recovery, and Task 13 verifies live scale-in/out behavior.
