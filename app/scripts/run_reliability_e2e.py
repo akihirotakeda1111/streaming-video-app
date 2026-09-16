@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 from datetime import datetime
 import math
+from urllib.parse import urlsplit
 
 SUITE_ID = "phase3-cloudfront-delivery-e2e-regression"
 SCENARIOS = {
@@ -194,6 +195,20 @@ def _validate_evidence(config: LiveConfig, evidence_file: Path) -> None:
         raise ValueError("queue monitoring evidence remains outstanding")
 
 
+def _playback_origin(value: str) -> str:
+    """Normalize an HTTPS origin, including the slash added by evidence redaction."""
+    if not isinstance(value, str) or not re.fullmatch(r"https://[^/?#\\\s@]+/?", value):
+        raise ValueError("invalid playback origin")
+    url = urlsplit(value)
+    if not url.hostname or url.path not in ("", "/"):
+        raise ValueError("invalid playback origin")
+    host = url.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    port = url.port
+    return f"https://{host}" + (f":{port}" if port is not None and port != 443 else "")
+
+
 def _historical_acceptance(parent: Path, run_id: str | None) -> dict:
     row = {"name": "historical-compatibility", "status": "unexecuted",
            "reason": "separate pre-cutover Phase 1/2 replay evidence is required"}
@@ -210,10 +225,11 @@ def _historical_acceptance(parent: Path, run_id: str | None) -> dict:
         replay = evidence["diagnostics"]["cloudfront-completed-replay"]
         expected = {"outputBucket": os.environ.get("E2E_OUTPUT_BUCKET"),
                     "account": os.environ.get("E2E_AWS_ACCOUNT_ID"),
-                    "region": os.environ.get("AWS_REGION"),
-                    "playbackOrigin": os.environ.get("PLAYBACK_BASE_URL", "").rstrip("/")}
+                    "region": os.environ.get("AWS_REGION")}
         if (replay["evidenceVersion"] != 1 or replay["verificationScope"] != "pre-cutover-compatibility"
-                or any(not value or replay.get(key) != value for key, value in expected.items())):
+                or any(not value or replay.get(key) != value for key, value in expected.items())
+                or _playback_origin(replay.get("playbackOrigin")) !=
+                   _playback_origin(os.environ.get("PLAYBACK_BASE_URL", ""))):
             raise ValueError("historical scope or target mismatch")
         captured, cutover, observed = (datetime.fromisoformat(value.replace("Z", "+00:00"))
                                        for value in (replay["capturedAt"], replay["cutoverAt"], evidence["observedAt"]))

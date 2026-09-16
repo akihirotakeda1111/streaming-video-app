@@ -46,6 +46,28 @@ class RunnerChecks(unittest.TestCase):
                         "observedAt": "2025-03-01T00:00:00Z", "diagnostics": {"cloudfront-completed-replay": replay}}
             file.write_text(json.dumps(evidence))
             self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "passed")
+            # Evidence redaction adds a root slash; compare normalized origins on both sides.
+            for configured in (target["playbackOrigin"], target["playbackOrigin"] + "/"):
+                for recorded in (target["playbackOrigin"], target["playbackOrigin"] + "/",
+                                 "https://EXAMPLE.cloudfront.net:443/"):
+                    with self.subTest(configured=configured, recorded=recorded), \
+                            patch.dict(os.environ, {"PLAYBACK_BASE_URL": configured}):
+                        file.write_text(json.dumps({**evidence, "diagnostics": {
+                            "cloudfront-completed-replay": {**replay, "playbackOrigin": recorded}}}))
+                        self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "passed")
+            for invalid in ("https://other.cloudfront.net/", "http://example.cloudfront.net/",
+                            "https://example.cloudfront.net/hls", "https://example.cloudfront.net//",
+                            "https://example.cloudfront.net/?x=1", "https://example.cloudfront.net/#fragment",
+                            "https://user@example.cloudfront.net/", "https://example.cloudfront.net:444/",
+                            "https://example.cloudfront.net:invalid/", "https://example.cloudfront.net:99999/",
+                            "https://example.cloudfront.net/\n", "", None):
+                with self.subTest(invalid=invalid):
+                    file.write_text(json.dumps({**evidence, "diagnostics": {
+                        "cloudfront-completed-replay": {**replay, "playbackOrigin": invalid}}}))
+                    self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "blocked")
+                    file.write_text(json.dumps(evidence))
+                    with patch.dict(os.environ, {"PLAYBACK_BASE_URL": invalid or ""}):
+                        self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "blocked")
             for changes in ({"checked": jobs[:1]}, {"verificationScope": "completed-job-replay"},
                             {"outputBucket": "other"}, {"playbackOrigin": "https://other.cloudfront.net"},
                             {"cutoverAt": "2025-04-01T00:00:00Z"}, {"evidenceVersion": 0},
