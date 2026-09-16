@@ -39,11 +39,16 @@ impl Agent {
             || endpoint.password().is_some()
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
-            || endpoint.path() != "/"
         {
             return Err("invalid ECS_AGENT_URI".into());
         }
-        endpoint.set_path("/task-protection/v1/state");
+        // ECS_AGENT_URI includes the container-specific /api/<id> prefix.
+        // Append segments rather than replacing the path or resolving an absolute URL.
+        endpoint
+            .path_segments_mut()
+            .map_err(|_| "invalid ECS_AGENT_URI")?
+            .pop_if_empty()
+            .extend(["task-protection", "v1", "state"]);
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -117,6 +122,32 @@ pub async fn update<P: Protection>(protection: &mut P, enabled: bool) -> Result<
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn endpoint_preserves_agent_prefix_and_handles_trailing_slash() {
+        for (base, expected) in [
+            ("", "/task-protection/v1/state"),
+            ("/", "/task-protection/v1/state"),
+            ("/api/test-id", "/api/test-id/task-protection/v1/state"),
+            ("/api/test-id/", "/api/test-id/task-protection/v1/state"),
+        ] {
+            let agent = Agent::new(&format!("http://169.254.170.2{base}")).unwrap();
+            assert_eq!(agent.endpoint.path(), expected);
+        }
+    }
+
+    #[test]
+    fn prefixed_uri_retains_endpoint_validation() {
+        for uri in [
+            "https://169.254.170.2/api/test-id",
+            "http://example.com/api/test-id",
+            "http://user:password@169.254.170.2/api/test-id",
+            "http://169.254.170.2/api/test-id?query=value",
+            "http://169.254.170.2/api/test-id#fragment",
+        ] {
+            assert!(Agent::new(uri).is_err());
+        }
+    }
     #[tokio::test]
     async fn agent_validates_http_confirmation_and_expiry() {
         for (status, body, accepted) in [
@@ -157,14 +188,14 @@ mod tests {
                     }
                 }
                 let request = String::from_utf8(request).unwrap();
-                assert!(request.starts_with("PUT /task-protection/v1/state HTTP/1.1"));
+                assert!(request.starts_with("PUT /api/test-id/task-protection/v1/state HTTP/1.1"));
                 assert!(request.contains("\"ProtectionEnabled\":true"));
                 assert!(!request.to_lowercase().contains("authorization:"));
                 let body = body.to_string();
                 socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             });
             assert_eq!(
-                Agent::new(&format!("http://{address}"))
+                Agent::new(&format!("http://{address}/api/test-id"))
                     .unwrap()
                     .set(true)
                     .await

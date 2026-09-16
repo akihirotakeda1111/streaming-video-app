@@ -432,7 +432,7 @@ mod tests {
         values.remove(MAX_CONCURRENCY);
         values.remove("WORKER_RUNTIME_MODE");
         assert!(load(&values).is_err());
-        values.insert("ECS_AGENT_URI", "http://127.0.0.1:1234".into());
+        values.insert("ECS_AGENT_URI", "http://127.0.0.1:1234/api/test-id".into());
         assert!(load(&values).is_err(), "cloud must reject disable");
         values.insert(
             DATABASE_URL,

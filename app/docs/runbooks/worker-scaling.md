@@ -55,7 +55,9 @@ credentials, database URLs, or tokens.
 ## Task protection and shutdown
 
 ECS mode confirms protection before receiving, through PUT
-`/task-protection/v1/state` with two-minute expiry. HTTP success is insufficient:
+`${ECS_AGENT_URI}/task-protection/v1/state` with two-minute expiry. The injected
+URI's `/api/<id>` prefix is preserved (a trailing slash is handled without
+duplicating the separator). HTTP success is insufficient:
 the response must confirm the state and a future expiration. Each update has a
 four-second overall bound. Renewal occurs at half the remaining lifetime while
 receiving or processing, including when concurrency is full. Failure stops
