@@ -9,7 +9,7 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 
 | 要素 | 実装・設定 | 役割 |
 | --- | --- | --- |
-| AWS環境 | `app/infra/terraform-e2e/` | 既存Terraformを再利用し、専用S3・SQS/DLQ・通知・3アラーム・IAMを作成 |
+| AWS環境 | `app/infra/terraform-e2e/` | 既存Terraformを再利用し、専用S3・CloudFront/OAC・SQS/DLQ・通知・3アラーム・IAMを作成 |
 | ローカル実行環境 | `app/compose.yaml` + `app/compose.e2e.yaml` | 専用プロジェクト・DB volume・ラベル。Worker、DB、migrationは既存定義を再利用 |
 | 設定統合（Bash） | `app/scripts/setup_reliability_env.sh` + `.mjs` | Terraform出力を読み込み、必要ならWorker・API・Frontendを起動してE2E設定を現在のシェルへ反映 |
 | 設定生成 | `app/scripts/generate_reliability_env.mjs` | AWS/Docker実効値から非機密の環境設定を生成。秘密情報は出力しない |
@@ -25,7 +25,8 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 
 | セレクター | 検証範囲 | 実装状況 |
 | --- | --- | --- |
-| `preflight` | ローカル・ブラウザ・APIの準備確認 | 実装済み。API/Frontendとブラウザが必要 |
+| `preflight` | ローカル・ブラウザ・APIの準備確認と配信事前確認 | 実装済み。API/Frontend、ブラウザ、配信設定の参照権限が必要 |
+| `delivery-preflight` | CloudFront/OAC・S3非公開・CORS・403/404キャッシュ設定 | 実装済み。読み取りのみ |
 | `runtime-authorization` | Reliability共通実行境界の確認 | 実装済み |
 | `duplicate-delivery` | 処理中と完了後の重複配送、単一の有効処理、ack、cleanup | 実装済み。ブラウザ/APIを操作しない |
 | `crash-recovery` | 取得後・永続完了前のWorker停止、可視性とDB lease expiry後の再取得 | 実装済み。停止対象は共通事前確認済みの同一Workerのみ |
@@ -33,14 +34,15 @@ Reliability E2Eは専用のAWSリソースとローカルDocker上のWorker・Po
 | `ffmpeg-exhaustion` | 不正メディアの実FFmpeg失敗、試行上限、FAILED、manifest非公開、run-owned DLQ隔離 | 実装済み。`--scenario ffmpeg-exhaustion` |
 | `poison-isolation` | malformed/unknown-job poison のDLQ隔離と、同時実行する正常jobの完了 | 実装済み。`--scenario poison-isolation` |
 | `queue-monitoring` | source queue backlog/age、DLQ depth、3つのCloudWatch alarm状態を読み取り、FFmpeg/poison証跡と相関 | 実装済み。`--scenario queue-monitoring`。Receive/Delete/Purge/Replayは行わない |
-| `--full` / `--full-suite` | 6つのReliabilityシナリオ後に新規アップロード・実ブラウザ再生 | 実装済み。最後に既存 `@phase1-pipeline` をChromiumで実行。単独の `--scenario phase1-pipeline` はない |
+| `delivery-regression` | 明示した完了jobのAPI・CloudFront・ブラウザ再生と元のHLSの維持 | 実装済み。単独では証跡runまたは移行前inventoryの指定が必須 |
+| `--full` / `--full-suite` | 配信事前確認 → 6つのReliabilityシナリオ → 新規アップロード・再生 → 完了job再生 | 実装済み。9段階を直列実行。単独の `--scenario phase1-pipeline` はない |
 
 最新の実装済みセレクターは `--list` で確認する。実環境の受け入れは対象環境で成功した証跡をレビューして判断する。
 
 個別の追加設定・実行コマンド・成功判定は、後述の「シナリオ別の前提条件と実行手順」を参照する。
 
 シナリオ追加時はこの表と「シナリオ別の前提条件と実行手順」「時間設定・検証詳細・復旧」を更新する。
-各シナリオは直接Playwrightで選択されても操作前に共通事前確認を呼び、別テストの成功を認可の代用にしない。
+runnerは各dispatch前に共通事前確認を行う。Reliabilityの操作シナリオも操作前に認可を確認し、別テストの成功を認可の代用にしない。
 停止を伴うシナリオでは直前にEngine ID・完全なコンテナID・開始時刻を再照合し、同じコンテナを保持して復旧する。
 再作成・Compose全体の停止・プロセス名での選択を障害注入に使わない。
 
@@ -68,7 +70,7 @@ WSLではLinux版Nodeを使い、`node -p 'process.platform'` が `linux` であ
 既存の専用環境があれば再作成は不要。新規作成時は通常環境とstate・リソース名を分離する。
 E2E用Terraformはinput/output S3、Standard sourceキューとDLQ、S3通知、3アラーム、API/Worker用IAMユーザー・ポリシー、
 ホストrunner用ポリシーを作成する。アクセスキー、DB、コンテナ、計算リソースは作成しない。
-outputのHLSパスは既存構成と同じ公開読み取り方式。アカウント方針が公開ポリシーを禁止する場合は適用できない。
+output S3は4つのBlock Public Accessを有効にして非公開とし、CloudFrontからOAC経由でHLSを配信する。ブラウザの再生先はCloudFrontのHTTPS originとする。既存環境の切り替えは[配信runbook](../../../docs/runbooks/cloudfront-delivery.md)を参照する。
 バケットは新規・非versionedで、強制オブジェクト削除は有効にしない。
 
 `terraform.tfvars.example` を同じディレクトリの `terraform.tfvars` にコピーし、
@@ -103,6 +105,7 @@ state・plan・実値tfvarsはコミットせず、provider lockファイルは�
 | 用途 | 起動元シェルの変数 | 設定元・注意点 |
 | --- | --- | --- |
 | 接続先 | `AWS_REGION`、`VIDEO_ENCODING_QUEUE_URL`、`VIDEO_INPUT_BUCKET`、`VIDEO_OUTPUT_BUCKET` | 統合セットアップがE2E専用Terraform outputから反映 |
+| 再生先 | `PLAYBACK_BASE_URL` | CloudFrontのHTTPS origin。`OUTPUT_S3_ENDPOINT` は直接S3アクセスの拒否確認に使い、再生先には使わない |
 | Worker認証 | `WORKER_AWS_ACCESS_KEY_ID`、`WORKER_AWS_SECRET_ACCESS_KEY` | Worker用principalの認証。Composeがコンテナ内の `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` に渡す |
 | Worker一時認証 | `WORKER_AWS_SESSION_TOKEN` | 一時認証なら必須。長期キーの場合は古いtokenを残さない |
 | API認証 | `API_AWS_ACCESS_KEY_ID`、`API_AWS_SECRET_ACCESS_KEY` | API用principalの認証。Composeがコンテナ内の `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` に渡す |
@@ -119,6 +122,8 @@ terraform -chdir=app/infra/terraform-e2e output runner_policy_arn
 ```
 
 runner policyはホスト側principalへ手動付与する。専用DLQに限定した `sqs:ReceiveMessage` を含む。source queueのReceive、queueのDelete/Purge、DLQ replay、Terraform適用権限は含まない。既存環境では更新したrunner policyを人手で適用してからFFmpeg exhaustionを実行する。
+
+配信検証にはCloudFront distribution・OAC・response headers policy、S3 bucket policy・public access blockの参照権限が必要。元HLSの確認と公開時点の観測には対象を限定した `s3:GetObject` と `s3:ListBucket` も必要（ListBucketがないと不存在を404で判定できない）。生成済みrunner policyだけで充足すると仮定せず、[配信runbook](../../../docs/runbooks/cloudfront-delivery.md)に従いホストprincipalの権限を確認する。
 CloudWatch DescribeAlarmsは設定生成の一覧取得に必要なため読み取りの `Resource=*` を使用する。
 AWS認証情報は生成ファイル・tfvars・Git管理ファイルに追記しない。WorkerのDATABASE_URLもコピー不要。
 
@@ -172,6 +177,7 @@ source app/scripts/setup_reliability_env.sh \
 | `--terraform-directory` | スクリプト基準の `app/infra/terraform-e2e`。別stateの環境では変更 |
 | `--project` | Composeプロジェクト。既定は `streaming-video-e2e` |
 | `--frontend-url` / `--api-url` | 既定は `http://localhost:5173` / `http://localhost:8080` |
+| `--playback-url` | CloudFrontのHTTPS origin。指定値 → `PLAYBACK_BASE_URL` → Terraform `playback_base_url` の順で採用 |
 | `--evidence-dir` | カレントディレクトリ基準の `artifacts/reliability-e2e` |
 | `--docker-host` | DOCKER_HOST、未設定なら `unix:///var/run/docker.sock`。Composeと設定生成で共通使用。ローカルLinuxソケットのみ対応 |
 | `--profile` | 設定生成のrunner用AWSプロファイル。Terraform出力取得は起動元シェルのAWS認証を使用 |
@@ -232,7 +238,7 @@ AWSリソースはComposeで分離されないため、他consumerと共有し�
 
 統合セットアップは正常・不正fixture、時計ずれ、`E2E_PROJECT=chromium`、全共通設定を現在のシェルへ反映する。
 fixture検査はファイル形式・サイズの条件のみで、正常動画としての再生可否・encode時間や、実FFmpegでの失敗は保証しない。
-API/Frontend用のバケット、出力S3 endpoint、許可origin、API接続先、公開ポートも生成する。`--start-services` は生成設定でAPI/Frontendの起動まで行う。認証とS3 CORS、ホストFFmpeg、Chromiumのインストールは別途必要。秘密情報は生成ファイルへ含めない。
+API/Frontend用のバケット、出力S3 endpoint、`PLAYBACK_BASE_URL`、許可origin、API接続先、公開ポートも生成する。`--start-services` は生成設定でAPI/Frontendの起動まで行う。認証とS3/CloudFront CORS、ホストFFmpeg、Chromiumのインストールは別途必要。秘密情報は生成ファイルへ含めない。
 `E2E_RUN_ID` と監視の先行run IDはフルrunnerが設定するため、生成設定には含めない。
 
 生成JSON・コマンドはいずれも非機密設定だけだが、環境固有の値なのでGitにはコミットしない。
@@ -299,7 +305,7 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 
 `--check` が `configured; live resources not verified`、`--live-preflight` が `status=verified` になったら個別手順へ進む。
 `not configured` / `blocked` の場合は設定を確認する。`--check` は外部ツールの存在と設定形式の確認であり、各権限・fixture・API・ブラウザの動作保証ではない。
-`--live-preflight` は読み取りによる実体確認を行い、`preflight-<UUID>/live-preflight.json` を保存する。後述の `--scenario preflight` とは役割が異なる。
+`--live-preflight` はAWS/Dockerの実体確認後、Chromiumプロジェクトで読み取り専用の `delivery-preflight` を実行する。成功した `delivery-preflight-evidence.json` を確認してから `preflight-<UUID>/live-preflight.json` を保存し、`deliveryEvidenceDirectory` に配信証跡の保存先を記録する。アップロードやWorker変更は行わず、`scenarioStarted=false` とする。後述の `--scenario preflight` と異なり、ブラウザ・APIの準備確認は行わない。
 
 各シナリオも実行直前に共通事前確認を行う。`E2E_EVIDENCE_DIR` は証跡の**親ディレクトリ**のまま保持し、runnerが表示する子ディレクトリへシェル設定を変更しない。
 `E2E_RUN_ID` はrunnerに生成させる。シナリオを並行実行しない。Workerの再作成・実環境の設定変更後は設定を再生成・再読込し、この確認からやり直す。
@@ -312,7 +318,8 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 
 | 実行対象 | 追加するもの | 先行する障害シナリオ | 主な証跡 |
 | --- | --- | --- | --- |
-| `preflight` | API・Frontend、対象ブラウザ、ホストFFmpeg | なし | Playwright結果・失敗時の診断添付 |
+| `preflight` | API・Frontend、対象ブラウザ、ホストFFmpeg、配信設定の参照権限 | なし | Playwright結果、`delivery-preflight-evidence.json` |
+| `delivery-preflight` | CloudFront/OAC/S3設定の参照権限、配信先設定 | なし | `delivery-preflight-evidence.json` |
 | `runtime-authorization` | 共通設定のみ | なし | Playwright結果・失敗時の認可診断 |
 | `duplicate-delivery` | 下記「データ作成シナリオ共通条件」、長めの正常MP4 | なし | `duplicate-delivery-evidence.json` |
 | `crash-recovery` | 同共通条件、正常MP4、時計ずれ設定、heartbeatログ、停止・再開可能なWorker | なし | `crash-recovery-evidence.json` |
@@ -320,7 +327,8 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 | `ffmpeg-exhaustion` | 同共通条件、不正MP4、DLQ受信権限、全再試行を待つ予算 | なし | `ffmpeg-exhaustion-evidence.json` |
 | `poison-isolation` | 同共通条件、正常MP4、DLQ受信権限、poisonのredriveを待つ予算 | なし | `poison-isolation-evidence.json` |
 | `queue-monitoring` | メトリクス取得権限、同じ環境のFFmpeg・poison成功証跡 | 完全な成功判定にはFFmpeg・poisonの両方 | `queue-monitoring-evidence.json` |
-| `--full` | 上記すべてとChromium再生環境。正常・不正の両fixture | runnerが6シナリオを順番に実行 | `full-suite-*.json` と各runのJSON、`phase1-pipeline-evidence.json` |
+| `delivery-regression` | Chromium・API・Frontend、選択した成功証跡または移行前inventory、元のDB/S3資源 | source run方式では成功した新規アップロード証跡 | `delivery-regression-evidence.json` |
+| `--full` | 上記の実行環境と正常・不正の両fixture。移行前inventoryは現在の回帰実行には不要 | runnerが9段階を順番に実行し、先行証跡を自動指定 | `full-suite-*.json` と各runのJSON |
 
 ### データ作成シナリオ共通条件
 
@@ -339,12 +347,12 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 
 ### ブラウザ使用シナリオの追加準備
 
-`preflight` と最終 `@phase1-pipeline` は、統合セットアップの `--start-services` で起動したAPI・Frontendを使用する。
+`preflight`、`@phase1-pipeline`、`delivery-regression` は、統合セットアップの `--start-services` で起動したAPI・Frontendを使用する。
 ブラウザが開くFrontend originはTerraformの `frontend_origin` と一致させる。`localhost` と `127.0.0.1` は別origin。必要なAWS変更は共通準備のplan確認手順で行う。
 
 ホストFFmpegは `libx264` を利用可能にする。`FFMPEG_PATH` を指定する場合はホストで実行できるパスを使い、Workerコンテナ内パスを流用しない。
 通常はブラウザを表示するため、WSL等では表示環境も必要。`CI` 設定時はheadlessになる。
-最終再生では公開HTTPSのHLS manifest/segmentをブラウザから取得でき、適切なContent-TypeとCORS応答が必要。
+再生ではCloudFrontのHTTPS経由でHLS manifest/segmentを取得でき、適切なContent-TypeとCORS応答が必要。匿名の直接S3アクセスは拒否されることを確認する。
 
 ### preflight：ブラウザ・APIの準備確認
 
@@ -354,8 +362,18 @@ python app/scripts/run_reliability_e2e.py --live-preflight
 python app/scripts/run_reliability_e2e.py --scenario preflight
 ```
 
-**成功判定：** Frontend到達、ブラウザ操作、APIの `/api/v1/health`、ホストFFmpegによるfixture生成がすべて成功すること。video/jobのアップロードや再生成功は検証しない。失敗時のPlaywright診断添付を保存する。
+**成功判定：** Frontend到達、ブラウザ操作、APIの `/api/v1/health`、ホストFFmpegによるfixture生成、および次項の配信事前確認がすべて成功すること。video/jobのアップロードや再生成功は検証しない。失敗時のPlaywright診断添付を保存する。
 引数省略時もこのシナリオになる。`preflight-*/live-preflight.json` を作成する `--live-preflight` と混同しない。
+
+### delivery-preflight：実配信設定の読み取り確認
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario delivery-preflight
+```
+
+`PLAYBACK_BASE_URL` に対応するdeployed distribution、単一のregional S3 origin、SigV4 always OAC、4つのS3 Block Public Access、Frontend originのCORSを確認する。bucket policyは、このdistributionのSourceArn条件付きCloudFront service principalに、既存HLSパスのGetObjectのみを許可する形式を検証する。対応外のAllowやNotAction/NotPrincipal/NotResourceは受け入れない。
+
+403・404のCustomErrorResponsesがそれぞれ1件、ErrorCachingMinTTLが0、応答コード・ページの書き換えがないことも必要。成功証跡は `delivery-preflight-evidence.json`。単独ではChromiumプロジェクト、再試行なしで実行する。フル実行ではこの確認の失敗または証跡欠落が後続を止める。
 
 ### runtime-authorization：共通実行境界の確認
 
@@ -477,7 +495,24 @@ python app/scripts/run_reliability_e2e.py --scenario queue-monitoring --ffmpeg-e
 現在のAWS観測期限はシナリオ内の300000 ms。`E2E_DLQ_TIMEOUT_MS` の変更では延びない。
 メトリクス欠落時は下の「CloudWatchメトリクス診断」を確認し、原因を解決して監視だけを新しいrunで再実行できる。source/DLQのReceive・Delete・Purge・Replayは行わない。
 
-### フル実行：全障害シナリオから最終ブラウザ再生まで
+### delivery-regression：選択した完了jobの再生
+
+単独実行は次のどちらか一方を明示する。`E2E_EVIDENCE_DIR` は参照元と同じ親ディレクトリにする。
+
+```text
+python app/scripts/run_reliability_e2e.py --scenario delivery-regression --playback-evidence-run e2e-<UUIDv4>
+python app/scripts/run_reliability_e2e.py --scenario delivery-regression --legacy-delivery-fixtures /absolute/path/legacy.json
+```
+
+1つ目は指定runの `phase1-pipeline-evidence.json` を読み、成功した新規アップロードのvideo/jobを再生する。元manifestのkey・ETag・output bucketを含む現行形式が必要で、`verificationScope=completed-job-replay` として記録する。元のDB/S3資源を保持する。古いPhase 2の実行スクリプトや任意の障害シナリオ証跡を指定するものではない。
+
+2つ目は切り替え前に採取した `capturedAt`、`cutoverAt`、Phase 1/2双方のjobと元manifestのkey・ETagを含むJSON inventoryを使う。2〜10件の異なるvideoが必要で、`verificationScope=pre-cutover-compatibility` とする。形式と採取手順は[配信runbook](../../../docs/runbooks/cloudfront-delivery.md)を参照する。通常の完了job再生だけでは、この移行前互換性の証明にはならない。
+
+いずれもlive APIのCOMPLETEDとjob ID、実Frontend origin上のvideo.js再生、CloudFrontのHLS・MIME・CORS・全segment、匿名S3拒否、正の再生時間増分、再生前後の元manifest key/ETagの一致を確認する。Chromium、再試行なしで実行し、`delivery-regression-evidence.json` を保存する。
+
+未指定時にjobやS3オブジェクトを自動選択しない。runnerは親シェルの `E2E_PLAYBACK_EVIDENCE_RUN` / `E2E_LEGACY_DELIVERY_FIXTURES` を引き継がず、CLI指定またはフル実行の自動選択だけを子プロセスに渡す。
+
+### フル実行：配信事前確認から完了job再生まで
 
 **追加条件：** 個別条件すべて。長めの正常MP4と不正MP4の両パス、時計ずれ、DLQ/メトリクス権限、Chromium・API・Frontendを**開始前に**揃える。`preflight` を先に実行してブラウザ側の準備も確認する。
 フル実行は個別条件すべてを開始前に検証するわけではなく、後半の条件不足でも途中停止し得る。
@@ -490,29 +525,47 @@ python app/scripts/run_reliability_e2e.py --scenario preflight
 python app/scripts/run_reliability_e2e.py --full
 ```
 
-順序は **duplicate-delivery → crash-recovery → long-heartbeat → ffmpeg-exhaustion → poison-isolation → queue-monitoring → 新規アップロード・Chromium再生**。
-`--full-suite` は同義。監視への先行run IDの受け渡しは自動で行う。`--ffmpeg-evidence-run` / `--poison-evidence-run` はフル実行には指定しない。
-`--full` は `runtime-authorization` / `preflight` を独立テストとしては実行しないが、各dispatchは共通の認可を再実行する。
+順序は **delivery-preflight → duplicate-delivery → crash-recovery → long-heartbeat → ffmpeg-exhaustion → poison-isolation → queue-monitoring → phase1-pipeline（新規アップロード・Chromium再生）→ delivery-regression（直前jobの再生）**。
+`--full-suite` は同義。監視へのFFmpeg/poison run ID、完了job再生への新規アップロードrun IDの受け渡しは自動で行う。`--ffmpeg-evidence-run` / `--poison-evidence-run` / `--playback-evidence-run` / `--legacy-delivery-fixtures` はフル実行には指定しない。
+`--full` は `runtime-authorization` / ブラウザ準備の `preflight` を独立テストとしては実行しない。配信の `delivery-preflight` は先頭で実行し、各dispatchは共通の認可を再実行する。
 
-最後の `@phase1-pipeline` はホストFFmpegで短い正常MP4を新規生成し、UIから1回アップロードする。正常・不正の指定fixtureを流用せず、自動再試行も行わない。
+8番目の `@phase1-pipeline` はホストFFmpegで短い正常MP4を新規生成し、UIから1回アップロードする。正常・不正の指定fixtureを流用せず、自動再試行も行わない。
 APIのCOMPLETED、HLS取得・Content-Type/CORS、player/networkの失敗不在、正の再生時間増分を検証する。単独の `--scenario phase1-pipeline` は登録されていない。
 
-**成功判定：** 親ディレクトリの `full-suite-*.json` が `status=passed`、7行すべて `passed`、`unexecutedLiveChecks=[]`。
-各行の `evidenceFile` を開き、シナリオ・run IDが一致する成功証跡を確認する。最終行は `phase1-pipeline-evidence.json` でvideo/job ID、ネットワーク、状態、再生時間の観測を保存する。失敗時も取得できた途中観測を残す。
+**現在の回帰の成功判定：** 親ディレクトリの `full-suite-*.json` が `executionStatus=passed`、`liveEvidence` の9行すべて `passed`。`statusScope=current-regression` であり、`status=passed` や終了コード0だけではTask 04全体の受入完了を意味しない。
+各行の `evidenceFile` を開き、シナリオ・run IDが一致する成功証跡を確認する。8番目は `phase1-pipeline-evidence.json`、最終行は `delivery-regression-evidence.json`。最終行の `playbackEvidenceRun` が8番目のrunを指し、`verificationScope=completed-job-replay` であることを確認する。失敗時も取得できた途中観測を残す。
+
+**移行前互換性を含む受入判定：** inventory方式で別途成功したdelivery-regressionのrunを指定する。
+
+```text
+python app/scripts/run_reliability_e2e.py --full --historical-evidence-run e2e-<UUIDv4>
+```
+
+このオプションはフル実行専用で、既存証跡を参照し、移行前jobの再生を再実行しない。`acceptanceChecks` の `historical-compatibility` は9行の `liveEvidence` と分離する。証跡の成功、バージョン、scope、account/region/output bucket/playback origin、採取・切替・観測時刻、Phase 1/2両方の元HLSと再生結果を検証する。配信変更後は互換性を再実行して新しい証跡を指定する。
+
+現在の9行と移行前互換性が成功すると `acceptanceStatus=passed`。未指定なら現在の9行が成功しても `acceptanceStatus=incomplete` となり、`unexecutedLiveChecks` に `historical-compatibility` が残る。指定した証跡が不正・欠落・別環境なら `acceptanceStatus=blocked`、`status=blocked` となる。
 
 | フル実行の終了コード | 意味・対応 |
 | --- | --- |
-| 0 | 全7行が成功し、対応する証跡も検証済み |
+| 0 | 現在の9行が成功し、対応する証跡も検証済み。移行前証跡が未指定なら受入判定はincomplete |
 | 1 | テスト失敗、証跡の欠落・不整合・未完了。失敗行を確認し、後続の `unexecuted` を実施済みと扱わない |
-| 2 | 設定・再認可・起動がblocked、または集約レポートを保存できない。標準エラーも確認する |
+| 2 | 設定・再認可・起動がblocked、指定した移行前証跡が不正、または集約レポートを保存できない。標準エラーも確認する |
 
 途中のblockedでも保存可能なら実行済み行と残りの未実行一覧を保持する。初期設定検証や保存先自体の失敗では集約JSONが存在しない場合がある。
 `componentChecks` は別途実行するオフライン検証コマンドの宣言であり、このフル実行がコンポーネントテストを実施した意味ではない。
 レポートだけでなく、参照される各runディレクトリを一緒に保存する。
-最終Phase 1テストは一時fixtureを削除するが、アップロードしたDB/S3資源の自動cleanupは行わない。証跡のvideo/job IDで残存資源を確認する。
+新規アップロードテストは一時fixtureを削除するが、アップロードしたDB/S3資源の自動cleanupは行わない。後続・単独の再生に必要な資源を保持し、証跡のvideo/job IDで残存資源を確認する。
 前半のDLQ保持分も含め、当該runの範囲で人手確認・cleanupを行う。
 
 ## 時間設定・検証詳細・復旧
+
+### CloudFront公開直後の観測
+
+新規アップロードでは、source PUT前にSDKでmanifestの不存在、CloudFrontで403/404を確認し、その後もS3とCloudFrontを独立して連続観測する。S3で初めて存在を確認する直前5秒以内に、S3不存在とCDNの否定応答の両観測が必要。
+
+復旧期限は最後のS3不存在リクエストの開始時刻から10秒で固定し、後続の403で延長しない。各SDK/CDN要求は2秒以内、ポーリング間隔は250 ms。アップロード・処理時間の予算とは分離する。S3 originの最小1秒のエラーキャッシュも含むテスト上の上限であり、AWSのSLAではない。
+
+`phase1-pipeline-evidence.json` の `diagnostics["browser-playback"].delivery` に元manifest情報、`publication` と `publicationSample` に単調時計による観測と最新sampleを残す。権限・通信エラーをS3不存在と扱わず失敗させる。
 
 ### 専用環境の固定時間設定
 
@@ -679,20 +732,13 @@ terraform -chdir=app/infra/terraform-e2e apply destroy.tfplan
 ```text
 npm --prefix app/frontend run test:e2e:helpers
 npm --prefix app/frontend run test:e2e:type-check
+npm --prefix app/frontend run test:e2e -- --list
+python app/scripts/run_reliability_e2e.py --check
+python app/scripts/validate_contracts.py
+python app/scripts/validate_terraform_contracts.py --stage delivery
 ```
 
-helpersはfake境界で認可・redaction・シナリオ・cleanup・設定生成を検証する。
-
-Terraformの変更を検証する場合（手動）:
-
-```text
-terraform -chdir=app/infra/terraform-e2e fmt -check
-terraform -chdir=app/infra/terraform-e2e init -backend=false
-terraform -chdir=app/infra/terraform-e2e validate
-terraform -chdir=app/infra/terraform-e2e test
-```
-
-initはprovider取得のため通信する。テストはmockで既存構成とE2E側の受け渡しを分けて検証し、AWSを操作しない。
+helpersはfake境界で認可・redaction・シナリオ・cleanup・設定生成に加え、配信policy、公開時点の観測、証跡選択と受入判定を検証する。Task 04のTerraform検証は上記の静的契約検証を使う。これらは実環境の成功証跡を代替しない。
 Workerのコンポーネント証跡も維持する。各テストは次の形式で選択できる。
 
 ```text
