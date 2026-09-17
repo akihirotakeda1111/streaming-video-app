@@ -49,9 +49,12 @@ for initial repository creation. The full plan requires both image digests and
 verifies their existence in ECR before creating task definitions, even at zero
 desired count.
 
-The image downloads the [AWS RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html)
-at build time to `/app/certs/rds-global-bundle.pem`, readable by API and migration.
-Download failure fails the build. Rebuild and deploy a new digest on CA updates.
+Both API and Worker images download the [AWS RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html)
+at build time to `/app/certs/rds-global-bundle.pem`, readable by their unprivileged
+users; migration uses the API image. Worker references this file through
+`DATABASE_CA_CERT_PATH`, while API and migration use `sslrootcert` in the URL.
+Download failure or an empty bundle fails the build. Rebuild and deploy new image
+digests on CA updates.
 
 ## 2. Full apply with API and Worker stopped
 

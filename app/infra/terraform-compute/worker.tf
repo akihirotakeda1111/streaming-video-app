@@ -40,7 +40,7 @@ locals {
       { name = "WORKER_LEASE_DURATION_SECONDS", value = tostring(local.shared.runtime_configuration.worker_lease_duration_seconds) },
       { name = "WORKER_RETRY_DELAY_SECONDS", value = tostring(local.shared.runtime_configuration.worker_retry_delay_seconds) },
       { name = "WORKER_MAXIMUM_ATTEMPTS", value = tostring(local.shared.runtime_configuration.worker_maximum_attempts) },
-      { name = "DATABASE_CA_CERT_PATH", value = "/etc/ssl/certs/ca-certificates.crt" },
+      { name = "DATABASE_CA_CERT_PATH", value = "/app/certs/rds-global-bundle.pem" },
       { name = "WORKER_MAX_SOURCE_BYTES", value = tostring(var.worker_max_source_bytes) },
       { name = "WORKER_MAX_TEMP_BYTES", value = tostring(var.worker_max_temp_bytes) },
       { name = "WORKER_DISK_RESERVE_BYTES", value = tostring(var.worker_disk_reserve_bytes) },

@@ -110,6 +110,10 @@ variable "api_desired_count" {
 variable "worker_desired_count" {
   type = number
   default = 1
+  validation {
+    condition     = var.worker_desired_count >= 0 && var.worker_desired_count <= 4 && floor(var.worker_desired_count) == var.worker_desired_count
+    error_message = "worker_desired_count must be a whole number between 0 and 4."
+  }
 }
 variable "worker_cpu" {
   type = number

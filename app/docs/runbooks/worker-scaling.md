@@ -47,7 +47,14 @@ encoding queue, canonical input reads, HLS output writes, and ECS task protectio
 on `arn:aws:ecs:<region>:<account>:task/<cluster-name>/*`;
 its execution role separately reads the application database secret and writes
 CloudWatch logs. `DATABASE_URL` must contain explicit `sslmode=verify-full` (the
-container supplies the system CA bundle at `/etc/ssl/certs/ca-certificates.crt`).
+container downloads the AWS RDS CA bundle at build time to
+`/app/certs/rds-global-bundle.pem`, matching API and migration).
+Terraform sets `DATABASE_CA_CERT_PATH` to that file, which is readable by the
+unprivileged Worker user. Download failure or an empty bundle fails the build.
+Rebuild and deploy a new image digest when the RDS CA bundle changes.
+
+`worker_desired_count` accepts only integers from 0 through 4. The example keeps
+it at zero for bootstrap; raise it to one only after migration succeeds.
 
 The deployment reserves 50 GiB of ephemeral storage, 1024 CPU units, 2048 MiB,
 and a 30-second stop timeout. The timeout exceeds the five-second runtime grace
