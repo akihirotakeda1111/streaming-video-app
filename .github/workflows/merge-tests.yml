@@ -93,8 +93,8 @@ jobs:
       - name: Validate API and storage contracts
         run: python app/scripts/validate_contracts.py
 
-      - name: Validate infrastructure reliability contracts
-        run: python app/scripts/validate_terraform_contracts.py --stage reliability
+      - name: Validate compute and shared delivery/reliability contracts
+        run: python app/scripts/validate_terraform_contracts.py --stage compute
 
   frontend:
     name: Frontend tests
