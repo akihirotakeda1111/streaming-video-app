@@ -1,5 +1,29 @@
 # Worker runtime handoff
 
+## Fargate deployment
+
+The compute root builds no image automatically. Build `app/backend/worker/Dockerfile`,
+push the image to the worker ECR repository, and set `worker_image_digest` to the
+immutable `sha256:` digest before applying. The service starts with one task and
+one receive slot; temporarily set `worker_desired_count = 2` to overlap distinct
+jobs during a migration. The database lease remains authoritative while the old
+local worker and ECS revisions overlap.
+
+The worker has no ALB target or inbound port. Its task role is limited to the
+encoding queue, canonical input reads, HLS output writes, and ECS task protection;
+its execution role separately reads the application database secret and writes
+CloudWatch logs. `DATABASE_URL` must contain explicit `sslmode=verify-full` (the
+container supplies the system CA bundle at `/etc/ssl/certs/ca-certificates.crt`).
+
+The deployment reserves 50 GiB of ephemeral storage, 1024 CPU units, 2048 MiB,
+and a 30-second stop timeout. The timeout exceeds the five-second runtime grace
+period plus protection-request and cleanup margin. Diagnose failures in order:
+ECR digest/image pull, task execution-role logs/secret access, database TLS and
+security-group connectivity, task-role SQS/S3 access, ECS protection acquire/
+renew/release, then ephemeral-disk limits. Confirm protection transitions in ECS
+task details before changing desired count; autoscaling policy and metrics belong
+to the later scaling task.
+
 Task 10 implements the application runtime. Tasks 11–13 own infrastructure,
 IAM, deployment resource allocation, and scaling policies.
 

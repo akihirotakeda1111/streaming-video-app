@@ -365,7 +365,7 @@ def check_foundation(config: Configuration, checks: Checks) -> None:
 
 
 def check_forbidden_resources(config: Configuration, checks: Checks, stage: str = "complete") -> None:
-    if stage == "compute":
+    if stage in {"compute", "workers"}:
         return
     for block in config.resources():
         forbidden = block.type_name in FORBIDDEN_RESOURCE_TYPES or block.type_name.startswith(
@@ -849,6 +849,23 @@ def _without_ecr_token_statements(policy: str) -> str:
     return policy
 
 
+def _without_ecs_protection_statements(policy: str) -> str:
+    """Allow ECS task protection's AWS-required Resource = * statement only."""
+    masked = STRING_RE.sub(lambda match: " " * len(match.group()), policy)
+    spans: list[tuple[int, int]] = []
+    for opening, char in enumerate(masked):
+        if char != "{":
+            continue
+        closing = _matching_brace(policy, opening, Path("IAM policy"))
+        body = policy[opening + 1:closing]
+        actions = _policy_actions(body)
+        if actions and actions <= {"ecs:updatetaskprotection", "ecs:gettaskprotection"} and _has_wildcard_resource(body):
+            spans.append((opening, closing + 1))
+    for start, end in reversed(spans):
+        policy = policy[:start] + " " * (end - start) + policy[end:]
+    return policy
+
+
 def check_dangerous_configuration(config: Configuration, checks: Checks, stage: str = "complete") -> None:
     for block in config.resources():
         if block.type_name == "aws_s3_bucket_acl":
@@ -863,7 +880,9 @@ def check_dangerous_configuration(config: Configuration, checks: Checks, stage: 
             checks.reject(_has_wildcard_action(policy), f"{block.location}: wildcard IAM actions are forbidden")
             # ECR's authorization-token API is the AWS-defined exception: it
             # requires Resource "*" even when all image actions are scoped.
-            scoped_policy = _without_ecr_token_statements(policy) if stage == "compute" else policy
+            scoped_policy = _without_ecr_token_statements(policy) if stage in {"compute", "workers"} else policy
+            if stage == "workers":
+                scoped_policy = _without_ecs_protection_statements(scoped_policy)
             checks.reject(
                 _has_wildcard_resource(scoped_policy),
                 f"{block.location}: wildcard IAM resources are forbidden",
@@ -1154,9 +1173,34 @@ def check_compute(config: Configuration, checks: Checks) -> None:
                    "ALB HTTPS listener must use an operator-supplied ACM certificate")
     checks.require(any("migration" in (block.name or "").lower()
                        for block in config.resources("aws_ecs_task_definition")),
-                   "a one-off migration task definition is required")
+                       "a one-off migration task definition is required")
     checks.require("0001_phase1_schema.up.sql" in config.text and "0002_job_lease_persistence.up.sql" in config.text,
                    "migration task must apply migrations 0001 and 0002")
+
+def check_workers(config: Configuration, checks: Checks) -> None:
+    """Check the Fargate worker deployment without evaluating Terraform."""
+    resources = {block.type_name for block in config.resources()}
+    for resource_type in ("aws_ecr_repository", "aws_ecs_task_definition", "aws_ecs_service", "aws_iam_role", "aws_iam_role_policy"):
+        checks.require(resource_type in resources, f"worker root requires {resource_type}")
+    worker_tasks = [block for block in config.resources("aws_ecs_task_definition") if "worker" in (block.name or "").lower() or "worker" in block.body.lower()]
+    worker_services = [block for block in config.resources("aws_ecs_service") if "worker" in (block.name or "").lower() or "worker" in block.body.lower()]
+    checks.require(bool(worker_tasks), "worker task definition is required")
+    checks.require(bool(worker_services), "worker ECS service is required")
+    for block in worker_tasks:
+        worker_configuration = config.text
+        checks.require("FARGATE" in block.body and "awsvpc" in block.body, f"{block.location}: worker must run on Fargate awsvpc")
+        checks.require("ephemeral_storage" in block.body and "stop_timeout" in block.body, f"{block.location}: worker storage and stop timeout must be bounded")
+        checks.require("WORKER_MAX_CONCURRENCY" in worker_configuration and '"1"' in worker_configuration, f"{block.location}: worker receive concurrency must start at one")
+        checks.require("WORKER_RUNTIME_MODE" in worker_configuration and '"ecs"' in worker_configuration, f"{block.location}: ECS runtime mode is required")
+        checks.require("secretsmanager" in worker_configuration and "DATABASE_URL" in worker_configuration, f"{block.location}: database URL must be injected from Secrets Manager")
+        checks.require("awslogs" in worker_configuration, f"{block.location}: worker logs must use CloudWatch")
+    for block in worker_services:
+        checks.require("desired_count" in block.body and "worker_desired_count" in block.body, f"{block.location}: worker desired count must be configurable")
+        checks.require("load_balancer" not in block.body, f"{block.location}: worker must not have an ALB target")
+    policy_text = "\n".join(_policy_text(config, block) for block in config.resources("aws_iam_role_policy") if "worker" in block.body.lower() or "worker" in (block.name or "").lower())
+    for action in ("sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "s3:GetObject", "s3:PutObject", "ecs:UpdateTaskProtection", "ecs:GetTaskProtection"):
+        checks.require(action.lower() in policy_text.lower(), f"worker task policy must allow {action}")
+    checks.require("aws_security_group.worker" in config.text, "worker service must attach the worker security group")
 
 def validate(config: Configuration, stage: str, shared_config: Configuration | None = None) -> list[str]:
     checks = Checks()
@@ -1168,6 +1212,9 @@ def validate(config: Configuration, stage: str, shared_config: Configuration | N
         check_compute(config, checks)
         shared = shared_config or load_configuration(config.root.parent / "terraform")
         checks.errors.extend(f"shared root: {error}" for error in validate(shared, "complete"))
+        return checks.errors
+    if stage == "workers":
+        check_workers(config, checks)
         return checks.errors
 
     input_name: str | None = None
@@ -1199,7 +1246,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("foundation", "storage-queue", "reliability", "delivery", "complete", "compute"),
+        choices=("foundation", "storage-queue", "reliability", "delivery", "complete", "compute", "workers"),
         default="complete",
         help="Task completion stage to validate (default: complete)",
     )
@@ -1210,7 +1257,7 @@ def main() -> int:
     args = parse_args()
     try:
         terraform_dir = args.terraform_dir.resolve()
-        if args.terraform_dir == Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform" and args.stage == "compute":
+        if terraform_dir == Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform" and args.stage in {"compute", "workers"}:
             terraform_dir = Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform-compute"
         config = load_configuration(terraform_dir)
         shared_config = load_configuration(args.shared_terraform_dir.resolve()) if args.shared_terraform_dir else None
