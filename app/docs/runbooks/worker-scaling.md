@@ -68,6 +68,218 @@ to the later scaling task.
 Task 10 implements the application runtime. Tasks 11–13 own infrastructure,
 IAM, deployment resource allocation, and scaling policies.
 
+## Live acceptance: startup, processing, protection, and recovery
+
+Run these checks in a dedicated test environment/queue after image bootstrap,
+secret setup, and successful migration. Use Bash with AWS CLI, Terraform and jq,
+with `AWS_REGION` and the intended operator credentials configured. Stop the local
+Worker for these checks so it cannot consume the test jobs. Use MP4 files within
+the configured source/duration limits, long enough to observe processing.
+Use the normal application upload flow so the video/job rows exist before the
+S3 notification arrives. Keep the job IDs, timestamps, task ARNs and log streams
+as evidence; do not record database credentials or presigned upload URLs.
+
+### 1. Confirm one ECS Worker starts
+
+Persist `worker_desired_count = 1` in `terraform.tfvars`, then review and apply:
+
+```bash
+terraform -chdir=app/infra/terraform-compute plan -out=worker-start.tfplan
+terraform -chdir=app/infra/terraform-compute apply worker-start.tfplan
+CLUSTER=$(terraform -chdir=app/infra/terraform-compute output -raw ecs_cluster)
+SERVICE=$(terraform -chdir=app/infra/terraform-compute output -raw worker_service)
+aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+SERVICE_STATE=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --output json)
+jq -e '(.failures | length) == 0 and (.services | length) == 1 and
+  .services[0].desiredCount == 1 and .services[0].runningCount == 1 and
+  .services[0].pendingCount == 0' <<< "$SERVICE_STATE"
+TASK=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" \
+  --desired-status RUNNING --query 'taskArns[0]' --output text)
+TASK_DEFINITION=$(jq -r '.services[0].taskDefinition' <<< "$SERVICE_STATE")
+LOG_GROUP=$(aws ecs describe-task-definition --task-definition "$TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name==`worker`].logConfiguration.options."awslogs-group" | [0]' --output text)
+aws logs tail "$LOG_GROUP" --since 10m --follow
+```
+
+Require `desired=1 / running=1 / pending=0` and `worker started` in the current
+task's `worker/worker/<task-id>` log stream. Check for DB/TLS, SQS, S3 initialization
+or subsequent request errors and repeated task restarts. Startup alone does not
+prove SQS/S3 permissions; confirm real processing below. Stop the log tail with
+Ctrl-C before continuing, or keep it running in another terminal. On waiter or
+count-check failure, inspect service events and stopped-task reasons before proceeding.
+
+### 2. Confirm normal processing with one Worker
+
+Upload one MP4 through the application and record its `VIDEO_ID` and `JOB_ID`.
+Watch application/API status and logs for `QUEUED -> PROCESSING -> COMPLETED`.
+The short `QUEUED` phase may be missed by polling; correlate the recorded
+transitions with logs rather than treating one final snapshot as evidence.
+
+Connect to the application database through the in-VPC, verified-TLS procedure
+in [cloud-runtime.md](cloud-runtime.md#3-create-the-application-role-through-an-in-vpc-ssm-host).
+In psql, substitute the actual job UUID and observe before, during and after encoding:
+
+```sql
+\set job_id 'REPLACE_WITH_JOB_UUID'
+SELECT clock_timestamp() AS observed_at, id, video_id, status, attempt,
+       worker_id, lease_expires_at,
+       (worker_id IS NOT NULL AND lease_expires_at > CURRENT_TIMESTAMP) AS valid_owner
+FROM jobs WHERE id = :'job_id'::uuid;
+\watch 1
+```
+
+Use autocommit, not a long-running transaction. During `PROCESSING`, require a
+non-NULL `worker_id`, a future `lease_expires_at`, and lease renewal while the job
+continues. After `COMPLETED`, both fields must be NULL. Correlate `worker_id`,
+`job_id` and `attempt` with `record outcome` logs in that task's log stream.
+Stop `\watch` with Ctrl-C.
+
+```bash
+VIDEO_ID=REPLACE_WITH_VIDEO_UUID
+JOB_ID=REPLACE_WITH_JOB_UUID
+OUTPUT_BUCKET=$(terraform -chdir=app/infra/terraform output -raw video_output_bucket_name)
+aws s3 ls "s3://$OUTPUT_BUCKET/videos/$VIDEO_ID/jobs/$JOB_ID/hls/" --recursive
+```
+
+Require the HLS manifest and referenced segments, then play the completed video
+through the application's CloudFront playback URL. Object presence alone is not
+a playback check. If the shared root is elsewhere, use that root for its outputs.
+
+### 3. Confirm Task Protection during and after processing
+
+While the job is still processing, refresh the service's current Worker task ARN
+immediately before checking protection. Do not reuse the ARN from step 1: the
+task may have restarted. This step expects exactly one running Worker; if the
+checks fail, inspect service stability and retry rather than selecting an
+arbitrary task. Correlate the refreshed ARN's log stream with the job's current
+owner before interpreting the protection result.
+
+```bash
+TASKS=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" \
+  --desired-status RUNNING --output json) || exit 1
+TASK=$(jq -er '.taskArns | select(length == 1) | .[0]' <<< "$TASKS") || exit 1
+aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" --output json \
+  | jq -e '(.failures | length) == 0 and (.tasks | length) == 1 and
+    .tasks[0].lastStatus == "RUNNING"' || exit 1
+PROTECTION=$(aws ecs get-task-protection --cluster "$CLUSTER" --tasks "$TASK" --output json)
+jq -e --arg task "$TASK" '(.failures | length) == 0 and
+  any(.protectedTasks[]; .taskArn == $task and .protectionEnabled == true)' <<< "$PROTECTION"
+jq '.protectedTasks[] | {taskArn, protectionEnabled, expirationDate}' <<< "$PROTECTION"
+```
+
+Require `protectionEnabled=true` and a future expiration. For a long job, repeat
+the query and confirm expiration is renewed. After completion, stop submitting
+work and observe the idle release window:
+
+```bash
+for observation in {1..45}; do
+  date -u +%FT%TZ
+  aws ecs get-task-protection --cluster "$CLUSTER" --tasks "$TASK" --output json
+  sleep 2
+done
+```
+
+Confirm a successful response with `protectionEnabled=false`. Release occurs
+after an empty receive with no active work or pending receive, not necessarily
+at the instant the job completes. The Worker releases for ten seconds and then
+reacquires before polling, so a later `true` value is expected. Correlate this
+with completion/idle timing and protection errors in CloudWatch. The current
+runtime does not emit a dedicated successful acquire/release log; use ECS/API
+state as the evidence, not absence of errors. A response with `failures` is not
+proof of release. See [get-task-protection](https://docs.aws.amazon.com/cli/latest/reference/ecs/get-task-protection.html).
+
+### 4. Confirm parallel work and duplicate-delivery ownership with two Workers
+
+Persist `worker_desired_count = 2`, then review and apply a fresh full plan:
+
+```bash
+terraform -chdir=app/infra/terraform-compute plan -out=worker-two.tfplan
+terraform -chdir=app/infra/terraform-compute apply worker-two.tfplan
+aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --output json \
+  | jq -e '(.failures | length) == 0 and (.services | length) == 1 and
+    .services[0].desiredCount == 2 and .services[0].runningCount == 2 and
+    .services[0].pendingCount == 0'
+aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" \
+  --desired-status RUNNING --output json
+```
+
+Upload two MP4s almost simultaneously. Query both job rows with
+`WHERE id IN ('<job-1-uuid>'::uuid, '<job-2-uuid>'::uuid)` using the columns above.
+Require overlapping `PROCESSING` observations with two different `worker_id`
+values and unexpired leases. Match each to `outcome="acquired"` in a different
+task log stream, and require both jobs to complete and play successfully.
+
+For duplicate delivery, start a fresh sufficiently long job and leave the second
+Worker free. While the first holds a valid lease, send a synthetic S3 event
+for the same existing object/job into the dedicated test queue. The payload below
+is a minimal notification payload accepted by the current Worker parser, not a
+complete reproduction of an actual S3 notification. It exercises duplicate-job
+handling through SQS; it does not verify the full S3 notification format or the
+S3-to-SQS delivery path. Revisit this payload if parser requirements change. Set `VIDEO_ID`
+and `JOB_ID` to this fresh job. The operator needs `sqs:SendMessage`; do not grant
+that permission to the Worker role or overwrite the source object.
+
+```bash
+INPUT_BUCKET=$(terraform -chdir=app/infra/terraform output -raw video_input_bucket_name)
+QUEUE_URL=$(terraform -chdir=app/infra/terraform output -raw video_encoding_queue_url)
+DUPLICATE_EVENT=$(jq -nc --arg bucket "$INPUT_BUCKET" \
+  --arg key "videos/$VIDEO_ID/jobs/$JOB_ID/source.mp4" \
+  '{Records:[{eventSource:"aws:s3",eventName:"ObjectCreated:Put",
+    s3:{bucket:{name:$bucket},object:{key:$key}}}]}')
+aws sqs send-message --queue-url "$QUEUE_URL" --message-body "$DUPLICATE_EVENT"
+```
+
+Require the other Worker to log `outcome="busy"` for this job while the original
+lease remains valid; its duplicate must not acquire ownership or increment the
+attempt. Observe a stable owner in DB, renewed lease, and no overlapping
+`acquired` outcomes for different owners. A single DB row/snapshot alone cannot
+prove absence of competing work: retain the timed DB observations and both task
+logs. After completion, any duplicate redelivery should log `already_completed`
+without re-encoding or changing `COMPLETED`. If the duplicate is received only
+after completion, the overlap check is inconclusive; repeat with a longer job.
+
+### 5. Confirm recovery after StopTask
+
+After the two-Worker checks finish, persist `worker_desired_count = 1`, apply a
+fresh full plan, and repeat the step 1 stability/count check. This makes the
+replacement task the only candidate to recover the job. Idle protection may
+delay scale-in until its release window.
+
+Upload a new long MP4, with attempt budget remaining. While it is `PROCESSING`,
+record the job's owner, attempt, lease expiry, and owning task ARN from the log
+stream. Set `TASK` to that exact active task and confirm the job has not completed.
+Then stop it once:
+
+```bash
+STOPPED_TASK=$TASK
+aws ecs stop-task --cluster "$CLUSTER" --task "$STOPPED_TASK" \
+  --reason "Dedicated Worker recovery acceptance"
+aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$STOPPED_TASK"
+aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+  --query 'services[].{desired:desiredCount,running:runningCount,pending:pendingCount}' --output table
+TASK=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" \
+  --desired-status RUNNING --query 'taskArns[0]' --output text)
+test "$TASK" != "None" && test "$TASK" != "$STOPPED_TASK"
+```
+
+Require service counts `1 / 1 / 0`, a new task ARN and `worker started` in its log
+stream. [StopTask](https://docs.aws.amazon.com/cli/latest/reference/ecs/stop-task.html)
+sends SIGTERM before forced termination if needed; task scale-in protection does
+not prevent this explicit stop. Inspect old-task shutdown logs and ECS stop reason.
+
+Observe DB and logs until both the previous lease and SQS visibility have expired
+and the replacement reacquires the same job. Use the configured heartbeat, lease
+and visibility-extension values; do not assume immediate redelivery. Require a
+new `worker_id`, a higher `attempt`, `outcome="acquired"` in the replacement's
+stream, and eventual `COMPLETED` with both lease fields NULL. Verify HLS playback
+again. Do not manually clear the lease, delete messages, or change visibility to
+force this test to pass. If the job completed before shutdown took effect, repeat
+with a longer input. If recovery fails, inspect expiry timing, attempt exhaustion,
+DLQ, task events and DB/SQS/S3/protection errors, and record the failure rather
+than treating replacement startup alone as successful recovery.
+
 ## Runtime configuration
 
 All numeric settings are decimal positive integers; invalid values fail startup.
