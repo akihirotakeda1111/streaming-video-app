@@ -364,7 +364,9 @@ def check_foundation(config: Configuration, checks: Checks) -> None:
         )
 
 
-def check_forbidden_resources(config: Configuration, checks: Checks) -> None:
+def check_forbidden_resources(config: Configuration, checks: Checks, stage: str = "complete") -> None:
+    if stage == "compute":
+        return
     for block in config.resources():
         forbidden = block.type_name in FORBIDDEN_RESOURCE_TYPES or block.type_name.startswith(
             FORBIDDEN_RESOURCE_PREFIXES
@@ -815,7 +817,7 @@ def _has_public_principal(policy: str) -> bool:
     ) is not None
 
 
-def check_dangerous_configuration(config: Configuration, checks: Checks) -> None:
+def check_dangerous_configuration(config: Configuration, checks: Checks, stage: str = "complete") -> None:
     for block in config.resources():
         if block.type_name == "aws_s3_bucket_acl":
             values = _lower_strings(block.body)
@@ -827,7 +829,13 @@ def check_dangerous_configuration(config: Configuration, checks: Checks) -> None
         if block.type_name in POLICY_RESOURCE_TYPES:
             policy = _policy_text(config, block)
             checks.reject(_has_wildcard_action(policy), f"{block.location}: wildcard IAM actions are forbidden")
-            checks.reject(_has_wildcard_resource(policy), f"{block.location}: wildcard IAM resources are forbidden")
+            # ECR's authorization-token API is the AWS-defined exception: it
+            # requires Resource "*" even when all image actions are scoped.
+            ecr_token_only = stage == "compute" and "ecr:getauthorizationtoken" in _policy_actions(policy)
+            checks.reject(
+                _has_wildcard_resource(policy) and not ecr_token_only,
+                f"{block.location}: wildcard IAM resources are forbidden",
+            )
             if _has_public_principal(policy):
                 checks.reject(
                     bool(_policy_actions(policy) & WRITE_ACTIONS),
@@ -929,6 +937,7 @@ def check_reliability(
             _attribute(source.body, "visibility_timeout_seconds") is not None,
             f"{source.location}: source visibility timeout must be explicit",
         )
+
         checks.require(
             _has(source.body, "redrive_policy")
             and dlq_name is not None
@@ -1077,11 +1086,55 @@ def check_reliability(
             f"{block.location}: worker policy must not send to the DLQ or purge queues",
         )
 
+
+def check_compute(config: Configuration, checks: Checks) -> None:
+    """Check the Phase 3 compute root without evaluating Terraform or AWS."""
+    resources = {block.type_name for block in config.resources()}
+    required = {
+        "aws_vpc", "aws_subnet", "aws_security_group", "aws_db_subnet_group",
+        "aws_db_instance", "aws_ecs_cluster", "aws_ecs_task_definition",
+        "aws_ecs_service", "aws_lb", "aws_lb_listener", "aws_ecr_repository",
+        "aws_cloudwatch_log_group", "aws_iam_role", "aws_iam_role_policy",
+    }
+    for resource_type in sorted(required):
+        checks.require(resource_type in resources, f"compute root requires {resource_type}")
+
+    checks.require("terraform_remote_state" in {b.type_name for b in config.data()},
+                   "compute root must consume the shared S3/SQS root through remote state")
+    checks.require(any("source.mp4" in block.body and "s3" in block.body.lower()
+                       for block in config.resources("aws_iam_role_policy")),
+                   "API role must retain only presigned source upload access")
+    checks.require(any("manage_master_user_password" in block.body
+                       for block in config.resources("aws_db_instance")),
+                   "RDS administration must use the service-managed password")
+    for block in config.resources("aws_db_instance"):
+        checks.require("publicly_accessible" in block.body and "false" in block.body,
+                       f"{block.location}: RDS must be private")
+        checks.require("storage_encrypted" in block.body and "true" in block.body,
+                       f"{block.location}: RDS storage encryption is required")
+    checks.require(any("5432" in block.body and "aws_security_group" in block.body
+                       for block in config.resources("aws_security_group_rule")),
+                   "database ingress must be restricted to application security groups")
+    checks.require(not any("worker" in (block.name or "").lower()
+                           for block in config.resources("aws_ecs_service")),
+                   "compute root must not deploy the worker service")
+    checks.require(any("acm_certificate" in block.body for block in config.resources("aws_lb_listener")),
+                   "ALB HTTPS listener must use an operator-supplied ACM certificate")
+    checks.require(any("migration" in (block.name or "").lower()
+                       for block in config.resources("aws_ecs_task_definition")),
+                   "a one-off migration task definition is required")
+    checks.require("0001_phase1_schema.up.sql" in config.text and "0002_job_lease_persistence.up.sql" in config.text,
+                   "migration task must apply migrations 0001 and 0002")
+
 def validate(config: Configuration, stage: str) -> list[str]:
     checks = Checks()
     check_foundation(config, checks)
-    check_forbidden_resources(config, checks)
-    check_dangerous_configuration(config, checks)
+    check_forbidden_resources(config, checks, stage)
+    check_dangerous_configuration(config, checks, stage)
+
+    if stage == "compute":
+        check_compute(config, checks)
+        return checks.errors
 
     input_name: str | None = None
     output_name: str | None = None
@@ -1107,7 +1160,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("foundation", "storage-queue", "reliability", "delivery", "complete"),
+        choices=("foundation", "storage-queue", "reliability", "delivery", "complete", "compute"),
         default="complete",
         help="Task completion stage to validate (default: complete)",
     )
@@ -1117,7 +1170,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        config = load_configuration(args.terraform_dir.resolve())
+        terraform_dir = args.terraform_dir.resolve()
+        if args.terraform_dir == Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform" and args.stage == "compute":
+            terraform_dir = Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform-compute"
+        config = load_configuration(terraform_dir)
         errors = validate(config, args.stage)
     except TerraformContractError as exc:
         print(f"Terraform contract validation failed: {exc}", file=sys.stderr)
