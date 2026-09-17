@@ -18,7 +18,7 @@ resource "aws_iam_role_policy" "execution" {
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = ["ecr:GetAuthorizationToken"], Resource = "*" },
     { Effect = "Allow", Action = ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage"], Resource = aws_ecr_repository.api.arn },
-    { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.api.arn}:*" },
+    { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = ["${aws_cloudwatch_log_group.api.arn}:*", "${aws_cloudwatch_log_group.migration.arn}:*"] },
     { Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = var.database_url_secret_arn },
   ] })
 }
@@ -43,4 +43,10 @@ resource "aws_ecr_repository" "api" {
 data "aws_ecr_image" "api" {
   repository_name = aws_ecr_repository.api.name
   image_digest    = var.api_image_digest
+  lifecycle {
+    precondition {
+      condition     = var.api_image_digest != null
+      error_message = "Bootstrap the ECR repository, push the API image, and set api_image_digest before full apply."
+    }
+  }
 }

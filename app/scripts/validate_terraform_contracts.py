@@ -817,6 +817,38 @@ def _has_public_principal(policy: str) -> bool:
     ) is not None
 
 
+def _without_ecr_token_statements(policy: str) -> str:
+    """Remove only literal, token-only statement objects, never a whole policy."""
+    masked = STRING_RE.sub(lambda match: " " * len(match.group()), policy)
+    spans: list[tuple[int, int]] = []
+    for opening, char in enumerate(masked):
+        if char != "{":
+            continue
+        closing = _matching_brace(policy, opening, Path("IAM policy"))
+        # A statement can contain a Condition object; inspect only its direct
+        # attributes so a nested token statement cannot exempt its parent.
+        body = policy[opening + 1:closing]
+        direct = STRING_RE.sub(lambda match: " " * len(match.group()), body)
+        cursor = 0
+        while cursor < len(direct):
+            if direct[cursor] == "{":
+                end = _matching_brace(body, cursor, Path("IAM statement"))
+                body = body[:cursor] + " " * (end + 1 - cursor) + body[end + 1:]
+                cursor = end
+            cursor += 1
+        if re.search(
+            r'(?i)(?:"Action"|"actions"|\bAction\b|\bactions\b)\s*[:=]\s*'
+            r'(?:\[\s*"ecr:GetAuthorizationToken"\s*,?\s*\]|"ecr:GetAuthorizationToken")'
+            r'\s*(?=,|\n|$)', body
+        ) and _policy_actions(body) == {"ecr:getauthorizationtoken"} and not re.search(
+            r'(?i)\bnot_?action', body
+        ):
+            spans.append((opening, closing + 1))
+    for start, end in reversed(spans):
+        policy = policy[:start] + " " * (end - start) + policy[end:]
+    return policy
+
+
 def check_dangerous_configuration(config: Configuration, checks: Checks, stage: str = "complete") -> None:
     for block in config.resources():
         if block.type_name == "aws_s3_bucket_acl":
@@ -831,9 +863,9 @@ def check_dangerous_configuration(config: Configuration, checks: Checks, stage: 
             checks.reject(_has_wildcard_action(policy), f"{block.location}: wildcard IAM actions are forbidden")
             # ECR's authorization-token API is the AWS-defined exception: it
             # requires Resource "*" even when all image actions are scoped.
-            ecr_token_only = stage == "compute" and "ecr:getauthorizationtoken" in _policy_actions(policy)
+            scoped_policy = _without_ecr_token_statements(policy) if stage == "compute" else policy
             checks.reject(
-                _has_wildcard_resource(policy) and not ecr_token_only,
+                _has_wildcard_resource(scoped_policy),
                 f"{block.location}: wildcard IAM resources are forbidden",
             )
             if _has_public_principal(policy):
@@ -1126,7 +1158,7 @@ def check_compute(config: Configuration, checks: Checks) -> None:
     checks.require("0001_phase1_schema.up.sql" in config.text and "0002_job_lease_persistence.up.sql" in config.text,
                    "migration task must apply migrations 0001 and 0002")
 
-def validate(config: Configuration, stage: str) -> list[str]:
+def validate(config: Configuration, stage: str, shared_config: Configuration | None = None) -> list[str]:
     checks = Checks()
     check_foundation(config, checks)
     check_forbidden_resources(config, checks, stage)
@@ -1134,6 +1166,8 @@ def validate(config: Configuration, stage: str) -> list[str]:
 
     if stage == "compute":
         check_compute(config, checks)
+        shared = shared_config or load_configuration(config.root.parent / "terraform")
+        checks.errors.extend(f"shared root: {error}" for error in validate(shared, "complete"))
         return checks.errors
 
     input_name: str | None = None
@@ -1159,6 +1193,11 @@ def parse_args() -> argparse.Namespace:
         help="Terraform root to inspect (default: app/infra/terraform)",
     )
     parser.add_argument(
+        "--shared-terraform-dir",
+        type=Path,
+        help="Shared delivery/reliability root for compute (default: sibling terraform directory)",
+    )
+    parser.add_argument(
         "--stage",
         choices=("foundation", "storage-queue", "reliability", "delivery", "complete", "compute"),
         default="complete",
@@ -1174,7 +1213,8 @@ def main() -> int:
         if args.terraform_dir == Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform" and args.stage == "compute":
             terraform_dir = Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform-compute"
         config = load_configuration(terraform_dir)
-        errors = validate(config, args.stage)
+        shared_config = load_configuration(args.shared_terraform_dir.resolve()) if args.shared_terraform_dir else None
+        errors = validate(config, args.stage, shared_config)
     except TerraformContractError as exc:
         print(f"Terraform contract validation failed: {exc}", file=sys.stderr)
         return 1

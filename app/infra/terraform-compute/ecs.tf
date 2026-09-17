@@ -33,7 +33,8 @@ resource "aws_ecs_task_definition" "migration" {
   execution_role_arn       = aws_iam_role.execution.arn
   container_definitions = jsonencode([{
     name = "migration", image = local.api_image, essential = true,
-    command = ["/bin/sh", "-c", "for f in /app/migrations/0001_phase1_schema.up.sql /app/migrations/0002_job_lease_persistence.up.sql; do psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f \"$f\"; done"],
+    entryPoint = ["/bin/sh", "-ec"],
+    command = ["for f in /app/migrations/0001_phase1_schema.up.sql /app/migrations/0002_job_lease_persistence.up.sql; do psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f \"$f\"; done"],
     secrets = [{ name = "DATABASE_URL", valueFrom = var.database_url_secret_arn }]
     logConfiguration = { logDriver = "awslogs", options = { awslogs-group = aws_cloudwatch_log_group.migration.name, awslogs-region = var.aws_region, awslogs-stream-prefix = "migration" } }
   }])

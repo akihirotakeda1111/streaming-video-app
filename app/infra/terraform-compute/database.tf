@@ -1,6 +1,6 @@
 resource "aws_db_subnet_group" "main" {
   name       = local.name
-  subnet_ids = [aws_subnet.private_db.id]
+  subnet_ids = aws_subnet.private_db[*].id
 }
 
 resource "aws_db_instance" "postgres" {
@@ -22,5 +22,11 @@ resource "aws_db_instance" "postgres" {
   deletion_protection         = false
 }
 
-resource "aws_cloudwatch_log_group" "api" { name = "/ecs/${local.name}/api", retention_in_days = 7 }
-resource "aws_cloudwatch_log_group" "migration" { name = "/ecs/${local.name}/migration", retention_in_days = 7 }
+resource "aws_cloudwatch_log_group" "api" {
+  name              = "/ecs/${local.name}/api"
+  retention_in_days = 7
+}
+resource "aws_cloudwatch_log_group" "migration" {
+  name              = "/ecs/${local.name}/migration"
+  retention_in_days = 7
+}

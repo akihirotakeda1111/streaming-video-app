@@ -15,9 +15,15 @@ resource "aws_subnet" "public" {
 }
 
 resource "aws_subnet" "private_db" {
+  count             = 2
   vpc_id            = aws_vpc.main.id
-  cidr_block        = cidrsubnet(var.vpc_cidr, 4, 8)
-  availability_zone = data.aws_availability_zones.available.names[0]
+  cidr_block        = cidrsubnet(var.vpc_cidr, 4, 8 + count.index)
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+}
+
+moved {
+  from = aws_subnet.private_db
+  to   = aws_subnet.private_db[0]
 }
 
 resource "aws_internet_gateway" "main" { vpc_id = aws_vpc.main.id }
@@ -35,8 +41,14 @@ resource "aws_route_table_association" "public" {
 }
 resource "aws_route_table" "private_db" { vpc_id = aws_vpc.main.id }
 resource "aws_route_table_association" "private_db" {
-  subnet_id      = aws_subnet.private_db.id
+  count          = 2
+  subnet_id      = aws_subnet.private_db[count.index].id
   route_table_id = aws_route_table.private_db.id
+}
+
+moved {
+  from = aws_route_table_association.private_db
+  to   = aws_route_table_association.private_db[0]
 }
 
 resource "aws_security_group" "alb" {

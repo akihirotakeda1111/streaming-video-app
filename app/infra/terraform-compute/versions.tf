@@ -21,7 +21,7 @@ data "terraform_remote_state" "shared" {
 locals {
   name = "${var.project_name}-${var.environment}"
   shared = data.terraform_remote_state.shared.outputs
-  api_image = "${aws_ecr_repository.api.repository_url}@${var.api_image_digest}"
+  api_image = "${aws_ecr_repository.api.repository_url}@${data.aws_ecr_image.api.image_digest}"
   api_env = [
     { name = "HTTP_ADDR", value = "0.0.0.0:8080" },
     { name = "AWS_REGION", value = var.aws_region },
@@ -33,46 +33,88 @@ locals {
   ]
 }
 
-variable "allowed_account_ids" { type = list(string)
-  default = [] }
-variable "resource_tags" { type = map(string)
-  default = {} }
-variable "project_name" { type = string
-  default = "streaming-video" }
-variable "environment" { type = string
-  default = "dev" }
-variable "aws_region" { type = string
-  default = "ap-northeast-1" }
-variable "shared_state_path" { type = string
-  description = "Path to the state of app/infra/terraform." }
-variable "frontend_origin" { type = string
-  description = "The exact browser frontend origin." }
-variable "acm_certificate_arn" { type = string
-  description = "Operator-supplied ACM certificate in the ALB region." }
+variable "allowed_account_ids" {
+  type = list(string)
+  default = []
+}
+variable "resource_tags" {
+  type = map(string)
+  default = {}
+}
+variable "project_name" {
+  type = string
+  default = "streaming-video"
+}
+variable "environment" {
+  type = string
+  default = "dev"
+}
+variable "aws_region" {
+  type = string
+  default = "ap-northeast-1"
+}
+variable "shared_state_path" {
+  type = string
+  description = "Path to the state of app/infra/terraform."
+}
+variable "frontend_origin" {
+  type = string
+  description = "The exact browser frontend origin."
+}
+variable "acm_certificate_arn" {
+  type = string
+  description = "Operator-supplied ACM certificate in the ALB region."
+}
 variable "api_image_digest" {
   type        = string
   description = "Immutable API ECR image digest (sha256:...)."
-  validation { condition = can(regex("^sha256:[0-9a-f]{64}$", var.api_image_digest)), error_message = "api_image_digest must be a sha256 digest." }
+  default     = null
+  validation {
+    condition     = var.api_image_digest == null ? true : can(regex("^sha256:[0-9a-f]{64}$", var.api_image_digest))
+    error_message = "api_image_digest must be a sha256 digest."
+  }
 }
-variable "database_url_secret_arn" { type = string
-  description = "Secrets Manager ARN containing the non-admin application DATABASE_URL." }
-variable "database_name" { type = string
-  default = "video" }
-variable "database_username" { type = string
-  default = "rdsadmin" }
-variable "db_instance_class" { type = string
-  default = "db.t4g.micro" }
-variable "db_allocated_storage" { type = number
-  default = 20 }
-variable "api_desired_count" { type = number
-  default = 1 }
-variable "vpc_cidr" { type = string
-  default = "10.42.0.0/16" }
-variable "api_cpu" { type = number
-  default = 256 }
-variable "api_memory" { type = number
-  default = 512 }
-variable "migration_cpu" { type = number
-  default = 256 }
-variable "migration_memory" { type = number
-  default = 512 }
+variable "database_url_secret_arn" {
+  type = string
+  description = "Secrets Manager ARN containing the non-admin application DATABASE_URL."
+}
+variable "database_name" {
+  type = string
+  default = "video"
+}
+variable "database_username" {
+  type = string
+  default = "video_admin"
+}
+variable "db_instance_class" {
+  type = string
+  default = "db.t4g.micro"
+}
+variable "db_allocated_storage" {
+  type = number
+  default = 20
+}
+variable "api_desired_count" {
+  type = number
+  default = 0
+}
+variable "vpc_cidr" {
+  type = string
+  default = "10.42.0.0/16"
+}
+variable "api_cpu" {
+  type = number
+  default = 256
+}
+variable "api_memory" {
+  type = number
+  default = 512
+}
+variable "migration_cpu" {
+  type = number
+  default = 256
+}
+variable "migration_memory" {
+  type = number
+  default = 512
+}
