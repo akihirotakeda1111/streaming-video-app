@@ -1240,25 +1240,69 @@ def check_scaling(config: Configuration, checks: Checks) -> None:
                    "scaling target must use the ECS service namespace")
     checks.require("ecs:service:DesiredCount" in scaling_text,
                    "scaling target must control ECS service desired count")
-    checks.require("min_capacity" in scaling_text and re.search(r"\bmin_capacity\s*=\s*1\b", scaling_text) is not None,
-                   "scaling minimum capacity must be one")
-    checks.require("max_capacity" in scaling_text and re.search(r"\bmax_capacity\s*=\s*4\b", scaling_text) is not None,
-                   "scaling maximum capacity must be four")
+    variables = {block.type_name: block for block in config.blocks if block.kind == "variable"}
+    enabled = variables.get("worker_autoscaling_enabled")
+    checks.require(enabled is not None and _attribute(enabled.body, "default") == "false",
+                   "worker autoscaling must default to disabled for bootstrap")
+    for block in targets + policies:
+        checks.require(_attribute(block.body, "count") == "var.worker_autoscaling_enabled ? 1 : 0",
+                       f"{block.location}: autoscaling must be gated until bootstrap completes")
+    for capacity, default in (("min", "1"), ("max", "4")):
+        name = f"worker_autoscaling_{capacity}_capacity"
+        variable = variables.get(name)
+        checks.require(variable is not None and _attribute(variable.body, "default") == default,
+                       f"autoscaling {capacity} capacity must default to {default}")
+        for target in targets:
+            checks.require(_attribute(target.body, f"{capacity}_capacity") == f"var.{name}",
+                           f"autoscaling {capacity} capacity must be configurable")
     checks.require("scale_out_cooldown" in scaling_text and "scale_in_cooldown" in scaling_text,
                    "scaling must configure bounded scale-out and scale-in cooldowns")
-    checks.require("ECS/ContainerInsights" in scaling_text and "RunningTaskCount" in scaling_text,
-                   "scaling must use ContainerInsights RunningTaskCount")
-    checks.require("ClusterName" in scaling_text and "ServiceName" in scaling_text,
-                   "RunningTaskCount must identify the exact cluster and worker service")
-    checks.require('value = aws_ecs_cluster.main.name' in scaling_text and
-                   'value = aws_ecs_service.worker.name' in scaling_text,
-                   "RunningTaskCount dimensions must use the worker cluster and service")
-    checks.require("AWS/SQS" in scaling_text and "ApproximateNumberOfMessagesVisible" in scaling_text,
-                   "scaling must use visible SQS backlog")
-    checks.require("QueueName" in scaling_text,
-                   "visible backlog must identify the exact SQS queue")
-    checks.require("value = local.worker_queue_name" in scaling_text,
-                   "visible backlog dimension must use the worker queue name")
+    expected_metrics = (
+        ("visible_backlog", "AWS/SQS", "ApproximateNumberOfMessagesVisible", "Sum",
+         {"QueueName": "local.worker_queue_name"}),
+        ("running_tasks", "ECS/ContainerInsights", "RunningTaskCount", "Average",
+         {"ClusterName": "aws_ecs_cluster.main.name", "ServiceName": "aws_ecs_service.worker.name"}),
+    )
+    diagnostics = [block for block in config.resources("aws_cloudwatch_metric_alarm")
+                   if block.name == "worker_backlog_per_task_diagnostic"]
+    checks.require(len(diagnostics) == 1, "backlog diagnostic alarm is required")
+    for block in policies + diagnostics:
+        diagnostic = block.type_name == "aws_cloudwatch_metric_alarm"
+        queries = _nested_bodies(block.body, "metric_query" if diagnostic else "metrics")
+        for identifier, namespace, metric_name, statistic, dimensions in expected_metrics:
+            selected = [query for query in queries if _attribute(query, "id") == f'"{identifier}"']
+            checks.require(len(selected) == 1, f"{block.location}: require exactly one {identifier} query")
+            for query in selected:
+                stats = [query] if diagnostic else _nested_bodies(query, "metric_stat")
+                checks.require(len(stats) == 1, f"{identifier}: require one metric_stat")
+                for stat in stats:
+                    metrics = _nested_bodies(stat, "metric")
+                    checks.require(len(metrics) == 1, f"{identifier}: require one metric block")
+                    checks.reject(not diagnostic and _attribute(stat, "period") is not None,
+                                  f"{identifier}: Application Auto Scaling does not support period")
+                    for metric in metrics:
+                        checks.require(_attribute(metric, "namespace") == f'"{namespace}"' and
+                                       _attribute(metric, "metric_name") == f'"{metric_name}"',
+                                       f"{identifier}: incorrect namespace or metric name")
+                        checks.require(_attribute(metric if diagnostic else stat, "stat") == f'"{statistic}"',
+                                       f"{identifier}: statistic must be {statistic}")
+                        if diagnostic:
+                            checks.require(_attribute(metric, "period") == "60",
+                                           f"{identifier}: diagnostic period must be 60 seconds")
+                            match = re.search(r"\bdimensions\s*=\s*\{", metric)
+                            body = metric[match.end():_matching_brace(metric, match.end() - 1, block.path)] if match else ""
+                            pairs = dict(re.findall(r"(\w+)\s*=\s*([\w.]+)", body))
+                        else:
+                            bodies = _nested_bodies(metric, "dimensions")
+                            pairs = {(_attribute(body, "name") or "").strip('"'): _attribute(body, "value")
+                                     for body in bodies}
+                            checks.require(len(bodies) == len(dimensions), f"{identifier}: unexpected dimensions")
+                        checks.require(pairs == dimensions,
+                                       f"{identifier}: dimension names must match their exact metric values")
+        expressions = [query for query in queries if _attribute(query, "id") == '"backlog_per_worker"']
+        checks.require(len(expressions) == 1 and
+                       _attribute(expressions[0], "expression") == '"visible_backlog / running_tasks"',
+                       f"{block.location}: backlog expression must divide visible backlog by running tasks")
     checks.require('resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.worker.name}"' in scaling_text,
                    "scaling target must identify the worker service in the worker cluster")
     checks.require("expression" in scaling_text and re.search(r"visible_backlog\s*/\s*running_tasks", scaling_text) is not None,
@@ -1267,10 +1311,6 @@ def check_scaling(config: Configuration, checks: Checks) -> None:
                    "scaling must not convert missing data or a zero divisor into zero load")
     checks.require('treat_missing_data  = "missing"' in config.text,
                    "scaling diagnostics must preserve missing metric data")
-    checks.require("period" in scaling_text and re.search(r"\bperiod\s*=\s*60\b", scaling_text) is not None,
-                   "scaling metrics must specify a 60-second period")
-    checks.require("stat" in scaling_text and 'stat = "Average"' in scaling_text,
-                   "scaling metrics must specify Average statistics")
     checks.require("worker_acceptable_queue_delay_seconds" in scaling_text and
                    "worker_representative_processing_seconds" in scaling_text,
                    "scaling target must start from queue delay divided by representative processing time")

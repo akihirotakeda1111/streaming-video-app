@@ -9,4 +9,7 @@ api_desired_count       = 0 # Raise only after successful migration.
 # Leave unset for the initial -target=aws_ecr_repository.worker apply.
 # Push the Worker image, then set its real ECR digest before full apply.
 # worker_image_digest = "sha256:..."
-worker_desired_count    = 0 # Raise to 1 only after secret setup and successful migration; integer range 0..4.
+worker_desired_count    = 0 # Initial service creation only; autoscaling owns subsequent capacity.
+worker_autoscaling_enabled = false # Enable only after secret setup and successful migration.
+worker_autoscaling_min_capacity = 1
+worker_autoscaling_max_capacity = 4

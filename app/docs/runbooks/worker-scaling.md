@@ -5,7 +5,7 @@
 The compute root builds no image automatically. For the first deployment, create
 the worker ECR repository before pushing an image. Configure the compute variables
 as described in [cloud-runtime.md](cloud-runtime.md), leave `worker_image_digest`
-unset, and set `worker_desired_count = 0` until the database secret and migrations
+unset, and set `worker_desired_count = 0` and `worker_autoscaling_enabled = false` until the database secret and migrations
 are ready. From the repository root, in Bash with `AWS_REGION` set:
 
 ```bash
@@ -33,12 +33,12 @@ terraform -chdir=app/infra/terraform-compute plan -out=worker.tfplan
 terraform -chdir=app/infra/terraform-compute apply worker.tfplan
 ```
 
-For a new environment, keep both desired counts at zero and complete the secret
+For a new environment, keep both desired counts at zero and autoscaling disabled and complete the secret
 and migration steps in [cloud-runtime.md](cloud-runtime.md). Once ready, persist
-`worker_desired_count = 1`, then review and apply a fresh full plan. The service
+`worker_autoscaling_enabled = true` with min=1/max=4, then review and apply a fresh full plan. The service
 uses one receive slot per task. Confirm ECS stability, database connectivity and
 task protection before stopping the local worker. Temporarily set
-`worker_desired_count = 2` and apply a full plan to verify distinct jobs run
+`worker_autoscaling_min_capacity = 2` and `worker_autoscaling_max_capacity = 2` and apply a full plan to verify distinct jobs run
 concurrently. The database lease remains authoritative while the old local worker
 and ECS revisions overlap.
 
@@ -54,7 +54,9 @@ unprivileged Worker user. Download failure or an empty bundle fails the build.
 Rebuild and deploy a new image digest when the RDS CA bundle changes.
 
 `worker_desired_count` accepts only integers from 0 through 4. The example keeps
-it at zero for bootstrap; raise it to one only after migration succeeds.
+it at zero for bootstrap. It controls initial service creation only; later changes are
+ignored. Enable autoscaling only after migration succeeds. Disabling autoscaling
+does not stop an already-running service.
 
 The deployment reserves 50 GiB of ephemeral storage, 1024 CPU units, 2048 MiB,
 and a 30-second stop timeout. The timeout exceeds the five-second runtime grace
@@ -62,22 +64,34 @@ period plus protection-request and cleanup margin. Diagnose failures in order:
 ECR digest/image pull, task execution-role logs/secret access, database TLS and
 security-group connectivity, task-role SQS/S3 access, ECS protection acquire/
 renew/release, then ephemeral-disk limits. Confirm protection transitions in ECS
-task details before changing desired count; autoscaling policy and metrics belong
-to the later scaling task.
+task details before changing autoscaling capacity bounds.
 
 Task 10 implements the application runtime. Tasks 11–13 own infrastructure,
 IAM, deployment resource allocation, and scaling policies.
 
 ## Backlog-per-worker autoscaling
 
-The ECS worker service uses Application Auto Scaling with a minimum of one and
-a maximum of four tasks. Container Insights is enabled on the cluster because
+After bootstrap, enable `worker_autoscaling_enabled = true` to register the ECS
+worker service with Application Auto Scaling. Normal bounds are
+`worker_autoscaling_min_capacity = 1` and `worker_autoscaling_max_capacity = 4`.
+For an existing installation, preserve enabled=true when adopting this configuration
+to retain autoscaling; inspect the plan before applying. Container Insights is enabled on the cluster because
 the target metric divides the SQS `AWS/SQS` `ApproximateNumberOfMessagesVisible`
-metric by `ECS/ContainerInsights` `RunningTaskCount`, with exact `QueueName`,
+`Sum` metric by `ECS/ContainerInsights` `RunningTaskCount` (`Average`), with exact `QueueName`,
 `ClusterName`, and `ServiceName` dimensions. The initial target is acceptable
-queue delay divided by measured representative processing time (900 / 300 = 3
-messages per running worker by default). This is an approximate workload
-measure: video lengths vary and one SQS message may contain multiple records.
+queue delay divided by measured representative processing time. The initial
+values are based on the following measurement and MVP operating objective:
+
+- `worker_representative_processing_seconds = 300`: processing an approximately
+  two-minute video occupied a Worker for approximately five minutes in an actual
+  measurement. This measured Worker occupancy time is the basis for the initial
+  processing-time value.
+- `worker_acceptable_queue_delay_seconds = 900`: the initial MVP operating
+  objective allows 15 minutes of queue waiting time.
+- Therefore, the initial target is `900 / 300 = 3 messages / worker`.
+
+This is an approximate workload measure: video lengths vary and one SQS message
+may contain multiple records.
 Re-measure the processing-time input and target in the later distributed-mode
 tasks.
 
@@ -128,7 +142,9 @@ as evidence; do not record database credentials or presigned upload URLs.
 
 ### 1. Confirm one ECS Worker starts
 
-Persist `worker_desired_count = 1` in `terraform.tfvars`, then review and apply:
+After secret setup and migration, persist `worker_autoscaling_enabled = true`,
+`worker_autoscaling_min_capacity = 1`, and `worker_autoscaling_max_capacity = 1`
+in `terraform.tfvars` to hold one Worker throughout steps 1–3, then review and apply:
 
 ```bash
 terraform -chdir=app/infra/terraform-compute plan -out=worker-start.tfplan
@@ -237,7 +253,8 @@ proof of release. See [get-task-protection](https://docs.aws.amazon.com/cli/late
 
 ### 4. Confirm parallel work and duplicate-delivery ownership with two Workers
 
-Persist `worker_desired_count = 2`, then review and apply a fresh full plan:
+Keep autoscaling enabled and persist `worker_autoscaling_min_capacity = 2` and
+`worker_autoscaling_max_capacity = 2`, then review and apply a fresh full plan:
 
 ```bash
 terraform -chdir=app/infra/terraform-compute plan -out=worker-two.tfplan
@@ -288,8 +305,8 @@ after completion, the overlap check is inconclusive; repeat with a longer job.
 
 ### 5. Confirm recovery after StopTask
 
-After the two-Worker checks finish, persist `worker_desired_count = 1`, apply a
-fresh full plan, and repeat the step 1 stability/count check. This makes the
+After the two-Worker checks finish, persist `worker_autoscaling_min_capacity = 1`
+and `worker_autoscaling_max_capacity = 1`, apply a fresh full plan, and repeat the step 1 stability/count check. This makes the
 replacement task the only candidate to recover the job. Idle protection may
 delay scale-in until its release window.
 
@@ -326,6 +343,10 @@ force this test to pass. If the job completed before shutdown took effect, repea
 with a longer input. If recovery fails, inspect expiry timing, attempt exhaustion,
 DLQ, task events and DB/SQS/S3/protection errors, and record the failure rather
 than treating replacement startup alone as successful recovery.
+
+After recovery acceptance, restore `worker_autoscaling_min_capacity = 1` and
+`worker_autoscaling_max_capacity = 4`, review and apply a fresh full plan, and run
+the live scaling acceptance above. Keep `worker_autoscaling_enabled = true`.
 
 ## Runtime configuration
 

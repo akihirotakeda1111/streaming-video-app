@@ -109,10 +109,31 @@ variable "api_desired_count" {
 }
 variable "worker_desired_count" {
   type = number
-  default = 1
+  default = 0
   validation {
     condition     = var.worker_desired_count >= 0 && var.worker_desired_count <= 4 && floor(var.worker_desired_count) == var.worker_desired_count
     error_message = "worker_desired_count must be a whole number between 0 and 4."
+  }
+}
+variable "worker_autoscaling_enabled" {
+  description = "Enable only after the database secret and migrations are ready."
+  type        = bool
+  default     = false
+}
+variable "worker_autoscaling_min_capacity" {
+  type    = number
+  default = 1
+  validation {
+    condition     = var.worker_autoscaling_min_capacity >= 1 && var.worker_autoscaling_min_capacity <= 4 && floor(var.worker_autoscaling_min_capacity) == var.worker_autoscaling_min_capacity
+    error_message = "Worker autoscaling minimum must be an integer from 1 through 4."
+  }
+}
+variable "worker_autoscaling_max_capacity" {
+  type    = number
+  default = 4
+  validation {
+    condition     = var.worker_autoscaling_max_capacity >= 1 && var.worker_autoscaling_max_capacity <= 4 && floor(var.worker_autoscaling_max_capacity) == var.worker_autoscaling_max_capacity
+    error_message = "Worker autoscaling maximum must be an integer from 1 through 4."
   }
 }
 variable "worker_cpu" {

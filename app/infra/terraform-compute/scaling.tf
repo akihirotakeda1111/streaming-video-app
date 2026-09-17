@@ -2,20 +2,38 @@ locals {
   worker_queue_name = element(split("/", local.shared.video_encoding_queue_url), 4)
 }
 
+moved {
+  from = aws_appautoscaling_target.worker
+  to   = aws_appautoscaling_target.worker[0]
+}
+
+moved {
+  from = aws_appautoscaling_policy.worker_backlog_per_task
+  to   = aws_appautoscaling_policy.worker_backlog_per_task[0]
+}
+
 resource "aws_appautoscaling_target" "worker" {
-  max_capacity       = 4
-  min_capacity       = 1
+  count              = var.worker_autoscaling_enabled ? 1 : 0
+  max_capacity       = var.worker_autoscaling_max_capacity
+  min_capacity       = var.worker_autoscaling_min_capacity
   resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.worker.name}"
   scalable_dimension = "ecs:service:DesiredCount"
   service_namespace  = "ecs"
+  lifecycle {
+    precondition {
+      condition     = var.worker_autoscaling_min_capacity <= var.worker_autoscaling_max_capacity
+      error_message = "Worker autoscaling minimum must not exceed maximum capacity."
+    }
+  }
 }
 
 resource "aws_appautoscaling_policy" "worker_backlog_per_task" {
+  count              = var.worker_autoscaling_enabled ? 1 : 0
   name               = "${local.name}-worker-backlog-per-task"
   policy_type        = "TargetTrackingScaling"
-  resource_id        = aws_appautoscaling_target.worker.resource_id
-  scalable_dimension = aws_appautoscaling_target.worker.scalable_dimension
-  service_namespace  = aws_appautoscaling_target.worker.service_namespace
+  resource_id        = aws_appautoscaling_target.worker[0].resource_id
+  scalable_dimension = aws_appautoscaling_target.worker[0].scalable_dimension
+  service_namespace  = aws_appautoscaling_target.worker[0].service_namespace
 
   target_tracking_scaling_policy_configuration {
     target_value       = var.worker_acceptable_queue_delay_seconds / var.worker_representative_processing_seconds
@@ -27,8 +45,7 @@ resource "aws_appautoscaling_policy" "worker_backlog_per_task" {
         id          = "visible_backlog"
         return_data = false
         metric_stat {
-          period = 60
-          stat = "Average"
+          stat = "Sum"
           metric {
             namespace   = "AWS/SQS"
             metric_name = "ApproximateNumberOfMessagesVisible"
@@ -44,7 +61,6 @@ resource "aws_appautoscaling_policy" "worker_backlog_per_task" {
         id          = "running_tasks"
         return_data = false
         metric_stat {
-          period = 60
           stat = "Average"
           metric {
             namespace   = "ECS/ContainerInsights"
@@ -89,7 +105,7 @@ resource "aws_cloudwatch_metric_alarm" "worker_backlog_per_task_diagnostic" {
       metric_name = "ApproximateNumberOfMessagesVisible"
       namespace   = "AWS/SQS"
       period      = 60
-      stat        = "Average"
+      stat        = "Sum"
       dimensions  = { QueueName = local.worker_queue_name }
     }
   }
