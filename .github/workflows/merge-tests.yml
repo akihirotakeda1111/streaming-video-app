@@ -94,7 +94,7 @@ jobs:
         run: python app/scripts/validate_contracts.py
 
       - name: Validate compute and shared delivery/reliability contracts
-        run: python app/scripts/validate_terraform_contracts.py --stage compute
+        run: python app/scripts/validate_terraform_contracts.py --stage workers
 
   frontend:
     name: Frontend tests
