@@ -68,6 +68,53 @@ to the later scaling task.
 Task 10 implements the application runtime. Tasks 11–13 own infrastructure,
 IAM, deployment resource allocation, and scaling policies.
 
+## Backlog-per-worker autoscaling
+
+The ECS worker service uses Application Auto Scaling with a minimum of one and
+a maximum of four tasks. Container Insights is enabled on the cluster because
+the target metric divides the SQS `AWS/SQS` `ApproximateNumberOfMessagesVisible`
+metric by `ECS/ContainerInsights` `RunningTaskCount`, with exact `QueueName`,
+`ClusterName`, and `ServiceName` dimensions. The initial target is acceptable
+queue delay divided by measured representative processing time (900 / 300 = 3
+messages per running worker by default). This is an approximate workload
+measure: video lengths vary and one SQS message may contain multiple records.
+Re-measure the processing-time input and target in the later distributed-mode
+tasks.
+
+The metric expression does not fill missing data or a zero task count with zero;
+inspect metric gaps and startup failures before changing capacity. Visible
+backlog can be zero while work is still in progress, so use SQS `NotVisible`,
+oldest-message age, ECS task counts/events, and task-protection state for
+diagnostics. Existing DLQ and age alarms remain authoritative for poison or
+duplicate delivery; backlog is not a database attempt counter.
+
+Container Insights adds CloudWatch monitoring cost for the ECS cluster. Review
+the account's CloudWatch pricing and retention before enabling it in additional
+environments. Scale-out waits through Fargate startup and metric publication;
+scale-in has a longer cooldown for processing and task-protection release.
+Terraform ignores changes to the service's autoscaler-owned `desired_count`, so
+routine plans do not reset capacity. Keep the worker's receive concurrency at
+one and verify protection remains enabled before accepting scale-in.
+
+### Live scaling acceptance
+
+Record the queue attributes, metric queries, ECS service events and task
+protection state without recording credentials or presigned URLs. With one task
+running, submit a representative burst and compare SQS attributes with the
+CloudWatch observations. Require running capacity to rise above one and never
+exceed four, then drain the queue and require return to one within the bounded
+cooldown/startup observation window. Check `ApproximateNumberOfMessagesVisible`,
+`ApproximateNumberOfMessagesNotVisible`, and `ApproximateAgeOfOldestMessage`
+together; a zero visible count alone is not an idle proof.
+
+Repeat with missing or delayed metrics and with a task-startup failure. Require
+no rapid scale-in and no unbounded growth, and retain the metric gaps, ECS
+events, service desired/running/pending counts, and protection observations as
+diagnostic evidence. During normal scale-in, verify active jobs retain task
+protection and complete without interruption. The forced-termination recovery
+procedure above must still show lease expiry, redelivery, and completion on a
+replacement task.
+
 ## Live acceptance: startup, processing, protection, and recovery
 
 Run these checks in a dedicated test environment/queue after image bootstrap,

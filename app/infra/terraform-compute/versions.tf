@@ -155,6 +155,42 @@ variable "worker_max_wall_seconds" {
   type = number
   default = 7200
 }
+variable "worker_acceptable_queue_delay_seconds" {
+  type        = number
+  description = "Queue delay the worker fleet should absorb, divided by representative processing time for the initial backlog target."
+  default     = 900
+  validation {
+    condition     = var.worker_acceptable_queue_delay_seconds > 0
+    error_message = "worker_acceptable_queue_delay_seconds must be positive."
+  }
+}
+variable "worker_representative_processing_seconds" {
+  type        = number
+  description = "Measured representative processing time used to initialize backlog-per-worker scaling."
+  default     = 300
+  validation {
+    condition     = var.worker_representative_processing_seconds > 0
+    error_message = "worker_representative_processing_seconds must be positive."
+  }
+}
+variable "worker_scale_out_cooldown_seconds" {
+  type        = number
+  description = "Bounded scale-out cooldown covering Fargate startup and metric publication."
+  default     = 180
+  validation {
+    condition     = var.worker_scale_out_cooldown_seconds >= 60 && var.worker_scale_out_cooldown_seconds <= 900
+    error_message = "worker_scale_out_cooldown_seconds must be between 60 and 900."
+  }
+}
+variable "worker_scale_in_cooldown_seconds" {
+  type        = number
+  description = "Bounded scale-in cooldown covering processing and ECS task-protection release."
+  default     = 600
+  validation {
+    condition     = var.worker_scale_in_cooldown_seconds >= 300 && var.worker_scale_in_cooldown_seconds <= 1800
+    error_message = "worker_scale_in_cooldown_seconds must be between 300 and 1800."
+  }
+}
 variable "vpc_cidr" {
   type = string
   default = "10.42.0.0/16"

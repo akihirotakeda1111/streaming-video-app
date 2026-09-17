@@ -365,7 +365,7 @@ def check_foundation(config: Configuration, checks: Checks) -> None:
 
 
 def check_forbidden_resources(config: Configuration, checks: Checks, stage: str = "complete") -> None:
-    if stage in {"compute", "workers"}:
+    if stage in {"compute", "workers", "scaling"}:
         return
     for block in config.resources():
         forbidden = block.type_name in FORBIDDEN_RESOURCE_TYPES or block.type_name.startswith(
@@ -898,8 +898,8 @@ def check_dangerous_configuration(config: Configuration, checks: Checks, stage: 
             checks.reject(_has_wildcard_action(policy), f"{block.location}: wildcard IAM actions are forbidden")
             # ECR's authorization-token API is the AWS-defined exception: it
             # requires Resource "*" even when all image actions are scoped.
-            scoped_policy = _without_ecr_token_statements(policy) if stage in {"compute", "workers"} else policy
-            if stage in {"compute", "workers"}:
+            scoped_policy = _without_ecr_token_statements(policy) if stage in {"compute", "workers", "scaling"} else policy
+            if stage in {"compute", "workers", "scaling"}:
                 check_task_protection_scope(config, policy, checks, block.location)
             checks.reject(
                 _has_wildcard_resource(scoped_policy),
@@ -1229,16 +1229,70 @@ def check_workers(config: Configuration, checks: Checks) -> None:
         checks.require(action.lower() in policy_text.lower(), f"worker task policy must allow {action}")
     checks.require("aws_security_group.worker" in config.text, "worker service must attach the worker security group")
 
+def check_scaling(config: Configuration, checks: Checks) -> None:
+    """Check backlog-per-running-worker autoscaling without evaluating Terraform."""
+    targets = config.resources("aws_appautoscaling_target")
+    policies = config.resources("aws_appautoscaling_policy")
+    checks.require(bool(targets), "scaling requires an Application Auto Scaling target")
+    checks.require(bool(policies), "scaling requires an Application Auto Scaling policy")
+    scaling_text = "\n".join(block.body for block in targets + policies)
+    checks.require("service_namespace" in scaling_text and '"ecs"' in scaling_text,
+                   "scaling target must use the ECS service namespace")
+    checks.require("ecs:service:DesiredCount" in scaling_text,
+                   "scaling target must control ECS service desired count")
+    checks.require("min_capacity" in scaling_text and re.search(r"\bmin_capacity\s*=\s*1\b", scaling_text) is not None,
+                   "scaling minimum capacity must be one")
+    checks.require("max_capacity" in scaling_text and re.search(r"\bmax_capacity\s*=\s*4\b", scaling_text) is not None,
+                   "scaling maximum capacity must be four")
+    checks.require("scale_out_cooldown" in scaling_text and "scale_in_cooldown" in scaling_text,
+                   "scaling must configure bounded scale-out and scale-in cooldowns")
+    checks.require("ECS/ContainerInsights" in scaling_text and "RunningTaskCount" in scaling_text,
+                   "scaling must use ContainerInsights RunningTaskCount")
+    checks.require("ClusterName" in scaling_text and "ServiceName" in scaling_text,
+                   "RunningTaskCount must identify the exact cluster and worker service")
+    checks.require('value = aws_ecs_cluster.main.name' in scaling_text and
+                   'value = aws_ecs_service.worker.name' in scaling_text,
+                   "RunningTaskCount dimensions must use the worker cluster and service")
+    checks.require("AWS/SQS" in scaling_text and "ApproximateNumberOfMessagesVisible" in scaling_text,
+                   "scaling must use visible SQS backlog")
+    checks.require("QueueName" in scaling_text,
+                   "visible backlog must identify the exact SQS queue")
+    checks.require("value = local.worker_queue_name" in scaling_text,
+                   "visible backlog dimension must use the worker queue name")
+    checks.require('resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.worker.name}"' in scaling_text,
+                   "scaling target must identify the worker service in the worker cluster")
+    checks.require("expression" in scaling_text and re.search(r"visible_backlog\s*/\s*running_tasks", scaling_text) is not None,
+                   "scaling must divide visible backlog by running task count")
+    checks.reject(bool(re.search(r"\b(?:FILL|IF)\s*\(", scaling_text, re.IGNORECASE)),
+                   "scaling must not convert missing data or a zero divisor into zero load")
+    checks.require('treat_missing_data  = "missing"' in config.text,
+                   "scaling diagnostics must preserve missing metric data")
+    checks.require("period" in scaling_text and re.search(r"\bperiod\s*=\s*60\b", scaling_text) is not None,
+                   "scaling metrics must specify a 60-second period")
+    checks.require("stat" in scaling_text and 'stat = "Average"' in scaling_text,
+                   "scaling metrics must specify Average statistics")
+    checks.require("worker_acceptable_queue_delay_seconds" in scaling_text and
+                   "worker_representative_processing_seconds" in scaling_text,
+                   "scaling target must start from queue delay divided by representative processing time")
+    checks.require("ignore_changes = [desired_count]" in config.text,
+                   "ECS worker desired_count must not reset autoscaler-controlled capacity")
+    checks.require("containerInsights" in config.text and 'value = "enabled"' in config.text,
+                   "ECS Container Insights must be enabled for RunningTaskCount")
+    checks.require("ecs:UpdateTaskProtection" in config.text and "ecs:GetTaskProtection" in config.text,
+                   "scaling must retain worker task-protection integration")
+
 def validate(config: Configuration, stage: str, shared_config: Configuration | None = None) -> list[str]:
     checks = Checks()
     check_foundation(config, checks)
     check_forbidden_resources(config, checks, stage)
     check_dangerous_configuration(config, checks, stage)
 
-    if stage in {"compute", "workers"}:
+    if stage in {"compute", "workers", "scaling"}:
         check_compute(config, checks)
-        if stage == "workers":
+        if stage in {"workers", "scaling"}:
             check_workers(config, checks)
+        if stage == "scaling":
+            check_scaling(config, checks)
         shared = shared_config or load_configuration(config.root.parent / "terraform")
         checks.errors.extend(f"shared root: {error}" for error in validate(shared, "complete"))
         return checks.errors
@@ -1272,7 +1326,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("foundation", "storage-queue", "reliability", "delivery", "complete", "compute", "workers"),
+        choices=("foundation", "storage-queue", "reliability", "delivery", "complete", "compute", "workers", "scaling"),
         default="complete",
         help="Task completion stage to validate (default: complete)",
     )
@@ -1283,7 +1337,7 @@ def main() -> int:
     args = parse_args()
     try:
         terraform_dir = args.terraform_dir.resolve()
-        if terraform_dir == Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform" and args.stage in {"compute", "workers"}:
+        if terraform_dir == Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform" and args.stage in {"compute", "workers", "scaling"}:
             terraform_dir = Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform-compute"
         config = load_configuration(terraform_dir)
         shared_config = load_configuration(args.shared_terraform_dir.resolve()) if args.shared_terraform_dir else None

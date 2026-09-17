@@ -70,6 +70,9 @@ resource "aws_ecs_service" "worker" {
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.worker.arn
   desired_count   = var.worker_desired_count
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
   launch_type     = "FARGATE"
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 200
