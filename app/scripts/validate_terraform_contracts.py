@@ -849,21 +849,39 @@ def _without_ecr_token_statements(policy: str) -> str:
     return policy
 
 
-def _without_ecs_protection_statements(policy: str) -> str:
-    """Allow ECS task protection's AWS-required Resource = * statement only."""
+def check_task_protection_scope(config: Configuration, policy: str, checks: Checks, location: str) -> None:
+    """Require protection statements to target tasks in a deployed service's cluster."""
+    clusters = {
+        name for service in config.resources("aws_ecs_service")
+        for name in _resource_references(_attribute(service.body, "cluster") or "", "aws_ecs_cluster")
+    } & {block.name for block in config.resources("aws_ecs_cluster")}
+    expected = {
+        '"arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/'
+        '${aws_ecs_cluster.' + name + '.name}/*"'
+        for name in clusters
+    }
     masked = STRING_RE.sub(lambda match: " " * len(match.group()), policy)
-    spans: list[tuple[int, int]] = []
     for opening, char in enumerate(masked):
         if char != "{":
             continue
         closing = _matching_brace(policy, opening, Path("IAM policy"))
         body = policy[opening + 1:closing]
-        actions = _policy_actions(body)
-        if actions and actions <= {"ecs:updatetaskprotection", "ecs:gettaskprotection"} and _has_wildcard_resource(body):
-            spans.append((opening, closing + 1))
-    for start, end in reversed(spans):
-        policy = policy[:start] + " " * (end - start) + policy[end:]
-    return policy
+        # Mask nested objects so policy wrappers are ignored while statements
+        # with Condition objects still have their direct Resource checked.
+        direct = STRING_RE.sub(lambda match: " " * len(match.group()), body)
+        cursor = 0
+        while cursor < len(direct):
+            if direct[cursor] == "{":
+                end = _matching_brace(body, cursor, Path("IAM statement"))
+                body = body[:cursor] + " " * (end + 1 - cursor) + body[end + 1:]
+                cursor = end
+            cursor += 1
+        if _policy_actions(body) & {"ecs:updatetaskprotection", "ecs:gettaskprotection"}:
+            resource = _collection_attribute(body, "Resource") or _collection_attribute(body, "resources")
+            normalized = _normalized_expression(resource)
+            allowed = {_normalized_expression(arn) for arn in expected}
+            checks.require(normalized in allowed or normalized in {f"[{arn}]" for arn in allowed},
+                           f"{location}: task protection must target cluster-scoped task ARNs")
 
 
 def check_dangerous_configuration(config: Configuration, checks: Checks, stage: str = "complete") -> None:
@@ -881,8 +899,8 @@ def check_dangerous_configuration(config: Configuration, checks: Checks, stage: 
             # ECR's authorization-token API is the AWS-defined exception: it
             # requires Resource "*" even when all image actions are scoped.
             scoped_policy = _without_ecr_token_statements(policy) if stage in {"compute", "workers"} else policy
-            if stage == "workers":
-                scoped_policy = _without_ecs_protection_statements(scoped_policy)
+            if stage in {"compute", "workers"}:
+                check_task_protection_scope(config, policy, checks, block.location)
             checks.reject(
                 _has_wildcard_resource(scoped_policy),
                 f"{block.location}: wildcard IAM resources are forbidden",
@@ -1166,9 +1184,6 @@ def check_compute(config: Configuration, checks: Checks) -> None:
     checks.require(any("5432" in block.body and "aws_security_group" in block.body
                        for block in config.resources("aws_security_group_rule")),
                    "database ingress must be restricted to application security groups")
-    checks.require(not any("worker" in (block.name or "").lower()
-                           for block in config.resources("aws_ecs_service")),
-                   "compute root must not deploy the worker service")
     checks.require(any("acm_certificate" in block.body for block in config.resources("aws_lb_listener")),
                    "ALB HTTPS listener must use an operator-supplied ACM certificate")
     checks.require(any("migration" in (block.name or "").lower()
@@ -1189,7 +1204,19 @@ def check_workers(config: Configuration, checks: Checks) -> None:
     for block in worker_tasks:
         worker_configuration = config.text
         checks.require("FARGATE" in block.body and "awsvpc" in block.body, f"{block.location}: worker must run on Fargate awsvpc")
-        checks.require("ephemeral_storage" in block.body and "stop_timeout" in block.body, f"{block.location}: worker storage and stop timeout must be bounded")
+        checks.require("ephemeral_storage" in block.body, f"{block.location}: worker storage must be bounded")
+        checks.reject(_attribute(block.body, "stop_timeout") is not None,
+                      f"{block.location}: stop_timeout is not a task definition attribute; use container stopTimeout")
+        containers = _attribute(block.body, "container_definitions") or ""
+        container_bodies = []
+        for name in re.findall(r"\blocal\.([A-Za-z_][A-Za-z0-9_]*)", containers):
+            for match in re.finditer(rf"(?m)^\s*{re.escape(name)}\s*=\s*\{{", config.text):
+                end = _matching_brace(config.text, match.end() - 1, block.path)
+                container_bodies.append(config.text[match.end():end])
+        checks.require(bool(container_bodies) and all(
+            _attribute(body, "stopTimeout") == "var.worker_stop_timeout_seconds"
+            for body in container_bodies
+        ), f"{block.location}: worker container must set stopTimeout from worker_stop_timeout_seconds")
         checks.require("WORKER_MAX_CONCURRENCY" in worker_configuration and '"1"' in worker_configuration, f"{block.location}: worker receive concurrency must start at one")
         checks.require("WORKER_RUNTIME_MODE" in worker_configuration and '"ecs"' in worker_configuration, f"{block.location}: ECS runtime mode is required")
         checks.require("secretsmanager" in worker_configuration and "DATABASE_URL" in worker_configuration, f"{block.location}: database URL must be injected from Secrets Manager")
@@ -1208,13 +1235,12 @@ def validate(config: Configuration, stage: str, shared_config: Configuration | N
     check_forbidden_resources(config, checks, stage)
     check_dangerous_configuration(config, checks, stage)
 
-    if stage == "compute":
+    if stage in {"compute", "workers"}:
         check_compute(config, checks)
+        if stage == "workers":
+            check_workers(config, checks)
         shared = shared_config or load_configuration(config.root.parent / "terraform")
         checks.errors.extend(f"shared root: {error}" for error in validate(shared, "complete"))
-        return checks.errors
-    if stage == "workers":
-        check_workers(config, checks)
         return checks.errors
 
     input_name: str | None = None
@@ -1242,7 +1268,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--shared-terraform-dir",
         type=Path,
-        help="Shared delivery/reliability root for compute (default: sibling terraform directory)",
+        help="Shared delivery/reliability root for compute/workers (default: sibling terraform directory)",
     )
     parser.add_argument(
         "--stage",

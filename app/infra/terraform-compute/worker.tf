@@ -15,7 +15,7 @@ data "aws_ecr_image" "worker" {
   lifecycle {
     precondition {
       condition     = var.worker_image_digest != null
-      error_message = "Build and push the worker image, then set worker_image_digest before applying the worker service."
+      error_message = "Bootstrap the worker ECR repository, push the worker image, and set worker_image_digest before full apply."
     }
   }
 }
@@ -27,6 +27,7 @@ locals {
     name      = "worker"
     image     = local.worker_image
     essential = true
+    stopTimeout = var.worker_stop_timeout_seconds
     environment = [
       { name = "AWS_REGION", value = var.aws_region },
       { name = "VIDEO_ENCODING_QUEUE_URL", value = local.shared.video_encoding_queue_url },
@@ -62,7 +63,6 @@ resource "aws_ecs_task_definition" "worker" {
   task_role_arn            = aws_iam_role.worker.arn
   ephemeral_storage { size_in_gib = var.worker_ephemeral_storage_gib }
   container_definitions = jsonencode([local.worker_container])
-  stop_timeout          = var.worker_stop_timeout_seconds
 }
 
 resource "aws_ecs_service" "worker" {
