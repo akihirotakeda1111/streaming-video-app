@@ -67,6 +67,30 @@ curl. Outbound HTTPS reaches SSM without NAT. The existing API-SG-to-DB rule let
 this host reach private RDS on 5432; do not open RDS to public CIDRs. This host is
 operator-managed outside the compute state and is removed after bootstrap.
 
+Before opening the session, verify permissions in the dedicated account:
+
+1. Run `aws sts get-caller-identity` and confirm the expected account and operator
+   role. In IAM, check that this role can start an SSM session on the temporary
+   instance and the selected session document, and terminate its own sessions.
+   Check applicable permission boundaries/SCPs as well as attached policies.
+2. In EC2, select the temporary instance and follow its **IAM role** link. Confirm
+   its instance profile contains the intended role, that its trust policy allows
+   `ec2.amazonaws.com` to assume it, and that `AmazonSSMManagedInstanceCore` is
+   attached. See the [AWS instance-permission verification procedure](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started-instance-profile.html).
+3. In Systems Manager, confirm the instance appears as a managed node with
+   **Online** status. Successfully opening the session below confirms actual
+   session access; merely attaching a policy does not prove connectivity.
+4. In EC2 security groups, confirm the host has `api_security_group_id` and the
+   RDS security group allows inbound TCP 5432 from that group. Confirm host egress
+   permits DB traffic and HTTPS for SSM. No public DB ingress is required.
+5. In IAM/Secrets Manager, confirm the operator has `secretsmanager:GetSecretValue`
+   on the exact `rds_admin_secret_arn` and `secretsmanager:PutSecretValue` on the
+   application secret. If a customer-managed KMS key is used, check the required
+   key permissions and key policy too. Retrieve the administrator password only
+   through the console as described below; do not print it to verify access.
+   These operator permissions must not be added to the temporary host role or
+   the API task role.
+
 Run `aws ssm start-session --target <instance-id>`. An authorized operator reads
 the RDS-managed secret identified by `rds_admin_secret_arn` in Secrets Manager,
 and enters its password only at the psql password prompt. Do not put it in shell
@@ -83,7 +107,17 @@ PSQL_HISTORY=/dev/null psql \
   'host=<rds_endpoint> dbname=video user=video_admin sslmode=verify-full sslrootcert=/tmp/rds-global-bundle.pem' -W
 ```
 
-In psql, create the non-admin role and set a password at the hidden prompt:
+Immediately after connecting, verify the administrator and target database:
+
+```sql
+SELECT current_user, current_database();
+```
+
+Expect `video_admin` / `video` (or the explicitly configured administrator and
+database). If either differs, reconnect to the correct database before creating
+the role or running any `GRANT`; schema privileges apply to the connected database.
+Only after this check, create the non-admin role and set a password at the hidden
+prompt:
 
 ```sql
 CREATE ROLE video_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
@@ -92,12 +126,53 @@ GRANT CONNECT ON DATABASE video TO video_app;
 GRANT USAGE, CREATE ON SCHEMA public TO video_app;
 ```
 
+Before saving the application URL, verify the grants in the same database:
+
+```sql
+SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication
+FROM pg_roles WHERE rolname = 'video_app';
+SELECT has_database_privilege('video_app', current_database(), 'CONNECT') AS can_connect,
+       has_schema_privilege('video_app', 'public', 'USAGE') AS can_use_schema,
+       has_schema_privilege('video_app', 'public', 'CREATE') AS can_create_tables;
+```
+
+Expect one role row with `rolcanlogin = t` and all four administrative flags `f`,
+and all three privilege results `t`. These checks use PostgreSQL's
+[privilege inquiry functions](https://www.postgresql.org/docs/16/functions-info.html).
+Exit with `\q` and reconnect from the same host using the application password:
+
+```bash
+PSQL_HISTORY=/dev/null psql \
+  'host=<rds_endpoint> dbname=video user=video_app sslmode=verify-full sslrootcert=/tmp/rds-global-bundle.pem' -W
+```
+
+Verify real login and schema access with a transaction that leaves no test table:
+
+```sql
+\set ON_ERROR_STOP on
+SELECT current_user, current_database();
+BEGIN;
+CREATE TABLE public.bootstrap_permission_probe (id integer PRIMARY KEY);
+INSERT INTO public.bootstrap_permission_probe VALUES (1);
+SELECT * FROM public.bootstrap_permission_probe;
+ROLLBACK;
+\q
+```
+
+`ROLLBACK` removes the table created in this transaction, so no explicit `DROP`
+is needed. Expect `current_user = video_app`, the intended database, and the inserted row
+without permission errors. On failure, roll back and correct the specific missing
+grant or connection setting before proceeding; do not grant administrator roles.
+
 Substitute a custom DB name if configured. Populate the existing application
 secret as a **plain string** in Secrets Manager:
 `postgresql://video_app:<URL-encoded-password>@<rds_endpoint>:5432/video?sslmode=verify-full&sslrootcert=/app/certs/rds-global-bundle.pem`.
 Never paste the real URL into shell history, Terraform or logs. API and migration
 receive only this application credential. Migration creates tables owned by
-`video_app`. Terminate the temporary host and remove its temporary profile.
+`video_app`. Terminate the temporary host. Delete its Instance Profile and IAM Role
+only if they were created exclusively for this bootstrap and are no longer used
+by any other instance or workload. Retain shared or pre-existing profiles and
+roles; confirm each resource's usage before deleting it.
 
 ## 4. Run migration once and verify success
 
