@@ -3,9 +3,10 @@
 The compute root at `app/infra/terraform-compute` owns separate state and consumes
 S3/SQS/CloudFront outputs through `shared_state_path`. Apply the shared root first.
 RDS is Single-AZ, but its private DB subnet group spans two AZs. API tasks and the
-ALB use public subnets. Tasks get public IPs for outbound ECR/AWS access, avoiding
+ALB use public subnets, as do Worker tasks. Tasks get public IPs for outbound ECR/AWS access, avoiding
 an always-on NAT Gateway. Direct task egress is an MVP cost tradeoff. Worker
-ingress stays closed; this root does not deploy the worker service.
+ingress stays closed; this root deploys the API and Worker services plus a one-off
+migration task. Worker has no ALB target or inbound port.
 
 Operators run these commands in Bash with AWS CLI, Terraform, Docker and jq,
 using the dedicated account and region. Set `AWS_REGION` consistently. Copy
@@ -21,7 +22,9 @@ itself covered by that certificate.
 Create an empty application secret with
 `aws secretsmanager create-secret --name streaming-video/app-database-url`.
 Put the returned ARN in `database_url_secret_arn`; do not add an administrator URL.
-Leave `api_image_digest` unset and keep `api_desired_count = 0`. From repo root:
+Leave image digests unset initially and keep `api_desired_count = 0` and
+`worker_desired_count = 0` until the application secret and migrations are ready.
+From repo root:
 
 ```bash
 terraform -chdir=app/infra/terraform-compute init
@@ -39,22 +42,30 @@ aws ecr describe-images --repository-name "${REPOSITORY#*/}" \
 ```
 
 Set `api_image_digest` to the actual returned sha256 digest in `terraform.tfvars`.
-Targeting is only for initial repository creation. The full plan requires a digest
-and verifies its existence in ECR before creating task definitions.
+Before the first full apply, also follow the Worker ECR target apply, image push,
+and digest selection steps in [worker-scaling.md](worker-scaling.md#fargate-deployment).
+Set `worker_image_digest` and keep `worker_desired_count = 0`. Targeting is only
+for initial repository creation. The full plan requires both image digests and
+verifies their existence in ECR before creating task definitions, even at zero
+desired count.
 
-The image downloads the [AWS RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html)
-at build time to `/app/certs/rds-global-bundle.pem`, readable by API and migration.
-Download failure fails the build. Rebuild and deploy a new digest on CA updates.
+Both API and Worker images download the [AWS RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html)
+at build time to `/app/certs/rds-global-bundle.pem`, readable by their unprivileged
+users; migration uses the API image. Worker references this file through
+`DATABASE_CA_CERT_PATH`, while API and migration use `sslrootcert` in the URL.
+Download failure or an empty bundle fails the build. Rebuild and deploy new image
+digests on CA updates.
 
-## 2. Full apply with API stopped
+## 2. Full apply with API and Worker stopped
 
 ```bash
 terraform -chdir=app/infra/terraform-compute plan -out=foundation.tfplan
 terraform -chdir=app/infra/terraform-compute apply foundation.tfplan
 ```
 
-Keep `api_desired_count = 0`. This creates RDS, networking and task definitions,
-but starts neither API nor migration. Populate the application secret before
+Keep `api_desired_count = 0` and `worker_desired_count = 0`. This creates RDS,
+networking and task definitions, but starts neither service nor migration.
+Populate the application secret before
 starting any task. RDS manages the administrator password. The default username
 is `video_admin`; `rdsadmin` is reserved by RDS.
 
@@ -207,6 +218,10 @@ and healthy ALB targets. Verify HTTPS `/api/v1/health` at the certificate-covere
 DNS name, schema validation, database TLS, upload presigning and CloudFront
 playback. API and migration use the same verified TLS application URL.
 
+Then start Worker with `worker_desired_count = 1` through a fresh full plan/apply,
+following [worker-scaling.md](worker-scaling.md#fargate-deployment) for protection
+verification and local-worker cutover.
+
 For a small MVP budget use one db.t4g.micro, 20 GiB, one API task, seven-day logs
 and no NAT Gateway. ALB, public IPv4, RDS and storage can still cost money when
 API count is zero. Stop API and carefully stop RDS when idle; preserve snapshots
@@ -215,7 +230,7 @@ before removal. Operators own DNS, certificates and live acceptance.
 Offline verification covers both compute and shared delivery/reliability roots:
 
 ```bash
-python app/scripts/validate_terraform_contracts.py --stage compute
+python app/scripts/validate_terraform_contracts.py --stage workers
 python app/scripts/validate_contracts.py
 ```
 

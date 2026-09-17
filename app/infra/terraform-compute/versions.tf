@@ -74,6 +74,15 @@ variable "api_image_digest" {
     error_message = "api_image_digest must be a sha256 digest."
   }
 }
+variable "worker_image_digest" {
+  type        = string
+  description = "Immutable worker ECR image digest (sha256:...)."
+  default     = null
+  validation {
+    condition     = var.worker_image_digest == null ? true : can(regex("^sha256:[0-9a-f]{64}$", var.worker_image_digest))
+    error_message = "worker_image_digest must be a sha256 digest."
+  }
+}
 variable "database_url_secret_arn" {
   type = string
   description = "Secrets Manager ARN containing the non-admin application DATABASE_URL."
@@ -97,6 +106,54 @@ variable "db_allocated_storage" {
 variable "api_desired_count" {
   type = number
   default = 0
+}
+variable "worker_desired_count" {
+  type = number
+  default = 1
+  validation {
+    condition     = var.worker_desired_count >= 0 && var.worker_desired_count <= 4 && floor(var.worker_desired_count) == var.worker_desired_count
+    error_message = "worker_desired_count must be a whole number between 0 and 4."
+  }
+}
+variable "worker_cpu" {
+  type = number
+  default = 1024
+}
+variable "worker_memory" {
+  type = number
+  default = 2048
+}
+variable "worker_ephemeral_storage_gib" {
+  type = number
+  default = 50
+}
+variable "worker_stop_timeout_seconds" {
+  type = number
+  default = 30
+}
+variable "worker_max_source_bytes" {
+  type = number
+  default = 67108864
+}
+variable "worker_max_temp_bytes" {
+  type = number
+  default = 536870912
+}
+variable "worker_disk_reserve_bytes" {
+  type = number
+  default = 268435456
+}
+variable "worker_ffmpeg_threads" {
+  type = number
+  default = 1
+}
+variable "worker_max_duration_seconds" {
+  type = number
+  default = 3600
+}
+variable "worker_max_wall_seconds" {
+  type = number
+  default = 7200
 }
 variable "vpc_cidr" {
   type = string

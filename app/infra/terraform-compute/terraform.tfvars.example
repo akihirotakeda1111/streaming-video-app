@@ -6,3 +6,7 @@ database_url_secret_arn  = "arn:aws:secretsmanager:ap-northeast-1:123456789012:s
 # Leave unset only for the initial -target=aws_ecr_repository.api apply.
 # After pushing, set api_image_digest to the real sha256 digest returned by ECR.
 api_desired_count       = 0 # Raise only after successful migration.
+# Leave unset for the initial -target=aws_ecr_repository.worker apply.
+# Push the Worker image, then set its real ECR digest before full apply.
+# worker_image_digest = "sha256:..."
+worker_desired_count    = 0 # Raise to 1 only after secret setup and successful migration; integer range 0..4.
