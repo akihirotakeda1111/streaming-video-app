@@ -46,6 +46,13 @@ async fn supervise_database<T>(
 /// Starts the single bounded worker process.
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("encode-child") {
+        if let Err(error) = worker::encoder::run_from_cli().await {
+            eprintln!("child encoder failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()

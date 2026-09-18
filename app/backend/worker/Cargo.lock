@@ -3184,6 +3184,7 @@ dependencies = [
  "persistence",
  "queue",
  "reqwest",
+ "serde",
  "serde_json",
  "storage",
  "tempfile",
