@@ -111,7 +111,22 @@ locals {
             BoundEncoderTimeout = {
               Type = "Pass"
               QueryLanguage = "JSONata"
-              Output = "{% $merge([$states.input, {'task_timeout_seconds': $min([${var.encoder_timeout_seconds}, $max([1, $floor(($toMillis($states.input.deadline_at) - $millis()) / 1000)])])}]) %}"
+              Output = "{% $merge([$states.input, {'remaining_seconds': $floor(($toMillis($states.input.deadline_at) - $millis()) / 1000)}]) %}"
+              Next = "CheckRemainingSeconds"
+            }
+            CheckRemainingSeconds = {
+              Type = "Choice"
+              Choices = [{
+                Variable = "$.remaining_seconds"
+                NumericGreaterThanEquals = 1
+                Next = "ApplyEncoderTimeout"
+              }]
+              Default = "ChildDeadlineExceeded"
+            }
+            ApplyEncoderTimeout = {
+              Type = "Pass"
+              QueryLanguage = "JSONata"
+              Output = "{% $merge([$states.input, {'task_timeout_seconds': $min([${var.encoder_timeout_seconds}, $states.input.remaining_seconds])}]) %}"
               Next = "RunEncoder"
             }
             RunEncoder = {

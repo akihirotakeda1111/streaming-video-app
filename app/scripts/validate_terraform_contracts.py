@@ -1385,6 +1385,8 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
         "$toMillis($states.input.deadline_at)",
         "$millis()",
         "${var.encoder_timeout_seconds}",
+        "remaining_seconds",
+        "NumericGreaterThanEquals = 1",
         'entryPoint = ["/bin/sh", "-ec"]',
         "video-worker encode-child -",
         'States.Format(\'{}/{}\'',
@@ -1416,9 +1418,11 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
     checks.reject("deadline_at" in child_payload, "deadline_at must not be projected to child payload")
     checks.require("deadline_at" in text, "deadline_at must bound Map/Task execution")
     checks.require(
-        "TimeoutSecondsPath" in text and "$toMillis($states.input.deadline_at)" in text,
-        "RunEncoder timeout must be remaining seconds until deadline_at",
+        "TimeoutSecondsPath" in text and "$toMillis($states.input.deadline_at)" in text
+        and "NumericGreaterThanEquals = 1" in text,
+        "RunEncoder timeout must be remaining seconds until deadline_at and require at least one second",
     )
+    checks.reject("$max([1," in text, "do not raise a sub-second remainder to a 1-second encoder timeout")
 
     encoder_tasks = [block for block in config.resources("aws_ecs_task_definition") if "encoder" in (block.name or "").lower()]
     checks.require(bool(encoder_tasks), "a dedicated encoder task definition is required")
