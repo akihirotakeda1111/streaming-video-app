@@ -168,9 +168,9 @@ SELECT
     j.status,
     j.failure_code,
     j.failure_message,
-    j.mode,
-    j.attempt,
-    j.published_manifest_key,
+    to_jsonb(j)->>'mode',
+    COALESCE((to_jsonb(j)->>'attempt')::int, 0),
+    to_jsonb(j)->>'published_manifest_key',
     j.created_at,
     j.updated_at
 FROM videos v
