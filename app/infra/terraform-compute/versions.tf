@@ -176,6 +176,30 @@ variable "worker_max_wall_seconds" {
   type = number
   default = 7200
 }
+variable "encoder_cpu" {
+  type    = number
+  default = 1024
+}
+variable "encoder_memory" {
+  type    = number
+  default = 2048
+}
+variable "encoder_timeout_seconds" {
+  type    = number
+  default = 7200
+  validation {
+    condition     = var.encoder_timeout_seconds > 0 && var.encoder_timeout_seconds <= 43200
+    error_message = "encoder_timeout_seconds must be between 1 and 43200."
+  }
+}
+variable "orchestration_timeout_seconds" {
+  type    = number
+  default = 7200
+  validation {
+    condition     = var.orchestration_timeout_seconds > 0 && var.orchestration_timeout_seconds <= 43200
+    error_message = "orchestration_timeout_seconds must be between 1 and 43200."
+  }
+}
 variable "worker_acceptable_queue_delay_seconds" {
   type        = number
   description = "Queue delay the worker fleet should absorb, divided by representative processing time for the initial backlog target."
