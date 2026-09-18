@@ -17,7 +17,7 @@ locals {
                 { Variable = "$.renditions[0]", StringEquals = "720p" },
               ] },
             ]
-            Next = "EncodeRenditions"
+            Next = "GuardDeadline"
           },
           {
             And = [
@@ -35,7 +35,7 @@ locals {
                 ] },
               ] },
             ]
-            Next = "EncodeRenditions"
+            Next = "GuardDeadline"
           },
         ]
         Default = "InvalidRenditions"
@@ -45,15 +45,53 @@ locals {
         Error = "InvalidRenditions"
         Cause = "Exactly one or two distinct supported renditions are required"
       }
+      GuardDeadline = {
+        Type = "Choice"
+        Choices = [{
+          Variable = "$$.State.EnteredTime"
+          TimestampLessThanPath = "$.deadline_at"
+          Next = "EncodeRenditions"
+        }]
+        Default = "DeadlineExceeded"
+      }
+      DeadlineExceeded = {
+        Type = "Fail"
+        Error = "DeadlineExceeded"
+        Cause = "Parent execution deadline has passed"
+      }
       EncodeRenditions = {
         Type = "Map"
         ItemsPath = "$.renditions"
+        ItemSelector = {
+          "video_id.$" = "$.video_id"
+          "job_id.$" = "$.job_id"
+          "attempt.$" = "$.attempt"
+          "execution_id.$" = "$.execution_id"
+          "source_key.$" = "$.source_key"
+          "output_prefix.$" = "$.output_prefix"
+          "deadline_at.$" = "$.deadline_at"
+          "rendition.$" = "$$.Map.Item.Value"
+        }
         MaxConcurrency = 2
         ResultPath = null
         ItemProcessor = {
           ProcessorConfig = { Mode = "INLINE" }
-          StartAt = "BuildChildPayload"
+          StartAt = "GuardChildDeadline"
           States = {
+            GuardChildDeadline = {
+              Type = "Choice"
+              Choices = [{
+                Variable = "$$.State.EnteredTime"
+                TimestampLessThanPath = "$.deadline_at"
+                Next = "BuildChildPayload"
+              }]
+              Default = "ChildDeadlineExceeded"
+            }
+            ChildDeadlineExceeded = {
+              Type = "Fail"
+              Error = "DeadlineExceeded"
+              Cause = "Parent execution deadline has passed"
+            }
             BuildChildPayload = {
               Type = "Pass"
               Parameters = {
@@ -62,9 +100,9 @@ locals {
                   "job_id.$" = "$.job_id"
                   "attempt.$" = "$.attempt"
                   "execution_id.$" = "$.execution_id"
-                  "rendition.$" = "$$.Map.Item.Value"
+                  "rendition.$" = "$.rendition"
                   "source_key.$" = "$.source_key"
-                  "output_prefix.$" = "States.Format('{}/{}', $.output_prefix, $$.Map.Item.Value)"
+                  "output_prefix.$" = "States.Format('{}/{}', $.output_prefix, $.rendition)"
                 }
               }
               ResultPath = "$.child"
@@ -95,8 +133,30 @@ locals {
                   }]
                 }
               }
-              ResultPath = null
+              ResultSelector = {
+                "task_arn.$" = "$.TaskArn"
+                "stop_code.$" = "$.StopCode"
+                "stopped_reason.$" = "$.StoppedReason"
+                "name.$" = "$.Containers[0].Name"
+                "exit_code.$" = "$.Containers[0].ExitCode"
+              }
+              ResultPath = "$.encoder_result"
               Catch = [{ ErrorEquals = ["States.ALL"], Next = "EncoderFailed" }]
+              Next = "CheckEncoderExit"
+            }
+            CheckEncoderExit = {
+              Type = "Choice"
+              Choices = [{
+                And = [
+                  { Variable = "$.encoder_result.name", StringEquals = "encoder" },
+                  { Variable = "$.encoder_result.exit_code", NumericEquals = 0 },
+                ]
+                Next = "EncoderSucceeded"
+              }]
+              Default = "EncoderFailed"
+            }
+            EncoderSucceeded = {
+              Type = "Pass"
               End = true
             }
             EncoderFailed = {
@@ -188,14 +248,14 @@ resource "aws_iam_role" "orchestration" {
 resource "aws_iam_role_policy" "orchestration" {
   name = "${local.name}-orchestration"
   role = aws_iam_role.orchestration.id
-  # ECS DescribeTasks/StopTask and EventBridge's managed rule used by optimized
-  # ECS sync require Resource "*"; the ECS actions are constrained to this cluster.
+  # ECS DescribeTasks/StopTask require Resource "*" with a cluster condition.
+  # EventBridge sync is limited to Step Functions' managed ECS completion rule.
   # RunTask is limited to this cluster and encoder task definition; PassRole is limited
   # to the two fixed roles used by that task definition.
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = ["ecs:RunTask"], Resource = aws_ecs_task_definition.encoder.arn, Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.main.arn } } },
     { Effect = "Allow", Action = ["ecs:DescribeTasks", "ecs:StopTask"], Resource = "*", Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.main.arn } } },
-    { Effect = "Allow", Action = ["events:PutRule", "events:PutTargets", "events:DescribeRule"], Resource = "*" },
+    { Effect = "Allow", Action = ["events:PutRule", "events:PutTargets", "events:DescribeRule"], Resource = "arn:aws:events:${var.aws_region}:${data.aws_caller_identity.current.account_id}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule" },
     { Effect = "Allow", Action = ["iam:PassRole"], Resource = [aws_iam_role.encoder_execution.arn, aws_iam_role.encoder.arn], Condition = { StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" } } },
   ] })
 }
@@ -210,6 +270,7 @@ resource "aws_iam_role_policy" "worker_orchestration" {
   name = "${local.name}-worker-orchestration"
   role = aws_iam_role.worker.id
   policy = jsonencode({ Version = "2012-10-17", Statement = [
-    { Effect = "Allow", Action = ["states:StartExecution", "states:DescribeExecution", "states:StopExecution"], Resource = aws_sfn_state_machine.orchestration.arn },
+    { Effect = "Allow", Action = ["states:StartExecution"], Resource = aws_sfn_state_machine.orchestration.arn },
+    { Effect = "Allow", Action = ["states:DescribeExecution", "states:StopExecution"], Resource = "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:execution:${aws_sfn_state_machine.orchestration.name}:*" },
   ] })
 }

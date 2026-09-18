@@ -809,6 +809,33 @@ def _has_wildcard_resource(policy: str) -> bool:
     return False
 
 
+def _mask_nested_objects(body: str) -> str:
+    """Blank nested `{...}` objects so only direct statement attributes remain."""
+    direct = STRING_RE.sub(lambda match: " " * len(match.group()), body)
+    cursor = 0
+    while cursor < len(direct):
+        if direct[cursor] == "{":
+            end = _matching_brace(body, cursor, Path("IAM statement"))
+            body = body[:cursor] + " " * (end + 1 - cursor) + body[end + 1:]
+            cursor = end
+        cursor += 1
+    return body
+
+
+def _iam_statement_bodies(policy: str) -> list[str]:
+    """Return IAM statement object bodies, ignoring nested Condition objects."""
+    statements: list[str] = []
+    masked = STRING_RE.sub(lambda match: " " * len(match.group()), policy)
+    for opening, char in enumerate(masked):
+        if char != "{":
+            continue
+        closing = _matching_brace(policy, opening, Path("IAM policy"))
+        raw = policy[opening + 1:closing]
+        if _policy_actions(_mask_nested_objects(raw)):
+            statements.append(raw)
+    return statements
+
+
 def _has_public_principal(policy: str) -> bool:
     return re.search(
         r'(?is)["\']?(?:principal|identifiers)["\']?\s*[:=]\s*'
@@ -901,16 +928,25 @@ def check_dangerous_configuration(config: Configuration, checks: Checks, stage: 
             scoped_policy = _without_ecr_token_statements(policy) if stage in {"compute", "workers", "scaling", "orchestration"} else policy
             if stage in {"compute", "workers", "scaling", "orchestration"}:
                 check_task_protection_scope(config, policy, checks, block.location)
-            orchestration_wildcard_actions = {
-                "ecs:runtask", "ecs:describetasks", "ecs:stoptask",
-                "events:putrule", "events:puttargets", "events:describerule",
-                "iam:passrole",
-            }
-            orchestration_wildcard_ok = stage == "orchestration" and _policy_actions(policy) <= orchestration_wildcard_actions
-            checks.reject(
-                _has_wildcard_resource(scoped_policy) and not orchestration_wildcard_ok,
-                f"{block.location}: wildcard IAM resources are forbidden",
-            )
+                ecs_wildcard_actions = {"ecs:describetasks", "ecs:stoptask"}
+                for statement in _iam_statement_bodies(scoped_policy):
+                    if not _has_wildcard_resource(statement):
+                        continue
+                    actions = _policy_actions(statement)
+                    checks.require(
+                        bool(actions) and actions <= ecs_wildcard_actions,
+                        f"{block.location}: wildcard IAM resources are forbidden",
+                    )
+                    if actions <= ecs_wildcard_actions:
+                        checks.require(
+                            "ecs:cluster" in statement and "aws_ecs_cluster.main.arn" in statement,
+                            f"{block.location}: ECS wildcard actions must be conditioned on the worker cluster",
+                        )
+            else:
+                checks.reject(
+                    _has_wildcard_resource(scoped_policy),
+                    f"{block.location}: wildcard IAM resources are forbidden",
+                )
             if _has_public_principal(policy):
                 checks.reject(
                     bool(_policy_actions(policy) & WRITE_ACTIONS),
@@ -1335,9 +1371,12 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
         checks.require(resource_type in resources, f"orchestration requires {resource_type}")
 
     text = config.text
+    lower = text.lower()
     for required in (
         'Resource = "arn:aws:states:::ecs:runTask.sync"',
         "MaxConcurrency = 2",
+        "ItemSelector",
+        '"rendition.$" = "$$.Map.Item.Value"',
         'Name = "CHILD_PAYLOAD_JSON"',
         "States.JsonToString",
         'TimeoutSeconds = var.encoder_timeout_seconds',
@@ -1345,11 +1384,29 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
         'entryPoint = ["/bin/sh", "-ec"]',
         "video-worker encode-child -",
         'States.Format(\'{}/{}\'',
+        'ProcessorConfig = { Mode = "INLINE" }',
+        "TimestampLessThanPath",
+        "$$.State.EnteredTime",
+        "ResultSelector",
+        "$.Containers[0].ExitCode",
+        "NumericEquals = 0",
+        "StepFunctionsGetEventsForStepFunctionsExecutionRule",
     ):
         checks.require(required in text, f"orchestration must contain {required}")
-    checks.reject("states:::aws:states:distributedMap" in text.lower(), "Distributed Map is not allowed")
-    checks.reject("aws_lambda" in text.lower() or "batch:submitjob" in text.lower(), "orchestration must use ECS rather than Lambda or Batch")
-    checks.reject('"deadline_at"' in text and "CHILD_PAYLOAD_JSON" in text, "deadline_at must not be projected to child payload")
+    checks.require('Mode = "INLINE"' in text, 'Map ProcessorConfig Mode = "INLINE" is required')
+    checks.reject('Mode = "DISTRIBUTED"' in text, "Distributed Map is not allowed")
+    checks.reject("distributedmap" in lower, "Distributed Map is not allowed")
+    checks.reject("states:::lambda:invoke" in lower, "orchestration must use ECS rather than Lambda")
+    checks.reject("states:::batch:submitjob" in lower or "batch:submitjob" in lower,
+                  "orchestration must use ECS rather than Batch")
+
+    child_payload = ""
+    for match in re.finditer(r'"child_payload"\s*=\s*\{', text):
+        closing = _matching_brace(text, match.end() - 1, Path("orchestration"))
+        child_payload += text[match.end():closing]
+    checks.require(bool(child_payload), "orchestration must project a child_payload object")
+    checks.reject("deadline_at" in child_payload, "deadline_at must not be projected to child payload")
+    checks.require("deadline_at" in text, "deadline_at must bound Map/Task execution")
 
     encoder_tasks = [block for block in config.resources("aws_ecs_task_definition") if "encoder" in (block.name or "").lower()]
     checks.require(bool(encoder_tasks), "a dedicated encoder task definition is required")
@@ -1377,8 +1434,17 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
         checks.require(action.lower() in state_policy.lower(), f"state-machine role must allow {action}")
     checks.require("iam:PassedToService" in state_policy and "ecs-tasks.amazonaws.com" in state_policy,
                    "state-machine PassRole must be restricted to ECS tasks")
-    checks.require("states:StartExecution" in text and "states:DescribeExecution" in text and "states:StopExecution" in text,
+    checks.reject(
+        re.search(r'events:(?:PutRule|PutTargets|DescribeRule)[\s\S]*Resource\s*=\s*"\*"', state_policy) is not None,
+        "EventBridge permissions must target the Step Functions ECS sync rule",
+    )
+    checks.require('Action = ["states:StartExecution"]' in text, "parent StartExecution must target the state machine")
+    checks.require("states:DescribeExecution" in text and "states:StopExecution" in text,
                    "parent role must have only relevant execution lifecycle permissions")
+    checks.require(
+        ":execution:${aws_sfn_state_machine.orchestration.name}:" in text,
+        "DescribeExecution and StopExecution must target execution ARNs",
+    )
 
 def validate(config: Configuration, stage: str, shared_config: Configuration | None = None) -> list[str]:
     checks = Checks()
