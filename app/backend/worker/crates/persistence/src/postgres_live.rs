@@ -93,6 +93,10 @@ async fn connect_on_schema(url: &str, schema: &str) -> Client {
 }
 
 async fn setup() -> Option<Live> {
+    setup_with_migrations(&[SCHEMA_SQL, LEASE_SCHEMA_SQL, PUBLICATION_SCHEMA_SQL]).await
+}
+
+async fn setup_with_migrations(migrations: &[&str]) -> Option<Live> {
     let (url, required) = live_postgres_url();
     let admin = match connect(&url).await {
         Ok(client) => client,
@@ -127,32 +131,22 @@ async fn setup() -> Option<Live> {
         .execute(&format!("SET search_path TO {schema}"), &[])
         .await
         .expect("set search_path");
-    for statement in SCHEMA_SQL.split(';') {
-        let statement = statement.trim();
-        if !statement.is_empty() {
-            admin.execute(statement, &[]).await.unwrap_or_else(|error| {
-                panic!("apply schema statement {statement:?}: {error}");
-            });
-        }
-    }
-    for statement in LEASE_SCHEMA_SQL.split(';') {
-        let statement = statement.trim();
-        if !statement.is_empty() {
-            admin.execute(statement, &[]).await.unwrap_or_else(|error| {
-                panic!("apply lease schema statement {statement:?}: {error}");
-            });
-        }
-    }
-    for statement in PUBLICATION_SCHEMA_SQL.split(';') {
-        let statement = statement.trim();
-        if !statement.is_empty() {
-            admin.execute(statement, &[]).await.unwrap_or_else(|error| {
-                panic!("apply schema statement {statement:?}: {error}");
-            });
-        }
+    for sql in migrations {
+        apply_sql(&admin, sql).await;
     }
 
     Some(Live { url, schema, admin })
+}
+
+async fn apply_sql(admin: &Client, sql: &str) {
+    for statement in sql.split(';') {
+        let statement = statement.trim();
+        if !statement.is_empty() {
+            admin.execute(statement, &[]).await.unwrap_or_else(|error| {
+                panic!("apply schema statement {statement:?}: {error}");
+            });
+        }
+    }
 }
 
 async fn insert_job(admin: &Client, video_id: &str, job_id: &str, status: &str) {
@@ -262,6 +256,21 @@ async fn claim_and_acquire(
         jobs.acquire_lease(job_id, video_id, worker_id, LEASE_SECONDS, MAX_ATTEMPTS)
             .await
             .unwrap(),
+    )
+}
+
+async fn acquire_as_distributed(
+    live: &Live,
+    jobs: &mut PostgresJobState<Client>,
+    video_id: &str,
+    job_id: &str,
+    worker_id: &str,
+) -> (u32, String) {
+    let attempt = claim_and_acquire(jobs, video_id, job_id, worker_id).await;
+    set_mode(&live.admin, job_id, Some("distributed")).await;
+    (
+        attempt,
+        distributed_parent_master_key(video_id, job_id, attempt),
     )
 }
 
@@ -1022,5 +1031,95 @@ async fn cli_completion_rejects_non_null_pointer() {
     assert_eq!(status, "PROCESSING");
     assert_eq!(mode.as_deref(), Some("cli"));
     assert_eq!(published.as_deref(), Some(pointer));
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn distributed_completion_rejects_other_owner() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+    let (attempt, key) = acquire_as_distributed(&live, &mut jobs, VIDEO_ID, JOB_ID, WORKER_A).await;
+
+    assert_eq!(
+        jobs.complete_distributed(JOB_ID, VIDEO_ID, WORKER_B, attempt, &key)
+            .await
+            .unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "PROCESSING");
+    assert_eq!(mode.as_deref(), Some("distributed"));
+    assert!(pointer.is_none());
+    let row = lease_row(&live.admin, JOB_ID).await;
+    assert_eq!(row.get::<_, String>(1), WORKER_A);
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn distributed_completion_rejects_expired_lease() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+    let (attempt, key) = acquire_as_distributed(&live, &mut jobs, VIDEO_ID, JOB_ID, WORKER_A).await;
+    expire_lease(&live.admin, JOB_ID).await;
+
+    assert_eq!(
+        jobs.complete_distributed(JOB_ID, VIDEO_ID, WORKER_A, attempt, &key)
+            .await
+            .unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "PROCESSING");
+    assert_eq!(mode.as_deref(), Some("distributed"));
+    assert!(pointer.is_none());
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn distributed_completion_rejects_already_completed() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+    let (attempt, key) = acquire_as_distributed(&live, &mut jobs, VIDEO_ID, JOB_ID, WORKER_A).await;
+    assert_eq!(
+        jobs.complete_distributed(JOB_ID, VIDEO_ID, WORKER_A, attempt, &key)
+            .await
+            .unwrap(),
+        JobOperationOutcome::Applied
+    );
+
+    assert_eq!(
+        jobs.complete_distributed(JOB_ID, VIDEO_ID, WORKER_A, attempt, &key)
+            .await
+            .unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "COMPLETED");
+    assert_eq!(mode.as_deref(), Some("distributed"));
+    assert_eq!(pointer.as_deref(), Some(key.as_str()));
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn publication_migration_backfills_preexisting_jobs_to_cli() {
+    let Some(live) = setup_with_migrations(&[SCHEMA_SQL, LEASE_SCHEMA_SQL]).await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "COMPLETED").await;
+    apply_sql(&live.admin, PUBLICATION_SCHEMA_SQL).await;
+
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "COMPLETED");
+    assert_eq!(mode.as_deref(), Some("cli"));
+    assert!(pointer.is_none());
     live.cleanup().await;
 }

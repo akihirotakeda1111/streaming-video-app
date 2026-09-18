@@ -123,7 +123,11 @@ pub trait JobState: Send {
         published_manifest_key: &str,
     ) -> impl Future<Output = Result<JobOperationOutcome, PersistenceError>> + Send {
         let _ = (job_id, video_id, worker_id, attempt, published_manifest_key);
-        async { Err(PersistenceError("distributed completion is not implemented".into())) }
+        async {
+            Err(PersistenceError(
+                "distributed completion is not implemented".into(),
+            ))
+        }
     }
 
     fn fail(
