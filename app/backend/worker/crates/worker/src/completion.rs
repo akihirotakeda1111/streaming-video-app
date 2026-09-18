@@ -7,7 +7,7 @@ use persistence::JobState;
 use queue::{ChangeVisibility, Delete, Message};
 use storage::{Read, Write};
 use tokio::{
-    sync::{watch, Mutex},
+    sync::{Mutex, watch},
     time::Instant,
 };
 use tracing::Instrument;
@@ -18,7 +18,7 @@ use crate::{
     },
     heartbeat::{HeartbeatDeadlines, HeartbeatSettings},
     retry::{OwnedAttemptProcessor, ProcessingOutcome, RetrySettings},
-    runtime::{cancellation_requested, MessageProcessor},
+    runtime::{MessageProcessor, cancellation_requested},
 };
 
 /// Coordinates all records in one queue message. A message is acknowledged
@@ -753,11 +753,12 @@ mod tests {
             || c.starts_with("release:")
             || c.starts_with("fail:")));
         assert_eq!(calls.iter().filter(|c| *c == "encode").count(), 1);
-        assert!(!f
-            .log
-            .calls()
-            .iter()
-            .any(|c| matches!(c, crate::fakes::Call::Write { .. })));
+        assert!(
+            !f.log
+                .calls()
+                .iter()
+                .any(|c| matches!(c, crate::fakes::Call::Write { .. }))
+        );
         assert_eq!(queue_log.calls().len(), 1);
         assert!(std::fs::read_dir(f._root.path()).unwrap().next().is_none());
         assert!(f.processor.heartbeat_jobs.try_lock().is_ok());
@@ -974,11 +975,12 @@ mod tests {
             || c.starts_with("complete:")
             || c.starts_with("fail:")
             || c.starts_with("release:")));
-        assert!(!f
-            .log
-            .calls()
-            .iter()
-            .any(|c| matches!(c, crate::fakes::Call::Write { .. })));
+        assert!(
+            !f.log
+                .calls()
+                .iter()
+                .any(|c| matches!(c, crate::fakes::Call::Write { .. }))
+        );
         assert!(std::fs::read_dir(f._root.path()).unwrap().next().is_none());
         assert!(f.processor.heartbeat_jobs.try_lock().is_ok());
         assert!(f.processor.queue.try_lock().is_ok());
@@ -1034,11 +1036,7 @@ mod tests {
                 let transition = format!(
                     "{}:{FIRST}",
                     if first_fails {
-                        if attempt == 5 {
-                            "fail"
-                        } else {
-                            "release"
-                        }
+                        if attempt == 5 { "fail" } else { "release" }
                     } else {
                         "complete"
                     }
@@ -1067,18 +1065,20 @@ mod tests {
                 s.visibility_failure = visibility;
             }
             f.run(&[FIRST]).await;
-            assert!(!f
-                .log
-                .calls()
-                .iter()
-                .any(|c| matches!(c, crate::fakes::Call::Write { .. })));
-            assert!(!f
-                .state
-                .lock()
-                .unwrap()
-                .calls
-                .iter()
-                .any(|c| c == "delete" || c.starts_with("complete:")));
+            assert!(
+                !f.log
+                    .calls()
+                    .iter()
+                    .any(|c| matches!(c, crate::fakes::Call::Write { .. }))
+            );
+            assert!(
+                !f.state
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .iter()
+                    .any(|c| c == "delete" || c.starts_with("complete:"))
+            );
         }
     }
     #[tokio::test]

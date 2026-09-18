@@ -80,7 +80,11 @@ where
         if !owned() {
             return Err(PublishError::OwnershipLost);
         }
-        tracing::info!(operation = "segment_upload", outcome = "start", "media operation");
+        tracing::info!(
+            operation = "segment_upload",
+            outcome = "start",
+            "media operation"
+        );
         storage
             .write(
                 output_bucket,
@@ -89,7 +93,11 @@ where
                 &contents,
             )
             .await?;
-        tracing::info!(operation = "segment_upload", outcome = "success", "media operation");
+        tracing::info!(
+            operation = "segment_upload",
+            outcome = "success",
+            "media operation"
+        );
     }
 
     let playlist = tokio::fs::read(&output.playlist).await?;
@@ -97,7 +105,11 @@ where
         return Err(PublishError::OwnershipLost);
     }
 
-    tracing::info!(operation = "manifest_upload", outcome = "start", "media operation");
+    tracing::info!(
+        operation = "manifest_upload",
+        outcome = "start",
+        "media operation"
+    );
     storage
         .write(
             output_bucket,
@@ -106,7 +118,11 @@ where
             &playlist,
         )
         .await?;
-    tracing::info!(operation = "manifest_upload", outcome = "success", "media operation");
+    tracing::info!(
+        operation = "manifest_upload",
+        outcome = "success",
+        "media operation"
+    );
     Ok(())
 }
 

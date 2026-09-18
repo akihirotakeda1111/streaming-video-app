@@ -40,4 +40,5 @@ cargo test --locked --manifest-path app/backend/worker/Cargo.toml
 cargo test --locked --manifest-path app/backend/worker/Cargo.toml --test tls_database -- --ignored
 cargo test --locked --manifest-path app/backend/worker/Cargo.toml -p encoding --test media_limits -- --ignored
 cargo test --locked --manifest-path app/backend/worker/Cargo.toml -p worker --bin worker sigterm_stops_receive_and_terminates_real_ffmpeg -- --ignored
+cargo test --locked --manifest-path app/backend/worker/Cargo.toml -p worker sigterm_stops_ffmpeg_without_result_json -- --ignored
 python3 app/scripts/validate_contracts.py
