@@ -20,5 +20,6 @@ output "worker_task_definition" { value = aws_ecs_task_definition.worker.arn }
 output "worker_service" { value = aws_ecs_service.worker.name }
 output "worker_image_digest" { value = data.aws_ecr_image.worker.image_digest }
 output "worker_repository_url" { value = aws_ecr_repository.worker.repository_url }
+output "orchestration_state_machine" { value = aws_sfn_state_machine.orchestration.arn }
 output "public_subnet_ids" { value = aws_subnet.public[*].id }
 output "api_security_group_id" { value = aws_security_group.api.id }

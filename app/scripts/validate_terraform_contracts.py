@@ -365,7 +365,7 @@ def check_foundation(config: Configuration, checks: Checks) -> None:
 
 
 def check_forbidden_resources(config: Configuration, checks: Checks, stage: str = "complete") -> None:
-    if stage in {"compute", "workers", "scaling"}:
+    if stage in {"compute", "workers", "scaling", "orchestration"}:
         return
     for block in config.resources():
         forbidden = block.type_name in FORBIDDEN_RESOURCE_TYPES or block.type_name.startswith(
@@ -898,11 +898,17 @@ def check_dangerous_configuration(config: Configuration, checks: Checks, stage: 
             checks.reject(_has_wildcard_action(policy), f"{block.location}: wildcard IAM actions are forbidden")
             # ECR's authorization-token API is the AWS-defined exception: it
             # requires Resource "*" even when all image actions are scoped.
-            scoped_policy = _without_ecr_token_statements(policy) if stage in {"compute", "workers", "scaling"} else policy
-            if stage in {"compute", "workers", "scaling"}:
+            scoped_policy = _without_ecr_token_statements(policy) if stage in {"compute", "workers", "scaling", "orchestration"} else policy
+            if stage in {"compute", "workers", "scaling", "orchestration"}:
                 check_task_protection_scope(config, policy, checks, block.location)
+            orchestration_wildcard_actions = {
+                "ecs:runtask", "ecs:describetasks", "ecs:stoptask",
+                "events:putrule", "events:puttargets", "events:describerule",
+                "iam:passrole",
+            }
+            orchestration_wildcard_ok = stage == "orchestration" and _policy_actions(policy) <= orchestration_wildcard_actions
             checks.reject(
-                _has_wildcard_resource(scoped_policy),
+                _has_wildcard_resource(scoped_policy) and not orchestration_wildcard_ok,
                 f"{block.location}: wildcard IAM resources are forbidden",
             )
             if _has_public_principal(policy):
@@ -1197,8 +1203,8 @@ def check_workers(config: Configuration, checks: Checks) -> None:
     resources = {block.type_name for block in config.resources()}
     for resource_type in ("aws_ecr_repository", "aws_ecs_task_definition", "aws_ecs_service", "aws_iam_role", "aws_iam_role_policy"):
         checks.require(resource_type in resources, f"worker root requires {resource_type}")
-    worker_tasks = [block for block in config.resources("aws_ecs_task_definition") if "worker" in (block.name or "").lower() or "worker" in block.body.lower()]
-    worker_services = [block for block in config.resources("aws_ecs_service") if "worker" in (block.name or "").lower() or "worker" in block.body.lower()]
+    worker_tasks = [block for block in config.resources("aws_ecs_task_definition") if "worker" in (block.name or "").lower() or "WORKER_RUNTIME_MODE" in block.body]
+    worker_services = [block for block in config.resources("aws_ecs_service") if "worker" in (block.name or "").lower()]
     checks.require(bool(worker_tasks), "worker task definition is required")
     checks.require(bool(worker_services), "worker ECS service is required")
     for block in worker_tasks:
@@ -1321,18 +1327,75 @@ def check_scaling(config: Configuration, checks: Checks) -> None:
     checks.require("ecs:UpdateTaskProtection" in config.text and "ecs:GetTaskProtection" in config.text,
                    "scaling must retain worker task-protection integration")
 
+
+def check_orchestration(config: Configuration, checks: Checks) -> None:
+    """Check the fixed, inline-Map Fargate orchestration contract."""
+    resources = {block.type_name for block in config.resources()}
+    for resource_type in ("aws_sfn_state_machine", "aws_ecs_task_definition", "aws_iam_role", "aws_iam_role_policy"):
+        checks.require(resource_type in resources, f"orchestration requires {resource_type}")
+
+    text = config.text
+    for required in (
+        'Resource = "arn:aws:states:::ecs:runTask.sync"',
+        "MaxConcurrency = 2",
+        'Name = "CHILD_PAYLOAD_JSON"',
+        "States.JsonToString",
+        'TimeoutSeconds = var.encoder_timeout_seconds',
+        'TimeoutSeconds = var.orchestration_timeout_seconds',
+        'entryPoint = ["/bin/sh", "-ec"]',
+        "video-worker encode-child -",
+        'States.Format(\'{}/{}\'',
+    ):
+        checks.require(required in text, f"orchestration must contain {required}")
+    checks.reject("states:::aws:states:distributedMap" in text.lower(), "Distributed Map is not allowed")
+    checks.reject("aws_lambda" in text.lower() or "batch:submitjob" in text.lower(), "orchestration must use ECS rather than Lambda or Batch")
+    checks.reject('"deadline_at"' in text and "CHILD_PAYLOAD_JSON" in text, "deadline_at must not be projected to child payload")
+
+    encoder_tasks = [block for block in config.resources("aws_ecs_task_definition") if "encoder" in (block.name or "").lower()]
+    checks.require(bool(encoder_tasks), "a dedicated encoder task definition is required")
+    for task in encoder_tasks:
+        checks.require("FARGATE" in task.body and "awsvpc" in task.body, f"{task.location}: encoder must run on Fargate awsvpc")
+        checks.require("aws_iam_role.encoder.arn" in task.body, f"{task.location}: encoder must use the restricted encoder task role")
+        checks.reject("DATABASE_URL" in task.body or "VIDEO_ENCODING_QUEUE_URL" in task.body, f"{task.location}: child must not receive database or SQS configuration")
+
+    encoder_policies = [
+        _policy_text(config, block) for block in config.resources("aws_iam_role_policy")
+        if "encoder" in (block.name or "").lower() or "encoder" in block.body.lower()
+    ]
+    child_policy = "\n".join(encoder_policies)
+    checks.require("s3:GetObject".lower() in child_policy.lower(), "encoder task must read the canonical source")
+    checks.require("s3:PutObject".lower() in child_policy.lower(), "encoder task must write rendition objects")
+    checks.require("hls/attempts/*/*/360p/*" in child_policy and "hls/attempts/*/*/720p/*" in child_policy,
+                   "encoder writes must be restricted to the two rendition prefixes")
+    checks.reject("sqs:" in child_policy.lower() or "database_url" in child_policy.lower(), "encoder task must have no SQS or database access")
+
+    state_policy = "\n".join(
+        _policy_text(config, block) for block in config.resources("aws_iam_role_policy")
+        if "orchestration" in (block.name or "").lower() or "orchestration" in block.body.lower()
+    )
+    for action in ("ecs:RunTask", "ecs:DescribeTasks", "ecs:StopTask", "events:PutRule", "events:PutTargets", "events:DescribeRule", "iam:PassRole"):
+        checks.require(action.lower() in state_policy.lower(), f"state-machine role must allow {action}")
+    checks.require("iam:PassedToService" in state_policy and "ecs-tasks.amazonaws.com" in state_policy,
+                   "state-machine PassRole must be restricted to ECS tasks")
+    checks.require("states:StartExecution" in text and "states:DescribeExecution" in text and "states:StopExecution" in text,
+                   "parent role must have only relevant execution lifecycle permissions")
+
 def validate(config: Configuration, stage: str, shared_config: Configuration | None = None) -> list[str]:
     checks = Checks()
     check_foundation(config, checks)
     check_forbidden_resources(config, checks, stage)
     check_dangerous_configuration(config, checks, stage)
 
-    if stage in {"compute", "workers", "scaling"}:
+    if stage in {"compute", "workers", "scaling", "orchestration"}:
         check_compute(config, checks)
         if stage in {"workers", "scaling"}:
             check_workers(config, checks)
         if stage == "scaling":
             check_scaling(config, checks)
+        if stage == "orchestration":
+            check_workers(config, checks)
+            check_scaling(config, checks)
+            check_orchestration(config, checks)
         shared = shared_config or load_configuration(config.root.parent / "terraform")
         checks.errors.extend(f"shared root: {error}" for error in validate(shared, "complete"))
         return checks.errors
@@ -1366,7 +1429,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("foundation", "storage-queue", "reliability", "delivery", "complete", "compute", "workers", "scaling"),
+        choices=("foundation", "storage-queue", "reliability", "delivery", "complete", "compute", "workers", "scaling", "orchestration"),
         default="complete",
         help="Task completion stage to validate (default: complete)",
     )
@@ -1377,7 +1440,7 @@ def main() -> int:
     args = parse_args()
     try:
         terraform_dir = args.terraform_dir.resolve()
-        if terraform_dir == Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform" and args.stage in {"compute", "workers", "scaling"}:
+        if terraform_dir == Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform" and args.stage in {"compute", "workers", "scaling", "orchestration"}:
             terraform_dir = Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform-compute"
         config = load_configuration(terraform_dir)
         shared_config = load_configuration(args.shared_terraform_dir.resolve()) if args.shared_terraform_dir else None
