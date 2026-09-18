@@ -221,6 +221,177 @@ func TestGetVideoPlaybackRejectsCorruptStoredState(t *testing.T) {
 	}
 }
 
+func TestGetVideoPlaybackModeAndPointerCombinations(t *testing.T) {
+	legacyKey := legacyPlaybackManifestKey()
+	validPointer := distributedParentMasterKey(1)
+	legacyURL := testOutputEndpoint + "/" + legacyKey
+	distributedURL := testOutputEndpoint + "/" + validPointer
+
+	tests := []struct {
+		name       string
+		job        persistence.EncodingJob
+		wantStatus int
+		wantCode   string
+		wantURL    string
+	}{
+		{
+			name: "completed cli null pointer returns legacy url",
+			job: persistence.EncodingJob{
+				JobID:  testJobID,
+				Status: persistence.JobStatusCompleted,
+				Mode:   persistence.JobModeCLI,
+			},
+			wantStatus: http.StatusOK,
+			wantURL:    legacyURL,
+		},
+		{
+			name: "completed distributed valid pointer returns published key",
+			job: persistence.EncodingJob{
+				JobID:                testJobID,
+				Status:               persistence.JobStatusCompleted,
+				Mode:                 persistence.JobModeDistributed,
+				Attempt:              1,
+				PublishedManifestKey: stringPtr(validPointer),
+			},
+			wantStatus: http.StatusOK,
+			wantURL:    distributedURL,
+		},
+		{
+			name: "completed distributed null pointer is internal error",
+			job: persistence.EncodingJob{
+				JobID:   testJobID,
+				Status:  persistence.JobStatusCompleted,
+				Mode:    persistence.JobModeDistributed,
+				Attempt: 1,
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL_ERROR",
+		},
+		{
+			name: "completed distributed invalid pointer is internal error",
+			job: persistence.EncodingJob{
+				JobID:                testJobID,
+				Status:               persistence.JobStatusCompleted,
+				Mode:                 persistence.JobModeDistributed,
+				Attempt:              1,
+				PublishedManifestKey: stringPtr("videos/" + string(testVideoID) + "/jobs/" + string(testJobID) + "/hls/index.m3u8"),
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL_ERROR",
+		},
+		{
+			name: "completed distributed absolute url pointer is internal error",
+			job: persistence.EncodingJob{
+				JobID:                testJobID,
+				Status:               persistence.JobStatusCompleted,
+				Mode:                 persistence.JobModeDistributed,
+				Attempt:              1,
+				PublishedManifestKey: stringPtr("https://example.test/" + validPointer),
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL_ERROR",
+		},
+		{
+			name: "completed distributed traversal pointer is internal error",
+			job: persistence.EncodingJob{
+				JobID:                testJobID,
+				Status:               persistence.JobStatusCompleted,
+				Mode:                 persistence.JobModeDistributed,
+				Attempt:              1,
+				PublishedManifestKey: stringPtr("videos/" + string(testVideoID) + "/jobs/" + string(testJobID) + "/hls/attempts/1/job-" + string(testJobID) + "-a1/../index.m3u8"),
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL_ERROR",
+		},
+		{
+			name: "completed distributed other job pointer is internal error",
+			job: persistence.EncodingJob{
+				JobID:                testJobID,
+				Status:               persistence.JobStatusCompleted,
+				Mode:                 persistence.JobModeDistributed,
+				Attempt:              1,
+				PublishedManifestKey: stringPtr("videos/" + string(testVideoID) + "/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd68/hls/attempts/1/job-018f47a2-4699-7892-9fc0-fbe46d3bbd68-a1/index.m3u8"),
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL_ERROR",
+		},
+		{
+			name: "completed distributed encoded traversal pointer is internal error",
+			job: persistence.EncodingJob{
+				JobID:                testJobID,
+				Status:               persistence.JobStatusCompleted,
+				Mode:                 persistence.JobModeDistributed,
+				Attempt:              1,
+				PublishedManifestKey: stringPtr("videos/" + string(testVideoID) + "/jobs/" + string(testJobID) + "/hls/attempts/1/%2e%2e/index.m3u8"),
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL_ERROR",
+		},
+		{
+			name: "completed cli non-null pointer is internal error",
+			job: persistence.EncodingJob{
+				JobID:                testJobID,
+				Status:               persistence.JobStatusCompleted,
+				Mode:                 persistence.JobModeCLI,
+				PublishedManifestKey: stringPtr(legacyKey),
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL_ERROR",
+		},
+		{
+			name: "completed null mode is internal error",
+			job: persistence.EncodingJob{
+				JobID:  testJobID,
+				Status: persistence.JobStatusCompleted,
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL_ERROR",
+		},
+		{
+			name: "completed unknown mode is internal error",
+			job: persistence.EncodingJob{
+				JobID:  testJobID,
+				Status: persistence.JobStatusCompleted,
+				Mode:   persistence.JobMode("batch"),
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "INTERNAL_ERROR",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &fakeVideoStatusRepo{
+				video: persistence.Video{VideoID: testVideoID, Job: tt.job},
+			}
+			rr := getPlayback(repo, string(testVideoID), testOutputBucket, testOutputEndpoint)
+			body := rr.Body.Bytes()
+
+			if tt.wantStatus == http.StatusOK {
+				if rr.Code != http.StatusOK {
+					t.Fatalf("status = %d, body = %s", rr.Code, body)
+				}
+				var got playbackResponse
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Fatal(err)
+				}
+				if got.ManifestURL != tt.wantURL {
+					t.Fatalf("manifestUrl = %q, want %q", got.ManifestURL, tt.wantURL)
+				}
+				if got.VideoID != testVideoID || got.JobID != testJobID || got.Protocol != "HLS" || got.ContentType != playbackContentType {
+					t.Fatalf("playback = %#v", got)
+				}
+				return
+			}
+
+			if strings.Contains(string(body), "manifestUrl") || strings.Contains(string(body), "index.m3u8") {
+				t.Fatalf("inconsistent playback leaked manifest URL: %s", body)
+			}
+			assertErrorResponse(t, rr, tt.wantStatus, tt.wantCode)
+		})
+	}
+}
+
 func TestGetVideoPlaybackURLGenerationFailure(t *testing.T) {
 	tests := map[string]struct {
 		video    persistence.Video
@@ -280,6 +451,19 @@ func completedPlaybackVideo() persistence.Video {
 	}
 }
 
+func legacyPlaybackManifestKey() string {
+	return "videos/" + string(testVideoID) + "/jobs/" + string(testJobID) + "/hls/index.m3u8"
+}
+
+func distributedParentMasterKey(attempt int) string {
+	executionID := fmt.Sprintf("job-%s-a%d", testJobID, attempt)
+	return fmt.Sprintf("videos/%s/jobs/%s/hls/attempts/%d/%s/index.m3u8", testVideoID, testJobID, attempt, executionID)
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
 func getPlayback(repo persistence.Repository, videoID, bucket, endpoint string) *httptest.ResponseRecorder {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/videos/"+videoID+"/playback", nil)
@@ -288,16 +472,25 @@ func getPlayback(repo persistence.Repository, videoID, bucket, endpoint string) 
 }
 
 func TestBuildDeliveryManifestURL(t *testing.T) {
+	legacyKey := legacyPlaybackManifestKey()
+	distributedKey := distributedParentMasterKey(1)
 	for _, origin := range []string{"https://test.cloudfront.net", "https://test.cloudfront.net/", "http://localhost:4567"} {
-		got, err := buildDeliveryManifestURL(origin, testVideoID, testJobID)
-		want := strings.TrimSuffix(origin, "/") + "/videos/" + string(testVideoID) + "/jobs/" + string(testJobID) + "/hls/index.m3u8"
-		if err != nil || got != want {
-			t.Errorf("origin %q: got %q, %v; want %q", origin, got, err, want)
+		for _, key := range []string{legacyKey, distributedKey} {
+			got, err := buildDeliveryManifestURL(origin, key)
+			want := strings.TrimSuffix(origin, "/") + "/" + key
+			if err != nil || got != want {
+				t.Errorf("origin %q key %q: got %q, %v; want %q", origin, key, got, err, want)
+			}
 		}
 	}
 	for _, origin := range []string{"", "https://", "https://test.cloudfront.net//", "https://test.cloudfront.net/bucket", "https://user:pass@test.cloudfront.net", "https://test.cloudfront.net?key=value", "https://test.cloudfront.net?", "https://test.cloudfront.net#fragment"} {
-		if got, err := buildDeliveryManifestURL(origin, testVideoID, testJobID); err == nil || got != "" {
+		if got, err := buildDeliveryManifestURL(origin, legacyKey); err == nil || got != "" {
 			t.Errorf("invalid origin %q: got %q, %v", origin, got, err)
+		}
+	}
+	for _, key := range []string{"/" + legacyKey, "videos/../" + legacyKey, `videos\` + string(testVideoID) + "/index.m3u8"} {
+		if got, err := buildDeliveryManifestURL("https://test.cloudfront.net", key); err == nil || got != "" {
+			t.Errorf("invalid key %q: got %q, %v", key, got, err)
 		}
 	}
 }

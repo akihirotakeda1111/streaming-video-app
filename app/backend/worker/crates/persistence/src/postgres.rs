@@ -591,14 +591,85 @@ mod tests {
         assert!(acquire.contains("attempt < $5::text::int"));
         assert!(acquire.contains("worker_id IS NULL AND lease_expires_at IS NULL"));
         assert!(acquire.contains("status IN ('QUEUED', 'PROCESSING')"));
+        assert!(acquire.contains("mode = COALESCE(mode, 'cli')"));
+        assert!(acquire.contains("(mode IS NULL OR mode = 'cli')"));
         assert!(acquire.contains("RETURNING attempt, lease_expires_at"));
 
         assert!(jobs.database.statements[1].contains("lease_expires_at > NOW()"));
         assert!(jobs.database.statements[2].contains("lease_expires_at > NOW()"));
         assert!(jobs.database.statements[2].contains("attempt < $4::text::int"));
         assert!(jobs.database.statements[3].contains("lease_expires_at > NOW()"));
+        assert!(jobs.database.statements[3].contains("mode = 'cli'"));
+        assert!(jobs.database.statements[3].contains("published_manifest_key IS NULL"));
         assert!(jobs.database.statements[4].contains("lease_expires_at > NOW()"));
         assert!(jobs.database.statements[4].contains("attempt >= $5::text::int"));
+    }
+
+    fn distributed_parent_master_key(job_id: &str, video_id: &str, attempt: u32) -> String {
+        let execution_id = format!("job-{job_id}-a{attempt}");
+        format!("videos/{video_id}/jobs/{job_id}/hls/attempts/{attempt}/{execution_id}/index.m3u8")
+    }
+
+    #[tokio::test]
+    async fn distributed_completion_binds_attempt_and_mode_predicates() {
+        let mut jobs = jobs();
+        let key = distributed_parent_master_key("job-id", "video-id", 1);
+        assert_eq!(
+            jobs.complete_distributed("job-id", "video-id", "worker-a", 1, &key)
+                .await
+                .unwrap(),
+            JobOperationOutcome::Applied
+        );
+        assert_eq!(
+            jobs.database.parameters[0],
+            ["job-id", "video-id", "worker-a", "1", key.as_str()]
+        );
+        let sql = &jobs.database.statements[0];
+        assert!(sql.contains("published_manifest_key = $5"));
+        assert!(sql.contains("attempt = $4::text::int"));
+        assert!(sql.contains("lease_expires_at > NOW()"));
+        assert!(sql.contains("status = 'PROCESSING'"));
+        assert!(sql.contains("mode = 'distributed'"));
+        assert!(sql.contains("published_manifest_key IS NULL"));
+    }
+
+    #[tokio::test]
+    async fn distributed_completion_rejects_zero_attempt_and_invalid_keys_before_update() {
+        let mut jobs = jobs();
+        let valid = distributed_parent_master_key("job-id", "video-id", 1);
+        assert!(
+            jobs.complete_distributed("job-id", "video-id", "worker-a", 0, &valid)
+                .await
+                .is_err()
+        );
+        assert!(
+            jobs.complete_distributed(
+                "job-id",
+                "video-id",
+                "worker-a",
+                1,
+                "videos/video-id/jobs/job-id/hls/index.m3u8"
+            )
+            .await
+            .is_err()
+        );
+        assert!(jobs.database.statements.is_empty());
+        assert!(jobs.database.parameters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn distributed_completion_zero_rows_is_not_owner() {
+        let mut jobs = PostgresJobState::new(FakeDatabase {
+            changed: 0,
+            ..FakeDatabase::default()
+        });
+        let key = distributed_parent_master_key("job-id", "video-id", 2);
+        assert_eq!(
+            jobs.complete_distributed("job-id", "video-id", "worker-a", 2, &key)
+                .await
+                .unwrap(),
+            JobOperationOutcome::NotOwner
+        );
     }
 
     #[tokio::test]

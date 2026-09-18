@@ -104,25 +104,7 @@ func playbackManifestKey(video persistence.Video) (string, error) {
 	}
 }
 
-func buildDeliveryManifestURL(baseURL string, parts ...any) (string, error) {
-	var manifestKey string
-	switch len(parts) {
-	case 1:
-		key, ok := parts[0].(string)
-		if !ok {
-			return "", fmt.Errorf("manifest key must be a string")
-		}
-		manifestKey = key
-	case 2: // Kept for the existing URL-builder unit contract; playback uses the persisted key path above.
-		videoID, videoOK := parts[0].(persistence.CanonicalUUID)
-		jobID, jobOK := parts[1].(persistence.CanonicalUUID)
-		if !videoOK || !jobOK || !canonicalVideoIDPattern.MatchString(string(videoID)) || !canonicalVideoIDPattern.MatchString(string(jobID)) {
-			return "", fmt.Errorf("video and job IDs must be canonical UUIDs")
-		}
-		manifestKey = "videos/" + string(videoID) + "/jobs/" + string(jobID) + "/hls/index.m3u8"
-	default:
-		return "", fmt.Errorf("invalid manifest key arguments")
-	}
+func buildDeliveryManifestURL(baseURL, manifestKey string) (string, error) {
 	if strings.HasPrefix(manifestKey, "/") || strings.Contains(manifestKey, "..") || strings.Contains(manifestKey, "\\") {
 		return "", fmt.Errorf("manifest key is invalid")
 	}

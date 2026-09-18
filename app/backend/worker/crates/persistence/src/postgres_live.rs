@@ -18,9 +18,8 @@ const SCHEMA_SQL: &str =
 const LEASE_SCHEMA_SQL: &str = include_str!(
     "../../../../api/internal/persistence/migrations/0002_job_lease_persistence.up.sql"
 );
-const PUBLICATION_SCHEMA_SQL: &str = include_str!(
-    "../../../../api/internal/persistence/migrations/0003_publication_state.up.sql"
-);
+const PUBLICATION_SCHEMA_SQL: &str =
+    include_str!("../../../../api/internal/persistence/migrations/0003_publication_state.up.sql");
 const DEFAULT_URL: &str = "postgres://streaming_video:streaming_video_dev_password@localhost:5432/streaming_video?sslmode=disable";
 const VIDEO_ID: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910a";
 const JOB_ID: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd67";
@@ -209,6 +208,61 @@ async fn expire_lease(admin: &Client, job_id: &str) {
         )
         .await
         .expect("expire lease");
+}
+
+async fn set_mode(admin: &Client, job_id: &str, mode: Option<&str>) {
+    let parameters: &[&(dyn ToSql + Sync)] = &[&job_id, &mode];
+    admin
+        .execute(
+            "UPDATE jobs SET mode = $2 WHERE id = $1::text::uuid",
+            parameters,
+        )
+        .await
+        .expect("set mode");
+}
+
+async fn set_published_manifest_key(admin: &Client, job_id: &str, key: Option<&str>) {
+    let parameters: &[&(dyn ToSql + Sync)] = &[&job_id, &key];
+    admin
+        .execute(
+            "UPDATE jobs SET published_manifest_key = $2 WHERE id = $1::text::uuid",
+            parameters,
+        )
+        .await
+        .expect("set published manifest key");
+}
+
+async fn publication_state(
+    admin: &Client,
+    job_id: &str,
+) -> (String, Option<String>, Option<String>) {
+    let row = admin
+        .query_one(
+            "SELECT status, mode, published_manifest_key FROM jobs WHERE id = $1::text::uuid",
+            &[&job_id],
+        )
+        .await
+        .expect("load publication state");
+    (row.get(0), row.get(1), row.get(2))
+}
+
+fn distributed_parent_master_key(video_id: &str, job_id: &str, attempt: u32) -> String {
+    let execution_id = format!("job-{job_id}-a{attempt}");
+    format!("videos/{video_id}/jobs/{job_id}/hls/attempts/{attempt}/{execution_id}/index.m3u8")
+}
+
+async fn claim_and_acquire(
+    jobs: &mut PostgresJobState<Client>,
+    video_id: &str,
+    job_id: &str,
+    worker_id: &str,
+) -> u32 {
+    assert!(jobs.claim(job_id, video_id).await.unwrap());
+    acquired_attempt(
+        jobs.acquire_lease(job_id, video_id, worker_id, LEASE_SECONDS, MAX_ATTEMPTS)
+            .await
+            .unwrap(),
+    )
 }
 
 #[tokio::test]
@@ -764,5 +818,209 @@ async fn retry_release_and_terminal_outcomes_clear_lease_fields() {
             .unwrap(),
         LeaseAcquisitionOutcome::Failed
     );
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn null_mode_is_fixed_to_cli_on_successful_cli_acquisition() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+
+    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "QUEUED");
+    assert!(mode.is_none());
+    assert!(pointer.is_none());
+
+    assert_eq!(
+        jobs.acquire_lease(JOB_ID, VIDEO_ID_2, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+            .await
+            .unwrap(),
+        LeaseAcquisitionOutcome::UnknownOrMismatched
+    );
+    let (_, unresolved, _) = publication_state(&live.admin, JOB_ID).await;
+    assert!(unresolved.is_none());
+
+    assert_eq!(
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        1
+    );
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "PROCESSING");
+    assert_eq!(mode.as_deref(), Some("cli"));
+    assert!(pointer.is_none());
+
+    expire_lease(&live.admin, JOB_ID).await;
+    assert_eq!(
+        acquired_attempt(
+            jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, MAX_ATTEMPTS)
+                .await
+                .unwrap()
+        ),
+        2
+    );
+    let (_, mode, _) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(mode.as_deref(), Some("cli"));
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn cli_acquisition_does_not_take_distributed_jobs() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    set_mode(&live.admin, JOB_ID, Some("distributed")).await;
+
+    assert_eq!(
+        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_A, LEASE_SECONDS, MAX_ATTEMPTS)
+            .await
+            .unwrap(),
+        LeaseAcquisitionOutcome::Busy
+    );
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "QUEUED");
+    assert_eq!(mode.as_deref(), Some("distributed"));
+    assert!(pointer.is_none());
+    let row = lease_row(&live.admin, JOB_ID).await;
+    assert!(row.get::<_, Option<String>>(1).is_none());
+    assert_eq!(row.get::<_, i32>(3), 0);
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn distributed_completion_commits_current_attempt_pointer() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+    let attempt = claim_and_acquire(&mut jobs, VIDEO_ID, JOB_ID, WORKER_A).await;
+    set_mode(&live.admin, JOB_ID, Some("distributed")).await;
+    let key = distributed_parent_master_key(VIDEO_ID, JOB_ID, attempt);
+
+    assert_eq!(
+        jobs.complete_distributed(JOB_ID, VIDEO_ID, WORKER_A, attempt, &key)
+            .await
+            .unwrap(),
+        JobOperationOutcome::Applied
+    );
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "COMPLETED");
+    assert_eq!(mode.as_deref(), Some("distributed"));
+    assert_eq!(pointer.as_deref(), Some(key.as_str()));
+    let completed = lease_row(&live.admin, JOB_ID).await;
+    assert!(completed.get::<_, Option<String>>(1).is_none());
+    assert!(completed.get::<_, Option<SystemTime>>(2).is_none());
+    assert_eq!(completed.get::<_, i32>(3), attempt as i32);
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn distributed_completion_rejects_stale_attempt() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+    let stale_attempt = claim_and_acquire(&mut jobs, VIDEO_ID, JOB_ID, WORKER_A).await;
+    expire_lease(&live.admin, JOB_ID).await;
+    let current_attempt = acquired_attempt(
+        jobs.acquire_lease(JOB_ID, VIDEO_ID, WORKER_B, LEASE_SECONDS, MAX_ATTEMPTS)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(current_attempt, stale_attempt + 1);
+    set_mode(&live.admin, JOB_ID, Some("distributed")).await;
+    let stale_key = distributed_parent_master_key(VIDEO_ID, JOB_ID, stale_attempt);
+
+    assert_eq!(
+        jobs.complete_distributed(JOB_ID, VIDEO_ID, WORKER_B, stale_attempt, &stale_key)
+            .await
+            .unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "PROCESSING");
+    assert_eq!(mode.as_deref(), Some("distributed"));
+    assert!(pointer.is_none());
+    let row = lease_row(&live.admin, JOB_ID).await;
+    assert_eq!(row.get::<_, String>(1), WORKER_B);
+    assert_eq!(row.get::<_, i32>(3), current_attempt as i32);
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn distributed_completion_rejects_wrong_mode() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    insert_job(&live.admin, VIDEO_ID_2, JOB_ID_2, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+
+    let attempt = claim_and_acquire(&mut jobs, VIDEO_ID, JOB_ID, WORKER_A).await;
+    let cli_key = distributed_parent_master_key(VIDEO_ID, JOB_ID, attempt);
+    assert_eq!(
+        jobs.complete_distributed(JOB_ID, VIDEO_ID, WORKER_A, attempt, &cli_key)
+            .await
+            .unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "PROCESSING");
+    assert_eq!(mode.as_deref(), Some("cli"));
+    assert!(pointer.is_none());
+
+    let unresolved_attempt = claim_and_acquire(&mut jobs, VIDEO_ID_2, JOB_ID_2, WORKER_A).await;
+    set_mode(&live.admin, JOB_ID_2, None).await;
+    let unresolved_key = distributed_parent_master_key(VIDEO_ID_2, JOB_ID_2, unresolved_attempt);
+    assert_eq!(
+        jobs.complete_distributed(
+            JOB_ID_2,
+            VIDEO_ID_2,
+            WORKER_A,
+            unresolved_attempt,
+            &unresolved_key
+        )
+        .await
+        .unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID_2).await;
+    assert_eq!(status, "PROCESSING");
+    assert!(mode.is_none());
+    assert!(pointer.is_none());
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn cli_completion_rejects_non_null_pointer() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+    let _ = claim_and_acquire(&mut jobs, VIDEO_ID, JOB_ID, WORKER_A).await;
+    let pointer = "videos/example/hls/index.m3u8";
+    set_published_manifest_key(&live.admin, JOB_ID, Some(pointer)).await;
+
+    assert_eq!(
+        jobs.complete(JOB_ID, VIDEO_ID, WORKER_A).await.unwrap(),
+        JobOperationOutcome::NotOwner
+    );
+    let (status, mode, published) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "PROCESSING");
+    assert_eq!(mode.as_deref(), Some("cli"));
+    assert_eq!(published.as_deref(), Some(pointer));
     live.cleanup().await;
 }
