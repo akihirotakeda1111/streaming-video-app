@@ -61,7 +61,12 @@ func getVideoPlaybackHandler(service *VideoPlaybackService) http.HandlerFunc {
 			return
 		}
 
-		manifestURL, err := buildDeliveryManifestURL(service.playbackBaseURL, video.VideoID, video.Job.JobID)
+		manifestKey, err := playbackManifestKey(video)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "An unexpected error occurred.")
+			return
+		}
+		manifestURL, err := buildDeliveryManifestURL(service.playbackBaseURL, manifestKey)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "An unexpected error occurred.")
 			return
@@ -73,9 +78,53 @@ func getVideoPlaybackHandler(service *VideoPlaybackService) http.HandlerFunc {
 	}
 }
 
-func buildDeliveryManifestURL(baseURL string, videoID, jobID persistence.CanonicalUUID) (string, error) {
-	if !canonicalVideoIDPattern.MatchString(string(videoID)) || !canonicalVideoIDPattern.MatchString(string(jobID)) {
-		return "", fmt.Errorf("video and job IDs must be canonical UUIDs")
+func playbackManifestKey(video persistence.Video) (string, error) {
+	videoID, jobID := string(video.VideoID), string(video.Job.JobID)
+	if !canonicalVideoIDPattern.MatchString(videoID) || !canonicalVideoIDPattern.MatchString(jobID) || video.Job.Attempt < 0 {
+		return "", fmt.Errorf("invalid persisted playback identity")
+	}
+	switch video.Job.Mode {
+	case persistence.JobModeCLI:
+		if video.Job.PublishedManifestKey != nil {
+			return "", fmt.Errorf("cli job has a published pointer")
+		}
+		return "videos/" + videoID + "/jobs/" + jobID + "/hls/index.m3u8", nil
+	case persistence.JobModeDistributed:
+		if video.Job.Attempt <= 0 || video.Job.PublishedManifestKey == nil {
+			return "", fmt.Errorf("distributed job has no published pointer")
+		}
+		executionID := fmt.Sprintf("job-%s-a%d", jobID, video.Job.Attempt)
+		expected := fmt.Sprintf("videos/%s/jobs/%s/hls/attempts/%d/%s/index.m3u8", videoID, jobID, video.Job.Attempt, executionID)
+		if *video.Job.PublishedManifestKey != expected {
+			return "", fmt.Errorf("invalid distributed published pointer")
+		}
+		return expected, nil
+	default:
+		return "", fmt.Errorf("unknown or unresolved job mode")
+	}
+}
+
+func buildDeliveryManifestURL(baseURL string, parts ...any) (string, error) {
+	var manifestKey string
+	switch len(parts) {
+	case 1:
+		key, ok := parts[0].(string)
+		if !ok {
+			return "", fmt.Errorf("manifest key must be a string")
+		}
+		manifestKey = key
+	case 2: // Kept for the existing URL-builder unit contract; playback uses the persisted key path above.
+		videoID, videoOK := parts[0].(persistence.CanonicalUUID)
+		jobID, jobOK := parts[1].(persistence.CanonicalUUID)
+		if !videoOK || !jobOK || !canonicalVideoIDPattern.MatchString(string(videoID)) || !canonicalVideoIDPattern.MatchString(string(jobID)) {
+			return "", fmt.Errorf("video and job IDs must be canonical UUIDs")
+		}
+		manifestKey = "videos/" + string(videoID) + "/jobs/" + string(jobID) + "/hls/index.m3u8"
+	default:
+		return "", fmt.Errorf("invalid manifest key arguments")
+	}
+	if strings.HasPrefix(manifestKey, "/") || strings.Contains(manifestKey, "..") || strings.Contains(manifestKey, "\\") {
+		return "", fmt.Errorf("manifest key is invalid")
 	}
 	base, err := url.Parse(baseURL)
 	if err != nil || base.Scheme == "" || base.Host == "" {
@@ -84,7 +133,7 @@ func buildDeliveryManifestURL(baseURL string, videoID, jobID persistence.Canonic
 	if base.User != nil || base.ForceQuery || base.RawQuery != "" || base.Fragment != "" || (base.Path != "" && base.Path != "/") {
 		return "", fmt.Errorf("playback base URL must contain only a scheme and host")
 	}
-	base.Path = "/videos/" + string(videoID) + "/jobs/" + string(jobID) + "/hls/index.m3u8"
+	base.Path = "/" + manifestKey
 	return base.String(), nil
 }
 

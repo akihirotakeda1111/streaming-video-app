@@ -435,6 +435,7 @@ func completedContractVideo() persistence.Video {
 			JobID:     testContractJobID,
 			VideoID:   testContractVideoID,
 			Status:    persistence.JobStatusCompleted,
+			Mode:      persistence.JobModeCLI,
 			UpdatedAt: createdAt.Add(4*time.Minute + 52*time.Second),
 		},
 		CreatedAt: createdAt,

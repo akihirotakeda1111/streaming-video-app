@@ -114,6 +114,18 @@ pub trait JobState: Send {
         async { Err(PersistenceError("completion is not implemented".into())) }
     }
 
+    fn complete_distributed(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        published_manifest_key: &str,
+    ) -> impl Future<Output = Result<JobOperationOutcome, PersistenceError>> + Send {
+        let _ = (job_id, video_id, worker_id, attempt, published_manifest_key);
+        async { Err(PersistenceError("distributed completion is not implemented".into())) }
+    }
+
     fn fail(
         &mut self,
         job_id: &str,

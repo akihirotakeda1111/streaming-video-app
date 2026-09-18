@@ -228,6 +228,7 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
             "WITH acquired AS (
                 UPDATE jobs
                 SET status = 'PROCESSING',
+                    mode = COALESCE(mode, 'cli'),
                     worker_id = $3,
                     lease_expires_at = CURRENT_TIMESTAMP + ($4::text || ' seconds')::interval,
                     attempt = attempt + 1,
@@ -235,6 +236,7 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
                 WHERE id = $1::text::uuid
                   AND video_id = $2::text::uuid
                   AND status IN ('QUEUED', 'PROCESSING')
+                  AND (mode IS NULL OR mode = 'cli')
                   AND attempt < $5::text::int
                   AND ((worker_id IS NULL AND lease_expires_at IS NULL) OR lease_expires_at <= CURRENT_TIMESTAMP)
                 RETURNING attempt, lease_expires_at
@@ -294,8 +296,33 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
         worker_id: &str,
     ) -> Result<JobOperationOutcome, PersistenceError> {
         let changed = self.database.execute(
-            "UPDATE jobs SET status = 'COMPLETED', worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND worker_id = $3 AND status = 'PROCESSING' AND lease_expires_at > NOW()",
+            "UPDATE jobs SET status = 'COMPLETED', worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND worker_id = $3 AND status = 'PROCESSING' AND lease_expires_at > NOW() AND mode = 'cli' AND published_manifest_key IS NULL",
             &[job_id, video_id, worker_id],
+        ).await.map_err(map_error)?;
+        atomic_outcome(changed)
+    }
+
+    async fn complete_distributed(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        published_manifest_key: &str,
+    ) -> Result<JobOperationOutcome, PersistenceError> {
+        if attempt == 0 {
+            return Err(PersistenceError("invalid distributed attempt".into()));
+        }
+        let execution_id = format!("job-{job_id}-a{attempt}");
+        let expected = format!(
+            "videos/{video_id}/jobs/{job_id}/hls/attempts/{attempt}/{execution_id}/index.m3u8"
+        );
+        if published_manifest_key != expected {
+            return Err(PersistenceError("invalid distributed manifest key".into()));
+        }
+        let changed = self.database.execute(
+            "UPDATE jobs SET status = 'COMPLETED', published_manifest_key = $5, worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND worker_id = $3 AND attempt = $4::text::int AND status = 'PROCESSING' AND lease_expires_at > NOW() AND mode = 'distributed' AND published_manifest_key IS NULL AND $5 <> ''",
+            &[job_id, video_id, worker_id, &attempt.to_string(), published_manifest_key],
         ).await.map_err(map_error)?;
         atomic_outcome(changed)
     }

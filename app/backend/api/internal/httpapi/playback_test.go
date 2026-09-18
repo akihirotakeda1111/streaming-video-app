@@ -117,6 +117,7 @@ func TestGetVideoPlaybackStatusBranches(t *testing.T) {
 					Job: persistence.EncodingJob{
 						JobID:  testJobID,
 						Status: status,
+						Mode:   persistence.JobModeCLI,
 					},
 				},
 			}
@@ -239,6 +240,7 @@ func TestGetVideoPlaybackURLGenerationFailure(t *testing.T) {
 				Job: persistence.EncodingJob{
 					JobID:  testJobID,
 					Status: persistence.JobStatusCompleted,
+					Mode:   persistence.JobModeCLI,
 				},
 			},
 			endpoint: testOutputEndpoint,
@@ -273,6 +275,7 @@ func completedPlaybackVideo() persistence.Video {
 		Job: persistence.EncodingJob{
 			JobID:  testJobID,
 			Status: persistence.JobStatusCompleted,
+			Mode:   persistence.JobModeCLI,
 		},
 	}
 }
