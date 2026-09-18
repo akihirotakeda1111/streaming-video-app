@@ -10,6 +10,7 @@ allowed_paths:
   - app/backend/api/internal/persistence/**
   - app/backend/api/internal/httpapi/playback.go
   - app/backend/api/internal/httpapi/playback_test.go
+  - app/backend/api/cmd/api/wiring_test.go
   - app/backend/worker/crates/persistence/**
   - app/backend/worker/crates/worker/src/fakes.rs
 
