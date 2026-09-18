@@ -1379,8 +1379,12 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
         '"rendition.$" = "$$.Map.Item.Value"',
         'Name = "CHILD_PAYLOAD_JSON"',
         "States.JsonToString",
-        'TimeoutSeconds = var.encoder_timeout_seconds',
         'TimeoutSeconds = var.orchestration_timeout_seconds',
+        "TimeoutSecondsPath",
+        'QueryLanguage = "JSONata"',
+        "$toMillis($states.input.deadline_at)",
+        "$millis()",
+        "${var.encoder_timeout_seconds}",
         'entryPoint = ["/bin/sh", "-ec"]',
         "video-worker encode-child -",
         'States.Format(\'{}/{}\'',
@@ -1390,9 +1394,13 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
         "ResultSelector",
         "$.Containers[0].ExitCode",
         "NumericEquals = 0",
-        "StepFunctionsGetEventsForStepFunctionsExecutionRule",
+        "StepFunctionsGetEventsForECSTaskRule",
     ):
         checks.require(required in text, f"orchestration must contain {required}")
+    checks.reject(
+        "StepFunctionsGetEventsForStepFunctionsExecutionRule" in text,
+        "EventBridge sync must use StepFunctionsGetEventsForECSTaskRule",
+    )
     checks.require('Mode = "INLINE"' in text, 'Map ProcessorConfig Mode = "INLINE" is required')
     checks.reject('Mode = "DISTRIBUTED"' in text, "Distributed Map is not allowed")
     checks.reject("distributedmap" in lower, "Distributed Map is not allowed")
@@ -1407,6 +1415,10 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
     checks.require(bool(child_payload), "orchestration must project a child_payload object")
     checks.reject("deadline_at" in child_payload, "deadline_at must not be projected to child payload")
     checks.require("deadline_at" in text, "deadline_at must bound Map/Task execution")
+    checks.require(
+        "TimeoutSecondsPath" in text and "$toMillis($states.input.deadline_at)" in text,
+        "RunEncoder timeout must be remaining seconds until deadline_at",
+    )
 
     encoder_tasks = [block for block in config.resources("aws_ecs_task_definition") if "encoder" in (block.name or "").lower()]
     checks.require(bool(encoder_tasks), "a dedicated encoder task definition is required")

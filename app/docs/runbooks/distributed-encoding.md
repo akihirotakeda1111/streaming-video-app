@@ -28,8 +28,9 @@ In a dedicated environment, start one two-rendition payload and confirm the
 execution history shows two distinct encoder task ARNs with overlapping running
 intervals. Then confirm failure isolation:
 
-- StopExecution or a one-sided Map failure leaves the workflow `FAILED` and
-  does not publish a master playlist.
+- StopExecution leaves the workflow `ABORTED` and does not publish a master
+  playlist. A one-sided Map failure leaves the workflow `FAILED` and does not
+  publish a master playlist.
 - A child whose `encoder` container `exitCode` is nonzero makes the execution
   `FAILED`; do not treat a `STOPPED` ECS task alone as success.
 - Residual encoder tasks after failure or StopExecution are inspected with the

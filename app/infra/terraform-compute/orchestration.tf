@@ -106,12 +106,18 @@ locals {
                 }
               }
               ResultPath = "$.child"
+              Next = "BoundEncoderTimeout"
+            }
+            BoundEncoderTimeout = {
+              Type = "Pass"
+              QueryLanguage = "JSONata"
+              Output = "{% $merge([$states.input, {'task_timeout_seconds': $min([${var.encoder_timeout_seconds}, $max([1, $floor(($toMillis($states.input.deadline_at) - $millis()) / 1000)])])}]) %}"
               Next = "RunEncoder"
             }
             RunEncoder = {
               Type = "Task"
               Resource = "arn:aws:states:::ecs:runTask.sync"
-              TimeoutSeconds = var.encoder_timeout_seconds
+              TimeoutSecondsPath = "$.task_timeout_seconds"
               Parameters = {
                 Cluster = aws_ecs_cluster.main.arn
                 TaskDefinition = local.encoder_task_definition_arn
@@ -255,7 +261,7 @@ resource "aws_iam_role_policy" "orchestration" {
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = ["ecs:RunTask"], Resource = aws_ecs_task_definition.encoder.arn, Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.main.arn } } },
     { Effect = "Allow", Action = ["ecs:DescribeTasks", "ecs:StopTask"], Resource = "*", Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.main.arn } } },
-    { Effect = "Allow", Action = ["events:PutRule", "events:PutTargets", "events:DescribeRule"], Resource = "arn:aws:events:${var.aws_region}:${data.aws_caller_identity.current.account_id}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule" },
+    { Effect = "Allow", Action = ["events:PutRule", "events:PutTargets", "events:DescribeRule"], Resource = "arn:aws:events:${var.aws_region}:${data.aws_caller_identity.current.account_id}:rule/StepFunctionsGetEventsForECSTaskRule" },
     { Effect = "Allow", Action = ["iam:PassRole"], Resource = [aws_iam_role.encoder_execution.arn, aws_iam_role.encoder.arn], Condition = { StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" } } },
   ] })
 }
