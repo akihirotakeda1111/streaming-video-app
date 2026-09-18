@@ -1,4 +1,11 @@
-resource "aws_ecs_cluster" "main" { name = local.name }
+resource "aws_ecs_cluster" "main" {
+  name = local.name
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+}
 
 locals {
   api_container = {

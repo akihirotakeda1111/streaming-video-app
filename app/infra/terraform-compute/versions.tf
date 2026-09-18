@@ -109,10 +109,31 @@ variable "api_desired_count" {
 }
 variable "worker_desired_count" {
   type = number
-  default = 1
+  default = 0
   validation {
     condition     = var.worker_desired_count >= 0 && var.worker_desired_count <= 4 && floor(var.worker_desired_count) == var.worker_desired_count
     error_message = "worker_desired_count must be a whole number between 0 and 4."
+  }
+}
+variable "worker_autoscaling_enabled" {
+  description = "Enable only after the database secret and migrations are ready."
+  type        = bool
+  default     = false
+}
+variable "worker_autoscaling_min_capacity" {
+  type    = number
+  default = 1
+  validation {
+    condition     = var.worker_autoscaling_min_capacity >= 1 && var.worker_autoscaling_min_capacity <= 4 && floor(var.worker_autoscaling_min_capacity) == var.worker_autoscaling_min_capacity
+    error_message = "Worker autoscaling minimum must be an integer from 1 through 4."
+  }
+}
+variable "worker_autoscaling_max_capacity" {
+  type    = number
+  default = 4
+  validation {
+    condition     = var.worker_autoscaling_max_capacity >= 1 && var.worker_autoscaling_max_capacity <= 4 && floor(var.worker_autoscaling_max_capacity) == var.worker_autoscaling_max_capacity
+    error_message = "Worker autoscaling maximum must be an integer from 1 through 4."
   }
 }
 variable "worker_cpu" {
@@ -154,6 +175,42 @@ variable "worker_max_duration_seconds" {
 variable "worker_max_wall_seconds" {
   type = number
   default = 7200
+}
+variable "worker_acceptable_queue_delay_seconds" {
+  type        = number
+  description = "Queue delay the worker fleet should absorb, divided by representative processing time for the initial backlog target."
+  default     = 900
+  validation {
+    condition     = var.worker_acceptable_queue_delay_seconds > 0
+    error_message = "worker_acceptable_queue_delay_seconds must be positive."
+  }
+}
+variable "worker_representative_processing_seconds" {
+  type        = number
+  description = "Measured representative processing time used to initialize backlog-per-worker scaling."
+  default     = 300
+  validation {
+    condition     = var.worker_representative_processing_seconds > 0
+    error_message = "worker_representative_processing_seconds must be positive."
+  }
+}
+variable "worker_scale_out_cooldown_seconds" {
+  type        = number
+  description = "Bounded scale-out cooldown covering Fargate startup and metric publication."
+  default     = 180
+  validation {
+    condition     = var.worker_scale_out_cooldown_seconds >= 60 && var.worker_scale_out_cooldown_seconds <= 900
+    error_message = "worker_scale_out_cooldown_seconds must be between 60 and 900."
+  }
+}
+variable "worker_scale_in_cooldown_seconds" {
+  type        = number
+  description = "Bounded scale-in cooldown covering processing and ECS task-protection release."
+  default     = 600
+  validation {
+    condition     = var.worker_scale_in_cooldown_seconds >= 300 && var.worker_scale_in_cooldown_seconds <= 1800
+    error_message = "worker_scale_in_cooldown_seconds must be between 300 and 1800."
+  }
 }
 variable "vpc_cidr" {
   type = string

@@ -23,7 +23,7 @@ Create an empty application secret with
 `aws secretsmanager create-secret --name streaming-video/app-database-url`.
 Put the returned ARN in `database_url_secret_arn`; do not add an administrator URL.
 Leave image digests unset initially and keep `api_desired_count = 0` and
-`worker_desired_count = 0` until the application secret and migrations are ready.
+`worker_desired_count = 0` and `worker_autoscaling_enabled = false` until the application secret and migrations are ready.
 From repo root:
 
 ```bash
@@ -44,7 +44,7 @@ aws ecr describe-images --repository-name "${REPOSITORY#*/}" \
 Set `api_image_digest` to the actual returned sha256 digest in `terraform.tfvars`.
 Before the first full apply, also follow the Worker ECR target apply, image push,
 and digest selection steps in [worker-scaling.md](worker-scaling.md#fargate-deployment).
-Set `worker_image_digest` and keep `worker_desired_count = 0`. Targeting is only
+Set `worker_image_digest` and keep `worker_desired_count = 0` and `worker_autoscaling_enabled = false`. Targeting is only
 for initial repository creation. The full plan requires both image digests and
 verifies their existence in ECR before creating task definitions, even at zero
 desired count.
@@ -63,7 +63,7 @@ terraform -chdir=app/infra/terraform-compute plan -out=foundation.tfplan
 terraform -chdir=app/infra/terraform-compute apply foundation.tfplan
 ```
 
-Keep `api_desired_count = 0` and `worker_desired_count = 0`. This creates RDS,
+Keep `api_desired_count = 0` and `worker_desired_count = 0` and `worker_autoscaling_enabled = false`. This creates RDS,
 networking and task definitions, but starts neither service nor migration.
 Populate the application secret before
 starting any task. RDS manages the administrator password. The default username
@@ -218,7 +218,9 @@ and healthy ALB targets. Verify HTTPS `/api/v1/health` at the certificate-covere
 DNS name, schema validation, database TLS, upload presigning and CloudFront
 playback. API and migration use the same verified TLS application URL.
 
-Then start Worker with `worker_desired_count = 1` through a fresh full plan/apply,
+Then start Worker with `worker_autoscaling_enabled = true` and autoscaling bounds
+`worker_autoscaling_min_capacity = 1` / `worker_autoscaling_max_capacity = 4`
+through a fresh full plan/apply,
 following [worker-scaling.md](worker-scaling.md#fargate-deployment) for protection
 verification and local-worker cutover.
 
