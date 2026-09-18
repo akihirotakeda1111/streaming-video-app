@@ -168,6 +168,9 @@ SELECT
     j.status,
     j.failure_code,
     j.failure_message,
+    to_jsonb(j)->>'mode',
+    COALESCE((to_jsonb(j)->>'attempt')::int, 0),
+    to_jsonb(j)->>'published_manifest_key',
     j.created_at,
     j.updated_at
 FROM videos v
@@ -177,6 +180,8 @@ WHERE v.video_id = $1`
 	var video Video
 	var failureCode sql.NullString
 	var failureMessage sql.NullString
+	var mode sql.NullString
+	var publishedManifestKey sql.NullString
 
 	err := r.db.QueryRowContext(ctx, query, videoID).Scan(
 		&video.VideoID,
@@ -192,6 +197,9 @@ WHERE v.video_id = $1`
 		&video.Job.Status,
 		&failureCode,
 		&failureMessage,
+		&mode,
+		&video.Job.Attempt,
+		&publishedManifestKey,
 		&video.Job.CreatedAt,
 		&video.Job.UpdatedAt,
 	)
@@ -203,6 +211,12 @@ WHERE v.video_id = $1`
 	}
 
 	video.Job.VideoID = video.VideoID
+	if mode.Valid {
+		video.Job.Mode = JobMode(mode.String)
+	}
+	if publishedManifestKey.Valid {
+		video.Job.PublishedManifestKey = &publishedManifestKey.String
+	}
 	if failureCode.Valid && failureMessage.Valid {
 		video.Job.Failure = &JobFailure{
 			Code:    failureCode.String,

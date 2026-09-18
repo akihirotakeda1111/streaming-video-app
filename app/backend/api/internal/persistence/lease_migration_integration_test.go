@@ -67,6 +67,9 @@ worker_id = 'worker-a', lease_expires_at = NOW() + interval '5 minutes' WHERE id
 			if err != nil {
 				t.Fatal(err)
 			}
+			if before.Job.Attempt != 2 {
+				t.Fatalf("attempt before 0002 down = %d, want 2", before.Job.Attempt)
+			}
 			execSQL(t, db, readMigration(t, "0002_job_lease_persistence.down.sql"))
 			columns := tableColumns(t, db, "jobs")
 			for _, column := range []string{"worker_id", "lease_expires_at", "attempt"} {
@@ -78,6 +81,10 @@ worker_id = 'worker-a', lease_expires_at = NOW() + interval '5 minutes' WHERE id
 			if err != nil {
 				t.Fatal(err)
 			}
+			if after.Job.Attempt != 0 {
+				t.Fatalf("attempt after 0002 down = %d, want 0", after.Job.Attempt)
+			}
+			before.Job.Attempt = 0
 			if !reflect.DeepEqual(after, before) {
 				t.Fatalf("down migration changed existing video and job data: got %#v, want %#v", after, before)
 			}

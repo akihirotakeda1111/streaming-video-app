@@ -8,6 +8,13 @@ type CanonicalUUID string
 // JobStatus is the fixed Phase 1 encoding-job lifecycle state.
 type JobStatus string
 
+type JobMode string
+
+const (
+	JobModeCLI         JobMode = "cli"
+	JobModeDistributed JobMode = "distributed"
+)
+
 const (
 	JobStatusUploading  JobStatus = "UPLOADING"
 	JobStatusQueued     JobStatus = "QUEUED"
@@ -49,22 +56,25 @@ type UploadMetadata struct {
 
 // EncodingJob is the persistence model for the single Phase 1 job attached to a video.
 type EncodingJob struct {
-	JobID     CanonicalUUID
-	VideoID   CanonicalUUID
-	Status    JobStatus
-	Failure   *JobFailure
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	JobID                CanonicalUUID
+	VideoID              CanonicalUUID
+	Status               JobStatus
+	Mode                 JobMode
+	Attempt              int
+	PublishedManifestKey *string
+	Failure              *JobFailure
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 // Video is the persistence model for a single uploaded Phase 1 video.
 type Video struct {
-	VideoID      CanonicalUUID
-	FileName     string
-	ContentType  string
-	SizeBytes    int64
-	Upload       UploadMetadata
-	Job          EncodingJob
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	VideoID     CanonicalUUID
+	FileName    string
+	ContentType string
+	SizeBytes   int64
+	Upload      UploadMetadata
+	Job         EncodingJob
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }

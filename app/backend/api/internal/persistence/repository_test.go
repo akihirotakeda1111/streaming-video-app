@@ -211,6 +211,9 @@ func TestPostgresRepositoryGetVideoReturnsAggregate(t *testing.T) {
 				JobStatusFailed,
 				sql.NullString{String: "transcode_failed", Valid: true},
 				sql.NullString{String: "worker timeout", Valid: true},
+				sql.NullString{String: "cli", Valid: true},
+				0,
+				sql.NullString{},
 				jobCreatedAt,
 				jobUpdatedAt,
 			},
@@ -227,8 +230,19 @@ func TestPostgresRepositoryGetVideoReturnsAggregate(t *testing.T) {
 	if !strings.Contains(db.query, "FROM videos v") || !strings.Contains(db.query, "JOIN jobs j ON j.video_id = v.video_id") {
 		t.Fatalf("query = %q, want video/job aggregate", db.query)
 	}
+	if !strings.Contains(db.query, "to_jsonb(j)") {
+		t.Fatalf("query = %q, want optional columns via to_jsonb(j)", db.query)
+	}
+	for _, column := range []string{"j.mode", "j.attempt", "j.published_manifest_key"} {
+		if strings.Contains(db.query, column) {
+			t.Fatalf("query references %s directly: %s", column, db.query)
+		}
+	}
 	assertPlaceholders(t, db.query, 1)
 	assertSQLArgs(t, db.args, videoID)
+	if got.Job.Mode != JobModeCLI || got.Job.Attempt != 0 || got.Job.PublishedManifestKey != nil {
+		t.Fatalf("publication state = %#v", got.Job)
+	}
 
 	if got.VideoID != videoID {
 		t.Fatalf("VideoID = %q, want canonical UUID", got.VideoID)
