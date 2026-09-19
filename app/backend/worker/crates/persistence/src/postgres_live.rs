@@ -11,7 +11,7 @@ use std::{
 use tokio_postgres::{Client, NoTls, Row, types::ToSql};
 
 use super::{JobState, PostgresJobState};
-use crate::{JobOperationOutcome, LeaseAcquisitionOutcome};
+use crate::{JobMode, JobOperationOutcome, LeaseAcquisitionOutcome};
 
 const SCHEMA_SQL: &str =
     include_str!("../../../../api/internal/persistence/migrations/0001_phase1_schema.up.sql");
@@ -828,6 +828,47 @@ async fn retry_release_and_terminal_outcomes_clear_lease_fields() {
             .unwrap(),
         LeaseAcquisitionOutcome::Failed
     );
+    live.cleanup().await;
+}
+
+#[tokio::test]
+async fn first_distributed_acquisition_returns_acquired_with_mode() {
+    let Some(live) = setup().await else {
+        return;
+    };
+    insert_job(&live.admin, VIDEO_ID, JOB_ID, "UPLOADING").await;
+    let mut jobs = live.job_state().await;
+
+    assert!(jobs.claim(JOB_ID, VIDEO_ID).await.unwrap());
+    let (_, mode, _) = publication_state(&live.admin, JOB_ID).await;
+    assert!(mode.is_none());
+
+    let outcome = jobs
+        .acquire_lease_with_mode(
+            JOB_ID,
+            VIDEO_ID,
+            WORKER_A,
+            LEASE_SECONDS,
+            MAX_ATTEMPTS,
+            JobMode::Distributed,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            LeaseAcquisitionOutcome::AcquiredWithMode {
+                attempt: 1,
+                mode: JobMode::Distributed,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let (status, mode, pointer) = publication_state(&live.admin, JOB_ID).await;
+    assert_eq!(status, "PROCESSING");
+    assert_eq!(mode.as_deref(), Some("distributed"));
+    assert!(pointer.is_none());
     live.cleanup().await;
 }
 

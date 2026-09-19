@@ -5,6 +5,14 @@ rendition. A failed or timed-out Step Functions execution does not prove that
 every ECS child has stopped; optimized `ecs:runTask.sync` completion and
 execution cancellation are best-effort observations.
 
+StartExecution uses the deterministic name `job-{job_id}-a{attempt}` and the
+same parent input. A lost start response is resolved by describing that name
+and attaching only when the stored input is identical. Do not mint a new
+execution name when the existing execution has conflicting input or has already
+failed. Step Functions `SUCCEEDED` is not job completion: the parent still has
+to finalize child objects and commit under the current owner before
+acknowledgement.
+
 For a failed execution, record only the execution ARN, job/attempt, rendition,
 task ARN, and stop reason. Inspect tasks launched by that execution in the
 dedicated environment before retrying the parent. Do not print the complete

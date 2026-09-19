@@ -103,9 +103,9 @@ pub trait JobState: Send {
         }
     }
 
-    /// Acquire using the deployment-selected mode. Implementations that only
-    /// support CLI retain the legacy operation and therefore fail closed for
-    /// distributed selection.
+    /// Acquire using the deployment-selected mode. Implementations that do not
+    /// support distributed selection fail closed instead of running the CLI
+    /// acquire path.
     fn acquire_lease_with_mode(
         &mut self,
         job_id: &str,
@@ -115,8 +115,17 @@ pub trait JobState: Send {
         max_attempts: u32,
         mode: JobMode,
     ) -> impl Future<Output = Result<LeaseAcquisitionOutcome, PersistenceError>> + Send {
-        let _ = mode;
-        self.acquire_lease(job_id, video_id, worker_id, lease_seconds, max_attempts)
+        async move {
+            match mode {
+                JobMode::Cli => {
+                    self.acquire_lease(job_id, video_id, worker_id, lease_seconds, max_attempts)
+                        .await
+                }
+                JobMode::Distributed => Err(PersistenceError(
+                    "distributed lease acquisition is not implemented".into(),
+                )),
+            }
+        }
     }
 
     fn renew_lease(
@@ -182,3 +191,59 @@ pub trait JobState: Send {
 
 pub mod postgres;
 pub mod tls;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    struct UnsupportedJobs;
+
+    impl JobState for UnsupportedJobs {
+        fn claim(
+            &mut self,
+            _job_id: &str,
+            _video_id: &str,
+        ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
+            std::future::ready(Ok(false))
+        }
+
+        fn mark_processing(
+            &mut self,
+            _job_id: &str,
+        ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn acquire_lease(
+            &mut self,
+            _job_id: &str,
+            _video_id: &str,
+            _worker_id: &str,
+            _lease_seconds: u64,
+            _max_attempts: u32,
+        ) -> impl Future<Output = Result<LeaseAcquisitionOutcome, PersistenceError>> + Send
+        {
+            std::future::ready(Ok(LeaseAcquisitionOutcome::Acquired {
+                attempt: 1,
+                lease_expires_at: SystemTime::UNIX_EPOCH,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn default_distributed_acquisition_fails_closed() {
+        let mut jobs = UnsupportedJobs;
+        let error = jobs
+            .acquire_lease_with_mode("job", "video", "worker", 30, 3, JobMode::Distributed)
+            .await
+            .unwrap_err();
+        assert!(error.0.contains("distributed"));
+        assert!(matches!(
+            jobs.acquire_lease_with_mode("job", "video", "worker", 30, 3, JobMode::Cli)
+                .await
+                .unwrap(),
+            LeaseAcquisitionOutcome::Acquired { attempt: 1, .. }
+        ));
+    }
+}

@@ -274,7 +274,7 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
                   AND (mode IS NULL OR mode = $6)
                   AND attempt < $5::text::int
                   AND ((worker_id IS NULL AND lease_expires_at IS NULL) OR lease_expires_at <= CURRENT_TIMESTAMP)
-                RETURNING attempt, lease_expires_at
+                RETURNING attempt, lease_expires_at, mode
             ), target AS MATERIALIZED (
                 SELECT status, attempt, lease_expires_at, mode
                 FROM jobs
@@ -291,7 +291,7 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
                    END,
                    (SELECT attempt FROM acquired),
                    (SELECT lease_expires_at FROM acquired),
-                   (SELECT mode FROM target)",
+                   COALESCE((SELECT mode FROM acquired), (SELECT mode FROM target))",
             &[job_id, video_id, worker_id, &lease_seconds.to_string(), &max_attempts.to_string(), mode.as_str()],
         ).await.map_err(map_error)?;
         map_lease_acquisition(record)
@@ -496,7 +496,7 @@ mod tests {
                 disposition: self.lease_acquisition.disposition.clone(),
                 attempt: self.lease_acquisition.attempt,
                 lease_expires_at: self.lease_acquisition.lease_expires_at,
-                mode: Some("cli".into()),
+                mode: self.lease_acquisition.mode.clone(),
             }))
         }
     }
@@ -636,7 +636,10 @@ mod tests {
         assert!(acquire.contains("status IN ('QUEUED', 'PROCESSING')"));
         assert!(acquire.contains("mode = COALESCE(mode, $6)"));
         assert!(acquire.contains("(mode IS NULL OR mode = $6)"));
-        assert!(acquire.contains("RETURNING attempt, lease_expires_at"));
+        assert!(acquire.contains("RETURNING attempt, lease_expires_at, mode"));
+        assert!(
+            acquire.contains("COALESCE((SELECT mode FROM acquired), (SELECT mode FROM target))")
+        );
 
         assert!(jobs.database.statements[1].contains("lease_expires_at > NOW()"));
         assert!(jobs.database.statements[2].contains("lease_expires_at > NOW()"));
@@ -646,6 +649,36 @@ mod tests {
         assert!(jobs.database.statements[3].contains("published_manifest_key IS NULL"));
         assert!(jobs.database.statements[4].contains("lease_expires_at > NOW()"));
         assert!(jobs.database.statements[4].contains("attempt >= $5::text::int"));
+    }
+
+    #[tokio::test]
+    async fn acquired_mode_is_taken_from_the_acquired_row() {
+        let mut jobs = PostgresJobState::new(FakeDatabase {
+            lease_acquisition: LeaseAcquisitionRecord {
+                disposition: "ACQUIRED".into(),
+                attempt: Some(1),
+                lease_expires_at: Some(SystemTime::UNIX_EPOCH),
+                mode: Some("distributed".into()),
+            },
+            ..FakeDatabase::default()
+        });
+        assert_eq!(
+            jobs.acquire_lease_with_mode(
+                "job-id",
+                "video-id",
+                "worker-a",
+                30,
+                3,
+                JobMode::Distributed,
+            )
+            .await
+            .unwrap(),
+            LeaseAcquisitionOutcome::AcquiredWithMode {
+                attempt: 1,
+                lease_expires_at: SystemTime::UNIX_EPOCH,
+                mode: JobMode::Distributed,
+            }
+        );
     }
 
     fn distributed_parent_master_key(job_id: &str, video_id: &str, attempt: u32) -> String {

@@ -4,17 +4,25 @@
 //! parent manifest assembly, and distributed completion belong to the finalizer
 //! supplied by the later distributed-publication task.
 
-use std::{fmt, future::Future, pin::Pin, time::Duration};
+use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use persistence::JobMode;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::acquisition::AcquiredJob;
 
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub const SQS_VISIBILITY_LIFETIME: Duration = Duration::from_secs(43_200);
+pub const ALLOWED_RENDITIONS: [&str; 2] = ["360p", "720p"];
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+const START_RECOVERY_ATTEMPTS: usize = 3;
+const PREVIOUS_INSPECT_ATTEMPTS: usize = 3;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionInput {
     pub video_id: String,
     pub job_id: String,
@@ -23,28 +31,141 @@ pub struct ExecutionInput {
     pub source_key: String,
     pub output_prefix: String,
     pub renditions: Vec<String>,
+    pub deadline_at: String,
 }
 
 impl ExecutionInput {
-    pub fn for_job(job: &AcquiredJob, renditions: Vec<String>) -> Self {
+    pub fn for_job(
+        job: &AcquiredJob,
+        renditions: Vec<String>,
+        deadline_at: impl Into<String>,
+    ) -> Result<Self, OrchestrationError> {
         let execution_id = execution_name(&job.item.job_id, job.attempt);
-        Self {
+        let source_key = canonical_source_key(&job.item.video_id, &job.item.job_id);
+        let output_prefix = canonical_output_prefix(
+            &job.item.video_id,
+            &job.item.job_id,
+            job.attempt,
+            &execution_id,
+        );
+        if job.item.key != source_key {
+            return Err(OrchestrationError::Start(
+                "source key identity mismatch".into(),
+            ));
+        }
+        let input = Self {
             video_id: job.item.video_id.clone(),
             job_id: job.item.job_id.clone(),
             attempt: job.attempt,
-            execution_id: execution_id.clone(),
-            source_key: job.item.key.clone(),
-            output_prefix: format!(
-                "videos/{}/jobs/{}/hls/attempts/{}/{execution_id}",
-                job.item.video_id, job.item.job_id, job.attempt
-            ),
+            execution_id,
+            source_key,
+            output_prefix,
             renditions,
+            deadline_at: deadline_at.into(),
+        };
+        input.validate()?;
+        Ok(input)
+    }
+
+    pub fn validate(&self) -> Result<(), OrchestrationError> {
+        validate_renditions(&self.renditions)?;
+        if self.execution_id != execution_name(&self.job_id, self.attempt) {
+            return Err(OrchestrationError::Start(
+                "execution_id identity mismatch".into(),
+            ));
         }
+        if self.source_key != canonical_source_key(&self.video_id, &self.job_id) {
+            return Err(OrchestrationError::Start(
+                "source key identity mismatch".into(),
+            ));
+        }
+        if self.output_prefix
+            != canonical_output_prefix(
+                &self.video_id,
+                &self.job_id,
+                self.attempt,
+                &self.execution_id,
+            )
+        {
+            return Err(OrchestrationError::Start(
+                "output prefix identity mismatch".into(),
+            ));
+        }
+        parse_deadline(&self.deadline_at)?;
+        Ok(())
+    }
+
+    pub fn payload_json(&self) -> Result<String, OrchestrationError> {
+        serde_json::to_string(self)
+            .map_err(|_| OrchestrationError::Start("invalid execution input".into()))
     }
 }
 
 pub fn execution_name(job_id: &str, attempt: u32) -> String {
     format!("job-{job_id}-a{attempt}")
+}
+
+pub fn canonical_renditions() -> Vec<String> {
+    ALLOWED_RENDITIONS
+        .iter()
+        .map(|rendition| (*rendition).to_owned())
+        .collect()
+}
+
+pub fn canonical_source_key(video_id: &str, job_id: &str) -> String {
+    format!("videos/{video_id}/jobs/{job_id}/source.mp4")
+}
+
+pub fn canonical_output_prefix(
+    video_id: &str,
+    job_id: &str,
+    attempt: u32,
+    execution_id: &str,
+) -> String {
+    format!("videos/{video_id}/jobs/{job_id}/hls/attempts/{attempt}/{execution_id}")
+}
+
+pub fn deadline_at(visibility: Instant, margin: Duration) -> Result<String, OrchestrationError> {
+    let remaining = visibility.saturating_duration_since(Instant::now());
+    let budget = remaining.min(SQS_VISIBILITY_LIFETIME);
+    if margin.is_zero() || margin >= budget {
+        return Err(OrchestrationError::TimedOut);
+    }
+    let deadline = std::time::SystemTime::now() + (budget - margin);
+    Ok(DateTime::<Utc>::from(deadline).to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn validate_renditions(renditions: &[String]) -> Result<(), OrchestrationError> {
+    if renditions.is_empty() || renditions.len() > 2 {
+        return Err(OrchestrationError::Start(
+            "renditions must contain one or two allowed identifiers".into(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for rendition in renditions {
+        if !ALLOWED_RENDITIONS.contains(&rendition.as_str()) || !seen.insert(rendition) {
+            return Err(OrchestrationError::Start(
+                "renditions must be unique 360p and/or 720p".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_deadline(value: &str) -> Result<DateTime<Utc>, OrchestrationError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| OrchestrationError::Start("invalid deadline_at".into()))
+}
+
+fn input_matches(expected: &ExecutionInput, json: &str) -> bool {
+    let Ok(actual) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    let Ok(expected) = serde_json::to_value(expected) else {
+        return false;
+    };
+    actual == expected
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +174,15 @@ pub enum ExecutionStatus {
     Succeeded,
     Failed,
     TimedOut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionInspection {
+    NotFound,
+    Found {
+        status: ExecutionStatus,
+        input_json: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +211,10 @@ impl fmt::Display for OrchestrationError {
 }
 impl std::error::Error for OrchestrationError {}
 
+fn describe_is_retryable(error: &OrchestrationError) -> bool {
+    matches!(error, OrchestrationError::Describe(_))
+}
+
 pub trait ExecutionClient: Send + Sync {
     fn start(
         &self,
@@ -91,7 +225,41 @@ pub trait ExecutionClient: Send + Sync {
         &self,
         name: &str,
     ) -> Pin<Box<dyn Future<Output = Result<ExecutionStatus, OrchestrationError>> + Send + '_>>;
+    fn inspect(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecutionInspection, OrchestrationError>> + Send + '_>>;
     fn cancel(&self, name: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+impl<T: ExecutionClient + ?Sized> ExecutionClient for Arc<T> {
+    fn start(
+        &self,
+        name: &str,
+        input: &ExecutionInput,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrationError>> + Send + '_>> {
+        (**self).start(name, input)
+    }
+
+    fn status(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecutionStatus, OrchestrationError>> + Send + '_>>
+    {
+        (**self).status(name)
+    }
+
+    fn inspect(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecutionInspection, OrchestrationError>> + Send + '_>>
+    {
+        (**self).inspect(name)
+    }
+
+    fn cancel(&self, name: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        (**self).cancel(name)
+    }
 }
 
 pub trait Finalizer: Send + Sync {
@@ -101,6 +269,85 @@ pub trait Finalizer: Send + Sync {
         input: &ExecutionInput,
         ownership: watch::Receiver<bool>,
     ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrationError>> + Send + '_>>;
+}
+
+impl<T: Finalizer + ?Sized> Finalizer for Arc<T> {
+    fn finalize(
+        &self,
+        job: &AcquiredJob,
+        input: &ExecutionInput,
+        ownership: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrationError>> + Send + '_>> {
+        (**self).finalize(job, input, ownership)
+    }
+}
+
+/// Production stand-in until the distributed publication task supplies the
+/// concrete finalizer. Succeeding here would skip master publication.
+pub struct UnpublishedFinalizer;
+
+impl Finalizer for UnpublishedFinalizer {
+    fn finalize(
+        &self,
+        _: &AcquiredJob,
+        _: &ExecutionInput,
+        ownership: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrationError>> + Send + '_>> {
+        Box::pin(async move {
+            if *ownership.borrow() {
+                return Err(OrchestrationError::OwnershipLost);
+            }
+            Err(OrchestrationError::Finalizer(
+                "distributed publication is not available".into(),
+            ))
+        })
+    }
+}
+
+/// Used when no Step Functions adapter is configured. Distributed jobs fail
+/// into the existing owned retry/failure path instead of skipping coordination.
+pub struct UnavailableExecutionClient;
+
+impl ExecutionClient for UnavailableExecutionClient {
+    fn start(
+        &self,
+        _: &str,
+        _: &ExecutionInput,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrationError>> + Send + '_>> {
+        Box::pin(async {
+            Err(OrchestrationError::Start(
+                "execution client is not configured".into(),
+            ))
+        })
+    }
+
+    fn status(
+        &self,
+        _: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecutionStatus, OrchestrationError>> + Send + '_>>
+    {
+        Box::pin(async {
+            Err(OrchestrationError::Describe(
+                "execution client is not configured".into(),
+            ))
+        })
+    }
+
+    fn inspect(
+        &self,
+        _: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecutionInspection, OrchestrationError>> + Send + '_>>
+    {
+        Box::pin(async {
+            Err(OrchestrationError::Describe(
+                "execution client is not configured".into(),
+            ))
+        })
+    }
+
+    fn cancel(&self, _: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 }
 
 pub struct OrchestrationBridge<C, F> {
@@ -120,35 +367,172 @@ where
         job: &AcquiredJob,
         input: &ExecutionInput,
         mut ownership: watch::Receiver<bool>,
+        mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), OrchestrationError> {
+        input.validate()?;
         let name = execution_name(&job.item.job_id, job.attempt);
-        self.client.start(&name, input).await?;
+        if lost(&ownership, &shutdown) {
+            self.client.cancel(&name).await;
+            return Err(OrchestrationError::OwnershipLost);
+        }
+        self.cancel_previous_attempt(job, &mut ownership, &mut shutdown)
+            .await?;
+        self.start_or_attach(&name, input, &mut ownership, &mut shutdown)
+            .await?;
         let mut delay = self.poll_interval.max(Duration::from_millis(1));
+        let mut last_describe_error = None;
+        let mut saw_running = false;
         for _ in 0..self.poll_limit {
-            if *ownership.borrow() {
+            if lost(&ownership, &shutdown) {
                 self.client.cancel(&name).await;
                 return Err(OrchestrationError::OwnershipLost);
             }
-            match self.client.status(&name).await? {
-                ExecutionStatus::Running => {
+            match self.client.status(&name).await {
+                Ok(ExecutionStatus::Running) => {
+                    saw_running = true;
+                    last_describe_error = None;
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {},
-                        _ = ownership.changed() => {
-                            if *ownership.borrow() { self.client.cancel(&name).await; return Err(OrchestrationError::OwnershipLost); }
-                        }
+                        _ = ownership.changed() => {},
+                        _ = shutdown.changed() => {},
                     }
                     delay = (delay * 2).min(MAX_POLL_INTERVAL);
                 }
-                ExecutionStatus::Succeeded => {
+                Ok(ExecutionStatus::Succeeded) => {
+                    if lost(&ownership, &shutdown) {
+                        self.client.cancel(&name).await;
+                        return Err(OrchestrationError::OwnershipLost);
+                    }
                     return self.finalizer.finalize(job, input, ownership).await;
                 }
-                ExecutionStatus::Failed => return Err(OrchestrationError::Failed),
-                ExecutionStatus::TimedOut => return Err(OrchestrationError::TimedOut),
+                Ok(ExecutionStatus::Failed) => return Err(OrchestrationError::Failed),
+                Ok(ExecutionStatus::TimedOut) => return Err(OrchestrationError::TimedOut),
+                Err(error) if describe_is_retryable(&error) => {
+                    last_describe_error = Some(error);
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {},
+                        _ = ownership.changed() => {},
+                        _ = shutdown.changed() => {},
+                    }
+                    delay = (delay * 2).min(MAX_POLL_INTERVAL);
+                }
+                Err(error) => {
+                    self.client.cancel(&name).await;
+                    return Err(error);
+                }
             }
         }
         self.client.cancel(&name).await;
+        if let Some(error) = last_describe_error {
+            if !saw_running {
+                return Err(error);
+            }
+        }
         Err(OrchestrationError::TimedOut)
     }
+
+    async fn cancel_previous_attempt(
+        &self,
+        job: &AcquiredJob,
+        ownership: &mut watch::Receiver<bool>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<(), OrchestrationError> {
+        if job.attempt <= 1 {
+            return Ok(());
+        }
+        let previous = execution_name(&job.item.job_id, job.attempt - 1);
+        let mut last_error = None;
+        for _ in 0..PREVIOUS_INSPECT_ATTEMPTS {
+            if lost(ownership, shutdown) {
+                self.client.cancel(&previous).await;
+                return Err(OrchestrationError::OwnershipLost);
+            }
+            match self.client.inspect(&previous).await {
+                Ok(ExecutionInspection::Found { .. } | ExecutionInspection::NotFound) => {
+                    self.client.cancel(&previous).await;
+                    return Ok(());
+                }
+                Err(error) if describe_is_retryable(&error) => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            OrchestrationError::Describe("previous execution bound not established".into())
+        }))
+    }
+
+    async fn start_or_attach(
+        &self,
+        name: &str,
+        input: &ExecutionInput,
+        ownership: &mut watch::Receiver<bool>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<(), OrchestrationError> {
+        let mut last_error = None;
+        for _ in 0..START_RECOVERY_ATTEMPTS {
+            if lost(ownership, shutdown) {
+                self.client.cancel(name).await;
+                return Err(OrchestrationError::OwnershipLost);
+            }
+            match self.client.start(name, input).await {
+                Ok(()) => return Ok(()),
+                Err(OrchestrationError::Permission) => return Err(OrchestrationError::Permission),
+                Err(error) => match self.resolve_existing(name, input).await {
+                    Ok(Attach::Ready) => return Ok(()),
+                    Ok(Attach::Terminal(error)) => return Err(error),
+                    Err(inspect_error) if describe_is_retryable(&inspect_error) => {
+                        last_error = Some(inspect_error);
+                    }
+                    Err(OrchestrationError::Start(_)) => {
+                        last_error = Some(error);
+                    }
+                    Err(inspect_error) => return Err(inspect_error),
+                },
+            }
+        }
+        match self.resolve_existing(name, input).await {
+            Ok(Attach::Ready) => Ok(()),
+            Ok(Attach::Terminal(error)) => Err(error),
+            Err(_) => Err(last_error.unwrap_or_else(|| {
+                OrchestrationError::Start("execution start could not be resolved".into())
+            })),
+        }
+    }
+
+    async fn resolve_existing(
+        &self,
+        name: &str,
+        input: &ExecutionInput,
+    ) -> Result<Attach, OrchestrationError> {
+        match self.client.inspect(name).await? {
+            ExecutionInspection::NotFound => Err(OrchestrationError::Start(
+                "execution was not found after an ambiguous start".into(),
+            )),
+            ExecutionInspection::Found { status, input_json } => {
+                if !input_matches(input, &input_json) {
+                    return Ok(Attach::Terminal(OrchestrationError::Start(
+                        "conflicting execution input".into(),
+                    )));
+                }
+                match status {
+                    ExecutionStatus::Running | ExecutionStatus::Succeeded => Ok(Attach::Ready),
+                    ExecutionStatus::Failed => Ok(Attach::Terminal(OrchestrationError::Failed)),
+                    ExecutionStatus::TimedOut => Ok(Attach::Terminal(OrchestrationError::TimedOut)),
+                }
+            }
+        }
+    }
+}
+
+enum Attach {
+    Ready,
+    Terminal(OrchestrationError),
+}
+
+fn lost(ownership: &watch::Receiver<bool>, shutdown: &watch::Receiver<bool>) -> bool {
+    *ownership.borrow() || *shutdown.borrow()
 }
 
 /// Marker used by the runtime to ensure this path cannot be selected by a
@@ -164,18 +548,74 @@ mod tests {
     };
     use std::time::SystemTime;
 
-    fn job() -> AcquiredJob {
+    const VIDEO_ID: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910a";
+    const JOB_ID: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd67";
+    const DEADLINE: &str = "2026-08-25T03:04:00Z";
+
+    fn job_with(attempt: u32) -> AcquiredJob {
         AcquiredJob {
             item: WorkItem {
                 bucket: "in".into(),
-                key: "source".into(),
-                video_id: "video".into(),
-                job_id: "job".into(),
+                key: canonical_source_key(VIDEO_ID, JOB_ID),
+                video_id: VIDEO_ID.into(),
+                job_id: JOB_ID.into(),
             },
             worker_id: crate::acquisition::WorkerIdentity::from_value("worker").unwrap(),
-            attempt: 1,
+            attempt,
             lease_expires_at: SystemTime::UNIX_EPOCH,
         }
+    }
+
+    fn job() -> AcquiredJob {
+        job_with(1)
+    }
+
+    fn input_for(job: &AcquiredJob) -> ExecutionInput {
+        ExecutionInput::for_job(job, canonical_renditions(), DEADLINE).unwrap()
+    }
+
+    fn channels() -> (
+        watch::Sender<bool>,
+        watch::Receiver<bool>,
+        watch::Receiver<bool>,
+    ) {
+        let (stop, ownership) = watch::channel(false);
+        let (_shutdown_stop, shutdown) = watch::channel(false);
+        (stop, ownership, shutdown)
+    }
+
+    #[test]
+    fn parent_input_identities_match_task01_contract() {
+        let input = input_for(&job());
+        assert_eq!(
+            input.execution_id,
+            "job-018f47a2-4699-7892-9fc0-fbe46d3bbd67-a1"
+        );
+        assert_eq!(
+            input.source_key,
+            "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/source.mp4"
+        );
+        assert_eq!(
+            input.output_prefix,
+            "videos/018f47a2-45c2-7a84-b84f-5f6dd7b5910a/jobs/018f47a2-4699-7892-9fc0-fbe46d3bbd67/hls/attempts/1/job-018f47a2-4699-7892-9fc0-fbe46d3bbd67-a1"
+        );
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../contracts/examples/internal/parent-input.json"
+        ))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&input).unwrap(), fixture);
+    }
+
+    #[test]
+    fn execution_input_rejects_invalid_renditions_and_mismatched_keys() {
+        let job = job();
+        assert!(ExecutionInput::for_job(&job, vec!["low".into()], DEADLINE).is_err());
+        assert!(
+            ExecutionInput::for_job(&job, vec!["360p".into(), "360p".into()], DEADLINE).is_err()
+        );
+        let mut mismatched = job.clone();
+        mismatched.item.key = "videos/other/source.mp4".into();
+        assert!(ExecutionInput::for_job(&mismatched, canonical_renditions(), DEADLINE).is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -189,13 +629,9 @@ mod tests {
             poll_limit: 2,
             poll_interval: Duration::from_millis(1),
         };
-        let (_stop, ownership) = watch::channel(false);
+        let (_stop, ownership, shutdown) = channels();
         bridge
-            .run(
-                &job(),
-                &ExecutionInput::for_job(&job(), vec!["low".into()]),
-                ownership,
-            )
+            .run(&job(), &input_for(&job()), ownership, shutdown)
             .await
             .unwrap();
         assert_eq!(*calls.lock().unwrap(), 1);
@@ -213,15 +649,214 @@ mod tests {
             poll_limit: 2,
             poll_interval: Duration::from_secs(1),
         };
-        let (stop, ownership) = watch::channel(false);
+        let (stop, ownership, shutdown) = channels();
         stop.send(true).unwrap();
         assert_eq!(
             bridge
-                .run(&job(), &ExecutionInput::for_job(&job(), vec![]), ownership)
+                .run(&job(), &input_for(&job()), ownership, shutdown)
                 .await,
             Err(OrchestrationError::OwnershipLost)
         );
         assert_eq!(*calls.lock().unwrap(), 0);
-        assert_eq!(cancellations.lock().unwrap().as_slice(), ["job-job-a1"]);
+        assert_eq!(
+            cancellations.lock().unwrap().as_slice(),
+            [execution_name(JOB_ID, 1)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lost_start_response_attaches_to_the_same_execution_name() {
+        let job = job();
+        let input = input_for(&job);
+        let name = execution_name(JOB_ID, 1);
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        client.fail_start(OrchestrationError::Start("lost response".into()));
+        client.seed_execution(&name, input.clone());
+        let starts = client.starts.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer,
+            poll_limit: 2,
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, shutdown) = channels();
+        bridge.run(&job, &input, ownership, shutdown).await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1);
+        let started = starts.lock().unwrap();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].0, name);
+        assert_eq!(started[0].1, input);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn conflicting_existing_input_does_not_create_a_new_name() {
+        let job = job();
+        let input = input_for(&job);
+        let name = execution_name(JOB_ID, 1);
+        let mut conflicting = input.clone();
+        conflicting.deadline_at = "2026-08-25T04:00:00Z".into();
+        let client = FakeExecutionClient::new(vec![]);
+        client.fail_start(OrchestrationError::Start("already exists".into()));
+        client.seed_execution(&name, conflicting);
+        let starts = client.starts.clone();
+        let cancellations = client.cancellations.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer,
+            poll_limit: 2,
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, shutdown) = channels();
+        assert_eq!(
+            bridge.run(&job, &input, ownership, shutdown).await,
+            Err(OrchestrationError::Start(
+                "conflicting execution input".into()
+            ))
+        );
+        assert_eq!(*calls.lock().unwrap(), 0);
+        assert!(cancellations.lock().unwrap().is_empty());
+        assert!(
+            starts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(started, _)| started == &name)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn already_failed_execution_is_not_restarted_under_a_new_name() {
+        let job = job();
+        let input = input_for(&job);
+        let name = execution_name(JOB_ID, 1);
+        let client = FakeExecutionClient::new(vec![]);
+        client.fail_start(OrchestrationError::Start("already exists".into()));
+        client.seed_execution_with_status(&name, input.clone(), ExecutionStatus::Failed);
+        let starts = client.starts.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer,
+            poll_limit: 2,
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, shutdown) = channels();
+        assert_eq!(
+            bridge.run(&job, &input, ownership, shutdown).await,
+            Err(OrchestrationError::Failed)
+        );
+        assert_eq!(*calls.lock().unwrap(), 0);
+        assert!(
+            starts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(started, _)| started == &name)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_describe_errors_retry_then_succeed() {
+        let client = FakeExecutionClient::new(vec![
+            Err(OrchestrationError::Describe("throttled".into())),
+            Ok(ExecutionStatus::Succeeded),
+        ]);
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let cancellations = client.cancellations.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer,
+            poll_limit: 3,
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, shutdown) = channels();
+        bridge
+            .run(&job(), &input_for(&job()), ownership, shutdown)
+            .await
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(cancellations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unresolvable_describe_cancels_without_finalizer() {
+        let client = FakeExecutionClient::new(vec![
+            Err(OrchestrationError::Describe("unavailable".into())),
+            Err(OrchestrationError::Describe("unavailable".into())),
+        ]);
+        let cancellations = client.cancellations.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer,
+            poll_limit: 2,
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, shutdown) = channels();
+        assert_eq!(
+            bridge
+                .run(&job(), &input_for(&job()), ownership, shutdown)
+                .await,
+            Err(OrchestrationError::Describe("unavailable".into()))
+        );
+        assert_eq!(*calls.lock().unwrap(), 0);
+        assert_eq!(
+            cancellations.lock().unwrap().as_slice(),
+            [execution_name(JOB_ID, 1)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_retryable_status_error_cancels_without_finalizer() {
+        let client = FakeExecutionClient::new(vec![Err(OrchestrationError::Permission)]);
+        let cancellations = client.cancellations.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer,
+            poll_limit: 2,
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, shutdown) = channels();
+        assert_eq!(
+            bridge
+                .run(&job(), &input_for(&job()), ownership, shutdown)
+                .await,
+            Err(OrchestrationError::Permission)
+        );
+        assert_eq!(*calls.lock().unwrap(), 0);
+        assert_eq!(
+            cancellations.lock().unwrap().as_slice(),
+            [execution_name(JOB_ID, 1)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn later_attempt_cancels_the_previous_execution_name() {
+        let job = job_with(2);
+        let input = input_for(&job);
+        let previous = execution_name(JOB_ID, 1);
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        client.seed_execution(&previous, input_for(&job_with(1)));
+        let cancellations = client.cancellations.clone();
+        let starts = client.starts.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer: FakeFinalizer::new(Ok(())),
+            poll_limit: 2,
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, shutdown) = channels();
+        bridge.run(&job, &input, ownership, shutdown).await.unwrap();
+        assert_eq!(cancellations.lock().unwrap().as_slice(), [previous]);
+        assert_eq!(starts.lock().unwrap()[0].0, execution_name(JOB_ID, 2));
     }
 }

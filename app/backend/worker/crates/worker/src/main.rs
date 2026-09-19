@@ -142,7 +142,21 @@ async fn main() {
         config.retry_delay_seconds,
         heartbeat,
     ) {
-        Ok(processor) => processor.with_limits(config.limits.clone()),
+        Ok(processor) => {
+            let processor = if let Some(arn) = config.orchestration_state_machine_arn.as_deref() {
+                match worker::sfn::SfnExecutionClient::new(&config.aws_region, arn).await {
+                    Ok(client) => processor
+                        .with_orchestration(client, worker::orchestration::UnpublishedFinalizer),
+                    Err(error) => {
+                        error!(%error, "orchestration client initialization failed");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                processor
+            };
+            processor.with_limits(config.limits.clone())
+        }
         Err(error) => {
             error!(%error, "worker processing configuration rejected");
             std::process::exit(1);

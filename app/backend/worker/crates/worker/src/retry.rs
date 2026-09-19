@@ -355,6 +355,19 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         })
     }
 
+    pub(crate) async fn fail_owned(
+        &self,
+        acquired: &AcquiredJob,
+        cancelled: &watch::Receiver<bool>,
+        failure: impl Into<String>,
+    ) -> Result<ProcessingOutcome, ProcessingError>
+    where
+        J: JobState,
+    {
+        self.resolve_failure(acquired, cancelled, failure.into())
+            .await
+    }
+
     async fn resolve_failure(
         &self,
         acquired: &AcquiredJob,

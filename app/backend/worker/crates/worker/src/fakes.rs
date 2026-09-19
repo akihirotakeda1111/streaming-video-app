@@ -2,7 +2,7 @@
 //! record a shared call order, and allow each operation to fail once.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     path::Path,
     sync::{Arc, Mutex},
@@ -16,7 +16,8 @@ use storage::{ObjectError, Read, Write};
 
 use crate::acquisition::AcquiredJob;
 use crate::orchestration::{
-    ExecutionClient, ExecutionInput, ExecutionStatus, Finalizer, OrchestrationError,
+    ExecutionClient, ExecutionInput, ExecutionInspection, ExecutionStatus, Finalizer,
+    OrchestrationError,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -324,6 +325,19 @@ impl JobState for FakeJobState {
             .pop_front()
             .unwrap_or(Ok(LeaseAcquisitionOutcome::UnknownOrMismatched))
     }
+
+    async fn acquire_lease_with_mode(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_attempts: u32,
+        _mode: persistence::JobMode,
+    ) -> Result<LeaseAcquisitionOutcome, PersistenceError> {
+        self.acquire_lease(job_id, video_id, worker_id, lease_seconds, max_attempts)
+            .await
+    }
 }
 
 #[derive(Debug)]
@@ -339,7 +353,10 @@ pub struct FakeProcessExecutor {
 #[derive(Clone)]
 pub struct FakeExecutionClient {
     pub starts: Arc<Mutex<Vec<(String, ExecutionInput)>>>,
+    pub start_results: Arc<Mutex<VecDeque<Result<(), OrchestrationError>>>>,
     pub statuses: Arc<Mutex<VecDeque<Result<ExecutionStatus, OrchestrationError>>>>,
+    pub inspections: Arc<Mutex<VecDeque<Result<ExecutionInspection, OrchestrationError>>>>,
+    pub executions: Arc<Mutex<HashMap<String, (ExecutionInput, ExecutionStatus)>>>,
     pub cancellations: Arc<Mutex<Vec<String>>>,
 }
 
@@ -347,9 +364,32 @@ impl FakeExecutionClient {
     pub fn new(statuses: Vec<Result<ExecutionStatus, OrchestrationError>>) -> Self {
         Self {
             starts: Arc::new(Mutex::new(Vec::new())),
+            start_results: Arc::new(Mutex::new(VecDeque::new())),
             statuses: Arc::new(Mutex::new(statuses.into_iter().collect())),
+            inspections: Arc::new(Mutex::new(VecDeque::new())),
+            executions: Arc::new(Mutex::new(HashMap::new())),
             cancellations: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn fail_start(&self, error: OrchestrationError) {
+        self.start_results.lock().unwrap().push_back(Err(error));
+    }
+
+    pub fn seed_execution(&self, name: &str, input: ExecutionInput) {
+        self.seed_execution_with_status(name, input, ExecutionStatus::Running);
+    }
+
+    pub fn seed_execution_with_status(
+        &self,
+        name: &str,
+        input: ExecutionInput,
+        status: ExecutionStatus,
+    ) {
+        self.executions
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), (input, status));
     }
 }
 
@@ -362,21 +402,60 @@ impl ExecutionClient for FakeExecutionClient {
         let name = name.to_owned();
         let input = input.clone();
         Box::pin(async move {
-            self.starts.lock().unwrap().push((name, input));
+            self.starts
+                .lock()
+                .unwrap()
+                .push((name.clone(), input.clone()));
+            if let Some(result) = self.start_results.lock().unwrap().pop_front() {
+                return result;
+            }
+            self.executions
+                .lock()
+                .unwrap()
+                .entry(name)
+                .or_insert((input, ExecutionStatus::Running));
             Ok(())
         })
     }
     fn status(
         &self,
-        _: &str,
+        name: &str,
     ) -> Pin<Box<dyn Future<Output = Result<ExecutionStatus, OrchestrationError>> + Send + '_>>
     {
+        let name = name.to_owned();
         Box::pin(async move {
-            self.statuses
+            if let Some(result) = self.statuses.lock().unwrap().pop_front() {
+                return result;
+            }
+            Ok(self
+                .executions
                 .lock()
                 .unwrap()
-                .pop_front()
-                .unwrap_or(Ok(ExecutionStatus::Running))
+                .get(&name)
+                .map(|(_, status)| *status)
+                .unwrap_or(ExecutionStatus::Running))
+        })
+    }
+    fn inspect(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecutionInspection, OrchestrationError>> + Send + '_>>
+    {
+        let name = name.to_owned();
+        Box::pin(async move {
+            if let Some(result) = self.inspections.lock().unwrap().pop_front() {
+                return result;
+            }
+            Ok(self
+                .executions
+                .lock()
+                .unwrap()
+                .get(&name)
+                .map(|(input, status)| ExecutionInspection::Found {
+                    status: *status,
+                    input_json: input.payload_json().expect("test input"),
+                })
+                .unwrap_or(ExecutionInspection::NotFound))
         })
     }
     fn cancel(&self, name: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
