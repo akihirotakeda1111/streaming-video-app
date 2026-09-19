@@ -13,6 +13,8 @@ pub struct Message {
     pub receive_count: u32,
     /// Conservative deadline captured before the receive request, not dispatch.
     pub visibility_deadline: Option<tokio::time::Instant>,
+    /// Instant the ReceiveMessage request started, before waiting for SQS.
+    pub receive_started_at: Option<tokio::time::Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -20,7 +20,7 @@ use crate::{
     orchestration::{
         DEFAULT_POLL_INTERVAL, DEPLOYMENT_MODE, ExecutionClient, ExecutionInput, Finalizer,
         OrchestrationBridge, OrchestrationError, UnavailableExecutionClient, UnpublishedFinalizer,
-        canonical_renditions, deadline_at,
+        canonical_renditions, deadline_from_receive,
     },
     retry::{OwnedAttemptProcessor, ProcessingOutcome, RetrySettings},
     runtime::{MessageProcessor, cancellation_requested},
@@ -43,7 +43,6 @@ pub struct MessageCompletionProcessor<J, S, E, Q> {
 struct OrchestrationSettings {
     client: Arc<dyn ExecutionClient>,
     finalizer: Arc<dyn Finalizer>,
-    poll_limit: usize,
     poll_interval: Duration,
 }
 
@@ -111,7 +110,6 @@ impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q> {
             orchestration: OrchestrationSettings {
                 client: Arc::new(UnavailableExecutionClient),
                 finalizer: Arc::new(UnpublishedFinalizer),
-                poll_limit: 10_000,
                 poll_interval: DEFAULT_POLL_INTERVAL,
             },
         })
@@ -137,8 +135,7 @@ impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q> {
         self
     }
 
-    pub fn with_poll(mut self, poll_limit: usize, poll_interval: Duration) -> Self {
-        self.orchestration.poll_limit = poll_limit.max(1);
+    pub fn with_poll(mut self, _poll_limit: usize, poll_interval: Duration) -> Self {
         self.orchestration.poll_interval = poll_interval;
         self
     }
@@ -202,14 +199,24 @@ where
     async fn run_distributed(
         &self,
         job: &crate::acquisition::AcquiredJob,
-        visibility: Instant,
+        receive_started_at: Option<Instant>,
         cancelled: &mut watch::Receiver<bool>,
         shutdown: watch::Receiver<bool>,
     ) -> Result<ProcessingOutcome, crate::retry::ProcessingError> {
         if *cancelled.borrow() || *shutdown.borrow() {
             return Ok(ProcessingOutcome::OwnershipLost);
         }
-        let deadline = match deadline_at(visibility, self.heartbeat.interval) {
+        let Some(receive_started_at) = receive_started_at else {
+            return self
+                .processing
+                .fail_owned(job, cancelled, "receive start time is missing")
+                .await;
+        };
+        let (deadline_at, deadline) = match deadline_from_receive(
+            receive_started_at,
+            self.processing.processing_budget(),
+            self.heartbeat.interval,
+        ) {
             Ok(deadline) => deadline,
             Err(error) => {
                 return self
@@ -218,7 +225,7 @@ where
                     .await;
             }
         };
-        let input = match ExecutionInput::for_job(job, canonical_renditions(), deadline) {
+        let input = match ExecutionInput::for_job(job, canonical_renditions(), deadline_at) {
             Ok(input) => input,
             Err(error) => {
                 return self
@@ -231,18 +238,13 @@ where
             .orchestration
             .poll_interval
             .max(Duration::from_millis(1));
-        let remaining = visibility.saturating_duration_since(Instant::now());
-        let dynamic_limit = (remaining.as_millis() / poll_interval.as_millis())
-            .max(1)
-            .min(10_000) as usize;
         let bridge = OrchestrationBridge {
             client: self.orchestration.client.clone(),
             finalizer: self.orchestration.finalizer.clone(),
-            poll_limit: self.orchestration.poll_limit.min(dynamic_limit),
             poll_interval,
         };
         match bridge
-            .run(job, &input, cancelled.clone(), shutdown.clone())
+            .run(job, &input, cancelled.clone(), shutdown.clone(), deadline)
             .await
         {
             Ok(()) if *cancelled.borrow() || *shutdown.borrow() => {
@@ -360,7 +362,12 @@ where
                     index += 1;
                     let mut cancelled = lost.clone();
                     let outcome = self
-                        .run_distributed(&job, visibility, &mut cancelled, shutdown.clone())
+                        .run_distributed(
+                            &job,
+                            message.receive_started_at,
+                            &mut cancelled,
+                            shutdown.clone(),
+                        )
                         .await;
                     activity.store(false, std::sync::atomic::Ordering::SeqCst);
                     match outcome {
@@ -811,12 +818,14 @@ mod tests {
         }
         fn message(ids: &[&str]) -> Message {
             let keys: Vec<_> = ids.iter().map(|id| source_key(VIDEO, id)).collect();
+            let receive_started_at = Instant::now();
             Message {
                 message_id: Some("message-test".into()),
                 delivery_id: "delivery-test".into(),
                 receipt_handle: "receipt".into(),
                 receive_count: 1,
-                visibility_deadline: Some(Instant::now() + Duration::from_secs(2)),
+                visibility_deadline: Some(receive_started_at + Duration::from_secs(2)),
+                receive_started_at: Some(receive_started_at),
                 body: records_notification(
                     &keys
                         .iter()
@@ -1488,5 +1497,69 @@ mod tests {
             || call.starts_with("release:")
             || call.starts_with("fail:")));
         assert!(!cancellations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn distributed_deadline_at_uses_processing_budget_not_visibility() {
+        use crate::fakes::{FakeExecutionClient, FakeFinalizer};
+        use crate::orchestration::ExecutionStatus;
+        use chrono::{DateTime, Utc};
+
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        let starts = client.starts.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let f = Fixture::new(Duration::ZERO, false).distributed(client, finalizer);
+        let before = Utc::now();
+        f.run(&[FIRST]).await;
+        let deadline_at = starts.lock().unwrap()[0].1.deadline_at.clone();
+        let deadline = DateTime::parse_from_rfc3339(&deadline_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        let remaining = deadline.signed_duration_since(before).num_seconds();
+        assert!(
+            remaining >= 7_000,
+            "deadline_at should use the 7200s processing budget, not ~2s visibility remaining: {remaining}"
+        );
+        assert!(remaining <= 7_200);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_distributed_orchestration_cancels_without_finalizer_release_or_ack() {
+        use crate::fakes::{FakeExecutionClient, FakeFinalizer};
+        use crate::orchestration::ExecutionStatus;
+
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Running)]);
+        let starts = client.starts.clone();
+        let cancellations = client.cancellations.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let f = Fixture::new(Duration::ZERO, false).distributed(client, finalizer);
+        let (stop, shutdown) = watch::channel(false);
+        let processor = f.processor.clone();
+        let task = tokio::spawn(async move {
+            processor
+                .process_with_shutdown(Fixture::message(&[FIRST]), shutdown)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while starts.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("distributed execution should start before shutdown");
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown should finish orchestration")
+            .unwrap()
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 0);
+        assert!(!cancellations.lock().unwrap().is_empty());
+        let s = f.state.lock().unwrap();
+        assert!(!s.calls.contains(&"delete".into()));
+        assert!(!s.calls.iter().any(|call| call.starts_with("complete:")
+            || call.starts_with("release:")
+            || call.starts_with("fail:")));
     }
 }

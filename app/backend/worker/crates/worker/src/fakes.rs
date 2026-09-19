@@ -358,6 +358,8 @@ pub struct FakeExecutionClient {
     pub inspections: Arc<Mutex<VecDeque<Result<ExecutionInspection, OrchestrationError>>>>,
     pub executions: Arc<Mutex<HashMap<String, (ExecutionInput, ExecutionStatus)>>>,
     pub cancellations: Arc<Mutex<Vec<String>>>,
+    cancel_stops: Arc<Mutex<bool>>,
+    status_fallback: Arc<Mutex<Option<Result<ExecutionStatus, OrchestrationError>>>>,
 }
 
 impl FakeExecutionClient {
@@ -369,7 +371,17 @@ impl FakeExecutionClient {
             inspections: Arc::new(Mutex::new(VecDeque::new())),
             executions: Arc::new(Mutex::new(HashMap::new())),
             cancellations: Arc::new(Mutex::new(Vec::new())),
+            cancel_stops: Arc::new(Mutex::new(true)),
+            status_fallback: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn hold_running_after_cancel(&self) {
+        *self.cancel_stops.lock().unwrap() = false;
+    }
+
+    pub fn keep_failing_status(&self, error: OrchestrationError) {
+        *self.status_fallback.lock().unwrap() = Some(Err(error));
     }
 
     pub fn fail_start(&self, error: OrchestrationError) {
@@ -427,6 +439,9 @@ impl ExecutionClient for FakeExecutionClient {
             if let Some(result) = self.statuses.lock().unwrap().pop_front() {
                 return result;
             }
+            if let Some(result) = self.status_fallback.lock().unwrap().clone() {
+                return result;
+            }
             Ok(self
                 .executions
                 .lock()
@@ -461,7 +476,12 @@ impl ExecutionClient for FakeExecutionClient {
     fn cancel(&self, name: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let name = name.to_owned();
         Box::pin(async move {
-            self.cancellations.lock().unwrap().push(name);
+            self.cancellations.lock().unwrap().push(name.clone());
+            if *self.cancel_stops.lock().unwrap() {
+                if let Some((_, status)) = self.executions.lock().unwrap().get_mut(&name) {
+                    *status = ExecutionStatus::Failed;
+                }
+            }
         })
     }
 }

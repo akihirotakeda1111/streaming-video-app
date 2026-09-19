@@ -174,6 +174,10 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         self
     }
 
+    pub(crate) fn processing_budget(&self) -> Duration {
+        Duration::from_secs(self.limits.wall_seconds)
+    }
+
     fn owned(cancelled: &watch::Receiver<bool>) -> bool {
         !*cancelled.borrow()
     }

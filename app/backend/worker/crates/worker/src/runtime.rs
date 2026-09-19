@@ -306,6 +306,7 @@ mod tests {
             body: body.into(),
             receive_count: 1,
             visibility_deadline: None,
+            receive_started_at: None,
         }
     }
 

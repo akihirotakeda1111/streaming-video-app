@@ -57,6 +57,7 @@ impl queue::Receive for Receiver {
             body: String::new(),
             receive_count: 1,
             visibility_deadline: None,
+            receive_started_at: None,
         }))
     }
 }
