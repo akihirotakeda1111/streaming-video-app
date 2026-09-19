@@ -356,6 +356,26 @@ def _has_delivery_source_arn(config: Configuration, policy: str, output_name: st
     )
 
 
+def _denies_cloudfront_result_json(policy: str) -> bool:
+    """Require an explicit CloudFront Deny of attempt-scoped result.json objects."""
+    for statement in _nested_bodies(policy, "statement"):
+        if not _assignment_is(statement, "effect", '"Deny"'):
+            continue
+        if "s3:getobject" not in _policy_actions(statement):
+            continue
+        if "cloudfront.amazonaws.com" not in statement.lower():
+            continue
+        if "hls/attempts" not in statement or "result.json" not in statement:
+            continue
+        if any(
+            _assignment_is(principal, "type", '"Service"')
+            and "cloudfront.amazonaws.com" in principal
+            for principal in _nested_bodies(statement, "principals")
+        ):
+            return True
+    return False
+
+
 def _find_linked_block(
     blocks: list[Block], resource_type: str, resource_name: str
 ) -> list[Block]:
@@ -616,6 +636,10 @@ def check_storage_queue(config: Configuration, checks: Checks) -> tuple[str | No
             checks.require(
                 _has(policy, "videos/*/jobs/*/hls/*"),
                 f"{linked_policy.location}: CloudFront read must be limited to HLS keys",
+            )
+            checks.require(
+                _denies_cloudfront_result_json(policy),
+                f"{linked_policy.location}: CloudFront must be denied s3:GetObject for attempt result.json objects",
             )
             checks.require(
                 _has_delivery_source_arn(config, policy, output_name),

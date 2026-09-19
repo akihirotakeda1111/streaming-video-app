@@ -28,6 +28,31 @@ data "aws_iam_policy_document" "output_cloudfront_read" {
       values   = [aws_cloudfront_distribution.video_output.arn]
     }
   }
+
+  # Internal child descriptors are never viewer content. A broader HLS Allow
+  # still cannot serve result.json through CloudFront.
+  statement {
+    sid     = "DenyCloudFrontResultJson"
+    effect  = "Deny"
+    actions = ["s3:GetObject"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+
+    resources = [
+      format(
+        "%s/videos/%s/jobs/%s/hls/attempts/%s/%s/%s/result.json",
+        aws_s3_bucket.video_output.arn,
+        local.s3_path_wildcard,
+        local.s3_path_wildcard,
+        local.s3_path_wildcard,
+        local.s3_path_wildcard,
+        local.s3_path_wildcard,
+      ),
+    ]
+  }
 }
 
 data "aws_iam_policy_document" "encoding_queue_publish" {

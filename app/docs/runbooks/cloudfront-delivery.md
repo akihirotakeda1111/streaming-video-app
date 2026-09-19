@@ -4,7 +4,9 @@ The output bucket is private. CloudFront uses an Origin Access Control (OAC)
 with SigV4 signing against the bucket's regional REST endpoint. The bucket
 policy grants `s3:GetObject` only to `cloudfront.amazonaws.com`, only below the
 legacy `videos/*/jobs/*/hls/*` prefix, and only when `AWS:SourceArn` matches
-the intended distribution. S3 CORS handles browser preflight requests forwarded
+the intended distribution. It also denies CloudFront `s3:GetObject` for
+`videos/*/jobs/*/hls/attempts/*/*/*/result.json`, so internal child descriptors
+are not viewer content even under the broader HLS Allow. S3 CORS handles browser preflight requests forwarded
 by CloudFront and authorized browser-based inspection tools. Non-browser SDKs
 do not enforce CORS; it is not an authentication mechanism. Playback CORS is applied by the
 CloudFront response-headers policy, including cache hits, for the configured
@@ -101,8 +103,9 @@ settings, the distribution-scoped bucket policy, and the frontend origin in the
 CloudFront response-headers policy.
 
 The bucket-policy validator accepts the repository's distribution-scoped
-CloudFront `Allow s3:GetObject` on `videos/*/jobs/*/hls/*` and non-granting Deny
-statements. Other Allow forms, including additional broader grants, fail closed.
+CloudFront `Allow s3:GetObject` on `videos/*/jobs/*/hls/*` and the explicit
+CloudFront `Deny s3:GetObject` on attempt `result.json` objects. Other Allow
+forms, including additional broader grants, fail closed.
 Dedicated SDK permissions should be identity-based. Both 403/404 custom error
 TTLs must be explicitly zero, without status/page rewriting.
 
