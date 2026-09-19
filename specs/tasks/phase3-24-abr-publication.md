@@ -82,11 +82,19 @@ Grant the worker task role the minimum ECS permissions required by Task 23 resid
 
 Preserve the existing restricted states:StartExecution, states:DescribeExecution, and states:StopExecution permissions. Do not broaden Step Functions permissions beyond the Phase 3 orchestration state machine and its executions. Do not grant the worker coordinator general ECS task-management authority outside the Phase 3 encoder cluster.
 
-Distributed mode must not be enabled until the Task 23 orchestration permissions, ECS residual-child inspection/cleanup permissions, and the concrete Task 24 finalizer are all available.
+Distributed mode must not be enabled until the Task 23 orchestration permissions,
+ECS residual-child inspection/cleanup permissions, the concrete Task 24 finalizer,
+and the configured Phase 3 orchestration state machine ARN are all available.
 
-Preserve the existing restricted states:StartExecution, states:DescribeExecution, and states:StopExecution permissions. Do not broaden Step Functions permissions beyond the Phase 3 orchestration state machine and its executions.
+When enabling distributed mode, wire the configured Phase 3 orchestration state machine ARN into the deployed ECS worker task definition.
 
-Distributed mode must not be enabled until these permissions and the concrete Task 24 finalizer are both available.
+Set ORCHESTRATION_STATE_MACHINE_ARN on the worker container from aws_sfn_state_machine.orchestration.arn. Do not require GitHub Actions, offline validation, or the default local development environment to provide this value.
+
+The worker must preserve CLI mode when ORCHESTRATION_STATE_MACHINE_ARN is unset. Select Distributed mode only when the ARN is configured, the Step Functions execution client initializes successfully, and the concrete Task 24 finalizer is available.
+
+Do not enable Distributed mode by changing a global or default deployment-mode constant shared by offline/component tests and normal CLI processing. Distributed-mode selection must be performed explicitly in the deployed worker runtime wiring.
+
+If the configured orchestration client cannot be initialized, fail worker startup rather than silently falling back from an explicitly configured Distributed deployment to CLI mode.
 
 **Allowed Changes:** Frontmatter paths are the maximum scope for this requirement, adjacent tests, and named runbooks. A broad glob does not authorize unrelated functionality.
 
@@ -98,6 +106,18 @@ Distributed mode must not be enabled until these permissions and the concrete Ta
 - CloudFront serves master, variants, and segments successfully with correct MIME types. Observe real decode of each rendition, positive media-time advancement, and at least one rendition switch.
 - Missing objects/descriptors, wrong attempts, one-child failure, stale parents, database failure after master Put, and deletion failure after completion cannot cause invalid publication or repeated encoding.
 - Legacy and distributed completed jobs use the same API shape; existing CLI mode remains functional.
+- MessageCompletionProcessor and offline/component tests preserve CLI as their default
+  mode; enabling distributed deployment must not change existing CLI completion-test
+  execution paths.
+- With ORCHESTRATION_STATE_MACHINE_ARN unset, worker startup preserves CLI acquisition
+  and processing.
+- With ORCHESTRATION_STATE_MACHINE_ARN configured and the Step Functions client and
+  concrete finalizer available, the deployed worker selects Distributed mode.
+- The ECS worker task definition supplies ORCHESTRATION_STATE_MACHINE_ARN from the
+  configured Phase 3 state machine without requiring GitHub Actions or local test
+  environments to provide it.
+- Existing CLI completion and shutdown tests must complete normally and must not be
+  redirected into the distributed orchestration path.
 - Verify repeated immutable requests using cache headers and bytes/hashes without requiring per-job invalidation.
 - Add only the worker coordinator permissions required for distributed finalization and Task 23 orchestration recovery.
 - In addition to the parent descriptor/GetObject permissions required by this task, grant states:GetExecutionHistory only for executions of the configured Phase 3 orchestration state machine.
