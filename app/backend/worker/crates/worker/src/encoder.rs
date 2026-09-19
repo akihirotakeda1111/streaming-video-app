@@ -153,7 +153,7 @@ fn streams_of(json: &Value) -> Result<&[Value], EncoderError> {
         .ok_or(EncoderError::Media("source has no streams".into()))
 }
 
-async fn probe<E: Execute>(
+pub(crate) async fn probe<E: Execute>(
     executor: &mut E,
     path: &Path,
     ffprobe: &Path,

@@ -137,6 +137,15 @@ where
             {
                 let mut store = storage.lock().await;
                 let mut probe = probe.lock().await;
+                let (source_width, source_height) = inspect_source(
+                    &mut *store,
+                    &mut *probe,
+                    &ffprobe,
+                    work.path(),
+                    &job.item.bucket,
+                    &input.source_key,
+                )
+                .await?;
                 for rendition in &input.renditions {
                     if *ownership.borrow() {
                         return Err(OrchestrationError::OwnershipLost);
@@ -154,6 +163,8 @@ where
                         work.path(),
                         rendition,
                         &objects,
+                        source_width,
+                        source_height,
                     )
                     .await?;
                     variants.insert(rendition.clone(), variant);
@@ -324,26 +335,58 @@ fn rendition_ceiling(rendition: &str) -> (u32, u32) {
     }
 }
 
-fn peak_bandwidth(playlist: &[u8], segment_sizes: &[u64]) -> u64 {
-    let durations: Vec<f64> = String::from_utf8_lossy(playlist)
-        .lines()
-        .filter_map(|line| {
-            line.strip_prefix("#EXTINF:")
-                .and_then(|value| value.split(',').next())
-                .and_then(|value| value.parse().ok())
-        })
-        .collect();
-    segment_sizes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, size)| {
-            let seconds = durations.get(index).copied().unwrap_or(6.0);
-            (seconds.is_finite() && seconds > 0.0)
-                .then(|| ((*size as f64 * 8.0) / seconds).ceil() as u64)
-        })
-        .max()
-        .unwrap_or(1)
-        .max(1)
+fn peak_bandwidth(playlist: &[u8], segment_sizes: &[u64]) -> Result<u64, OrchestrationError> {
+    let mut durations = Vec::new();
+    for line in String::from_utf8_lossy(playlist).lines() {
+        let Some(value) = line.strip_prefix("#EXTINF:") else {
+            continue;
+        };
+        let seconds = value
+            .split(',')
+            .next()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .ok_or_else(|| finalizer_error("media playlist duration is invalid"))?;
+        durations.push(seconds);
+    }
+    if durations.len() != segment_sizes.len() {
+        return Err(finalizer_error("media playlist EXTINF count mismatch"));
+    }
+    let mut peak = 0u64;
+    for (seconds, size) in durations.iter().zip(segment_sizes) {
+        let bandwidth = ((*size as f64 * 8.0) / seconds).ceil() as u64;
+        peak = peak.max(bandwidth);
+    }
+    if peak == 0 {
+        return Err(finalizer_error("actual media claims are invalid"));
+    }
+    Ok(peak)
+}
+
+async fn inspect_source<S, P>(
+    store: &mut S,
+    probe: &mut P,
+    ffprobe: &Path,
+    directory: &Path,
+    bucket: &str,
+    key: &str,
+) -> Result<(u32, u32), OrchestrationError>
+where
+    S: Read + Write,
+    P: Execute,
+{
+    let bytes = store.read(bucket, key).await.map_err(storage_error)?;
+    if bytes.is_empty() {
+        return Err(finalizer_error("source is empty"));
+    }
+    let path = directory.join("source.mp4");
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|error| finalizer_error(&error.to_string()))?;
+    let (width, height, _) = encoder::probe(probe, &path, ffprobe)
+        .await
+        .map_err(|error| finalizer_error(&error.to_string()))?;
+    Ok((width, height))
 }
 
 async fn inspect_actual_media<P: Execute>(
@@ -352,6 +395,8 @@ async fn inspect_actual_media<P: Execute>(
     directory: &Path,
     rendition: &str,
     objects: &ValidatedObjects,
+    source_width: u32,
+    source_height: u32,
 ) -> Result<MediaVariant, OrchestrationError> {
     let segment = objects
         .segments
@@ -370,6 +415,11 @@ async fn inspect_actual_media<P: Execute>(
             "actual media exceeds the rendition ceiling",
         ));
     }
+    if width > source_width || height > source_height {
+        return Err(finalizer_error(
+            "actual media exceeds the source resolution",
+        ));
+    }
     let bandwidth = peak_bandwidth(
         &objects.playlist,
         &objects
@@ -377,8 +427,8 @@ async fn inspect_actual_media<P: Execute>(
             .iter()
             .map(|segment| segment.len() as u64)
             .collect::<Vec<_>>(),
-    );
-    if bandwidth == 0 || codecs.is_empty() {
+    )?;
+    if codecs.is_empty() {
         return Err(finalizer_error("actual media claims are invalid"));
     }
     Ok(MediaVariant {
@@ -434,6 +484,7 @@ mod tests {
         fn succeeding() -> Self {
             Self {
                 responses: VecDeque::from([
+                    Ok(probe_output(1920, 1080, "High", 40)),
                     Ok(probe_output(640, 360, "High", 30)),
                     Ok(probe_output(1280, 710, "High", 31)),
                 ]),
@@ -488,7 +539,13 @@ mod tests {
         ExecutionInput::for_job(job, canonical_renditions(), DEADLINE).unwrap()
     }
 
-    fn child_json(input: &ExecutionInput, rendition: &str, attempt: u32, video_id: &str) -> String {
+    fn child_json(
+        input: &ExecutionInput,
+        rendition: &str,
+        attempt: u32,
+        video_id: &str,
+        playlist: &[u8],
+    ) -> String {
         let (width, height) = if rendition == "360p" {
             (640, 360)
         } else {
@@ -506,7 +563,7 @@ mod tests {
             "schema_version": 1,
             "media_playlist": {
                 "key": format!("{prefix}/index.m3u8"),
-                "size_bytes": PLAYLIST.len() as u64,
+                "size_bytes": playlist.len() as u64,
                 "content_type": PLAYLIST_TYPE,
             },
             "segments": [{
@@ -527,6 +584,7 @@ mod tests {
         input: &ExecutionInput,
         rendition: &str,
         json: &str,
+        playlist: &[u8],
         playlist_type: &str,
         segment_type: &str,
     ) {
@@ -540,8 +598,8 @@ mod tests {
             BUCKET,
             &format!("{prefix}/index.m3u8"),
             playlist_type,
-            Some(PLAYLIST.len() as u64),
-            PLAYLIST.to_vec(),
+            Some(playlist.len() as u64),
+            playlist.to_vec(),
         );
         storage.add_read_with_metadata(
             BUCKET,
@@ -554,12 +612,13 @@ mod tests {
 
     fn seed_valid(storage: &mut FakeStorage, input: &ExecutionInput) {
         for rendition in &input.renditions {
-            let json = child_json(input, rendition, input.attempt, &input.video_id);
+            let json = child_json(input, rendition, input.attempt, &input.video_id, PLAYLIST);
             seed_rendition(
                 storage,
                 input,
                 rendition,
                 &json,
+                PLAYLIST,
                 PLAYLIST_TYPE,
                 SEGMENT_TYPE,
             );
@@ -578,12 +637,13 @@ mod tests {
 
     async fn run_with_probe(
         jobs: FakeJobState,
-        storage: FakeStorage,
+        mut storage: FakeStorage,
         job: &AcquiredJob,
         input: &ExecutionInput,
         lost: bool,
         probe: FakeProbe,
     ) -> Result<(), OrchestrationError> {
+        storage.add_read(&job.item.bucket, &input.source_key, b"source".to_vec());
         let work = tempfile::tempdir().unwrap();
         let (_, ownership) = watch::channel(lost);
         DistributedFinalizer::new(
@@ -651,9 +711,66 @@ mod tests {
     #[test]
     fn peak_bandwidth_uses_actual_segment_bytes_and_playlist_duration() {
         assert_eq!(
-            peak_bandwidth(b"#EXTM3U\n#EXTINF:1,\nsegment-00000.ts\n", &[1000]),
+            peak_bandwidth(b"#EXTM3U\n#EXTINF:1,\nsegment-00000.ts\n", &[1000]).unwrap(),
             8000
         );
+    }
+
+    #[test]
+    fn peak_bandwidth_rejects_extinf_count_mismatch() {
+        let error = peak_bandwidth(b"#EXTM3U\nsegment-00000.ts\n", &[1000]).unwrap_err();
+        assert!(
+            matches!(error, OrchestrationError::Finalizer(message) if message.contains("EXTINF"))
+        );
+        let extra = peak_bandwidth(
+            b"#EXTM3U\n#EXTINF:1,\n#EXTINF:1,\nsegment-00000.ts\n",
+            &[1000],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(extra, OrchestrationError::Finalizer(message) if message.contains("EXTINF"))
+        );
+    }
+
+    #[test]
+    fn peak_bandwidth_rejects_invalid_or_zero_duration() {
+        let zero = peak_bandwidth(b"#EXTM3U\n#EXTINF:0,\nsegment-00000.ts\n", &[1000]).unwrap_err();
+        assert!(
+            matches!(zero, OrchestrationError::Finalizer(message) if message.contains("duration"))
+        );
+        let invalid =
+            peak_bandwidth(b"#EXTM3U\n#EXTINF:abc,\nsegment-00000.ts\n", &[1000]).unwrap_err();
+        assert!(
+            matches!(invalid, OrchestrationError::Finalizer(message) if message.contains("duration"))
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_extinf_does_not_publish() {
+        let job = job(1);
+        let input = input_for(&job);
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        const NO_DURATION: &[u8] = b"#EXTM3U\nsegment-00000.ts\n";
+        for rendition in &input.renditions {
+            let json = child_json(&input, rendition, 1, VIDEO_ID, NO_DURATION);
+            seed_rendition(
+                &mut storage,
+                &input,
+                rendition,
+                &json,
+                NO_DURATION,
+                PLAYLIST_TYPE,
+                SEGMENT_TYPE,
+            );
+        }
+        let error = run(FakeJobState::new(log.clone()), storage, &job, &input, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OrchestrationError::Finalizer(message) if message.contains("EXTINF"))
+        );
+        assert!(!master_written(&log, &input));
     }
 
     #[tokio::test]
@@ -665,6 +782,7 @@ mod tests {
         seed_valid(&mut storage, &input);
         let probe = FakeProbe {
             responses: VecDeque::from([
+                Ok(probe_output(1920, 1080, "High", 40)),
                 Ok(probe_output(640, 360, "High", 30)),
                 Ok(probe_output(1920, 1080, "High", 40)),
             ]),
@@ -686,6 +804,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probed_resolution_above_source_does_not_publish() {
+        let job = job(1);
+        let input = input_for(&job);
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        seed_valid(&mut storage, &input);
+        let probe = FakeProbe {
+            responses: VecDeque::from([
+                Ok(probe_output(640, 360, "High", 30)),
+                Ok(probe_output(640, 360, "High", 30)),
+                Ok(probe_output(1280, 710, "High", 31)),
+            ]),
+        };
+        let error = run_with_probe(
+            FakeJobState::new(log.clone()),
+            storage,
+            &job,
+            &input,
+            false,
+            probe,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, OrchestrationError::Finalizer(message) if message.contains("source"))
+        );
+        assert!(!master_written(&log, &input));
+    }
+
+    #[tokio::test]
     async fn corrupt_actual_media_does_not_publish() {
         let job = job(1);
         let input = input_for(&job);
@@ -693,11 +841,14 @@ mod tests {
         let mut storage = FakeStorage::new(log.clone());
         seed_valid(&mut storage, &input);
         let probe = FakeProbe {
-            responses: VecDeque::from([Ok(Output {
-                status: 1,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            })]),
+            responses: VecDeque::from([
+                Ok(probe_output(1920, 1080, "High", 40)),
+                Ok(Output {
+                    status: 1,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }),
+            ]),
         };
         let error = run_with_probe(
             FakeJobState::new(log.clone()),
@@ -719,12 +870,13 @@ mod tests {
         let input = input_for(&job);
         let log = CallLog::default();
         let mut storage = FakeStorage::new(log.clone());
-        let json = child_json(&input, "360p", 1, VIDEO_ID);
+        let json = child_json(&input, "360p", 1, VIDEO_ID, PLAYLIST);
         seed_rendition(
             &mut storage,
             &input,
             "360p",
             &json,
+            PLAYLIST,
             PLAYLIST_TYPE,
             SEGMENT_TYPE,
         );
@@ -752,12 +904,13 @@ mod tests {
             } else {
                 VIDEO_ID
             };
-            let json = child_json(&input, rendition, 1, video_id);
+            let json = child_json(&input, rendition, 1, video_id, PLAYLIST);
             seed_rendition(
                 &mut storage,
                 &input,
                 rendition,
                 &json,
+                PLAYLIST,
                 PLAYLIST_TYPE,
                 SEGMENT_TYPE,
             );
@@ -776,12 +929,13 @@ mod tests {
         let log = CallLog::default();
         let mut storage = FakeStorage::new(log.clone());
         for rendition in &input.renditions {
-            let json = child_json(&input, rendition, 2, VIDEO_ID);
+            let json = child_json(&input, rendition, 2, VIDEO_ID, PLAYLIST);
             seed_rendition(
                 &mut storage,
                 &input,
                 rendition,
                 &json,
+                PLAYLIST,
                 PLAYLIST_TYPE,
                 SEGMENT_TYPE,
             );
@@ -800,7 +954,7 @@ mod tests {
         let log = CallLog::default();
         let mut storage = FakeStorage::new(log.clone());
         for rendition in &input.renditions {
-            let json = child_json(&input, rendition, 1, VIDEO_ID);
+            let json = child_json(&input, rendition, 1, VIDEO_ID, PLAYLIST);
             let segment_type = if rendition == "720p" {
                 "application/octet-stream"
             } else {
@@ -811,6 +965,7 @@ mod tests {
                 &input,
                 rendition,
                 &json,
+                PLAYLIST,
                 PLAYLIST_TYPE,
                 segment_type,
             );

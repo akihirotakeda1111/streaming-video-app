@@ -1,6 +1,6 @@
 //! Amazon S3 adapter using configured input and output buckets.
 
-use aws_sdk_s3::{primitives::ByteStream, Client};
+use aws_sdk_s3::{Client, primitives::ByteStream};
 
 use crate::{ObjectError, ObjectRead, Read, Write};
 
@@ -383,10 +383,12 @@ mod tests {
             .await
             .unwrap();
         assert!(storage.read("other", "source").await.is_err());
-        assert!(storage
-            .write("input", "manifest", "application/vnd.apple.mpegurl", b"hls")
-            .await
-            .is_err());
+        assert!(
+            storage
+                .write("input", "manifest", "application/vnd.apple.mpegurl", b"hls")
+                .await
+                .is_err()
+        );
         assert_eq!(storage.api.calls.len(), 2);
         assert_eq!(storage.api.calls[1].0, "application/vnd.apple.mpegurl");
     }
@@ -414,11 +416,12 @@ async fn actual_s3_stream_rejects_oversize_without_content_length() {
     let mut api = AwsS3Api {
         client: Client::from_conf(config),
     };
-    assert!(api
-        .get_bounded("input", "key", 5)
-        .await
-        .unwrap_err()
-        .contains("size exceeds"));
+    assert!(
+        api.get_bounded("input", "key", 5)
+            .await
+            .unwrap_err()
+            .contains("size exceeds")
+    );
     server.await.unwrap();
 }
 
