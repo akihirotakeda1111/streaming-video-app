@@ -6,12 +6,14 @@ pub mod encoder;
 pub mod event;
 pub mod fakes;
 pub mod heartbeat;
+pub mod orchestration;
 pub mod protection;
 #[cfg(test)]
 mod protection_tests;
 pub mod publish;
 pub mod retry;
 pub mod runtime;
+pub mod sfn;
 
 use std::{env, fmt, path::PathBuf};
 
@@ -30,6 +32,7 @@ const LEASE_DURATION_SECONDS: &str = "WORKER_LEASE_DURATION_SECONDS";
 const RETRY_DELAY_SECONDS: &str = "WORKER_RETRY_DELAY_SECONDS";
 const MAXIMUM_ATTEMPTS: &str = "WORKER_MAXIMUM_ATTEMPTS";
 const MAX_CONCURRENCY: &str = "WORKER_MAX_CONCURRENCY";
+const ORCHESTRATION_STATE_MACHINE_ARN: &str = "ORCHESTRATION_STATE_MACHINE_ARN";
 const DEFAULT_MAX_CONCURRENCY: usize = 2;
 const MAX_ALLOWED_CONCURRENCY: usize = 32;
 
@@ -51,6 +54,7 @@ pub struct Config {
     pub max_concurrency: usize,
     pub runtime_mode: String,
     pub ecs_agent_uri: Option<String>,
+    pub orchestration_state_machine_arn: Option<String>,
     pub limits: encoding::limits::Limits,
 }
 
@@ -90,6 +94,9 @@ impl Config {
             ));
         }
         let ecs_agent_uri = lookup("ECS_AGENT_URI");
+        let orchestration_state_machine_arn = lookup(ORCHESTRATION_STATE_MACHINE_ARN)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         if runtime_mode == "ecs" {
             crate::protection::Agent::new(ecs_agent_uri.as_deref().unwrap_or("")).map_err(
                 |_| {
@@ -172,6 +179,7 @@ impl Config {
             max_concurrency,
             runtime_mode,
             ecs_agent_uri,
+            orchestration_state_machine_arn,
             limits,
         })
     }

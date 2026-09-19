@@ -67,6 +67,7 @@ fn normalize_received_message(message: AwsMessage) -> Result<Message, String> {
         body: message.body.unwrap_or_default(),
         receive_count,
         visibility_deadline: None,
+        receive_started_at: None,
     })
 }
 
@@ -174,13 +175,15 @@ impl<A: SqsApi + Send> Receive for SqsQueue<A> {
         }
         // Pin the current queue timeout on the request and account for the
         // entire receive latency, including long polling and SDK retries.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        let receive_started_at = tokio::time::Instant::now();
+        let deadline = receive_started_at + Duration::from_secs(seconds);
         let mut message = self
             .api
             .receive(&self.queue_url, 20, seconds as i32)
             .await
             .map_err(QueueError)?;
         if let Some(message) = &mut message {
+            message.receive_started_at = Some(receive_started_at);
             message.visibility_deadline = Some(deadline);
         }
         Ok(message)
@@ -248,6 +251,7 @@ mod tests {
                 body: "body".into(),
                 receive_count: 2,
                 visibility_deadline: None,
+                receive_started_at: None,
             }
         );
     }
@@ -351,6 +355,7 @@ mod tests {
                 body: "body".into(),
                 receive_count: 1,
                 visibility_deadline: None,
+                receive_started_at: None,
             }))
         }
         async fn delete(&mut self, queue_url: &str, receipt_handle: &str) -> Result<(), String> {
@@ -389,7 +394,13 @@ mod tests {
         };
         let start = tokio::time::Instant::now();
         let message = queue.receive().await.unwrap().unwrap();
+        let receive_started_at = message.receive_started_at.unwrap();
         let deadline = message.visibility_deadline.unwrap();
+        assert!(receive_started_at >= start);
+        assert_eq!(
+            deadline.checked_duration_since(receive_started_at),
+            Some(Duration::from_secs(120))
+        );
         assert!(deadline >= start + Duration::from_secs(120));
         assert!(
             deadline

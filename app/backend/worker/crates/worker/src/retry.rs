@@ -174,6 +174,10 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
         self
     }
 
+    pub(crate) fn processing_budget(&self) -> Duration {
+        Duration::from_secs(self.limits.wall_seconds)
+    }
+
     fn owned(cancelled: &watch::Receiver<bool>) -> bool {
         !*cancelled.borrow()
     }
@@ -353,6 +357,19 @@ impl<J, S, E> OwnedAttemptProcessor<J, S, E> {
             PublishError::OwnershipLost => "ownership lost".into(),
             other => format!("publish HLS: {other}"),
         })
+    }
+
+    pub(crate) async fn fail_owned(
+        &self,
+        acquired: &AcquiredJob,
+        cancelled: &watch::Receiver<bool>,
+        failure: impl Into<String>,
+    ) -> Result<ProcessingOutcome, ProcessingError>
+    where
+        J: JobState,
+    {
+        self.resolve_failure(acquired, cancelled, failure.into())
+            .await
     }
 
     async fn resolve_failure(

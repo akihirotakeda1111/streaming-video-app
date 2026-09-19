@@ -17,6 +17,11 @@ use crate::{
         LeaseAcquisitionProcessor, NoWorkReason, RecordAcquisitionDisposition, WorkerIdentity,
     },
     heartbeat::{HeartbeatDeadlines, HeartbeatSettings},
+    orchestration::{
+        DEFAULT_POLL_INTERVAL, DEPLOYMENT_MODE, ExecutionClient, ExecutionInput, Finalizer,
+        OrchestrationBridge, OrchestrationError, UnavailableExecutionClient, UnpublishedFinalizer,
+        canonical_renditions, deadline_from_receive,
+    },
     retry::{OwnedAttemptProcessor, ProcessingOutcome, RetrySettings},
     runtime::{MessageProcessor, cancellation_requested},
 };
@@ -31,6 +36,14 @@ pub struct MessageCompletionProcessor<J, S, E, Q> {
     heartbeat: HeartbeatSettings,
     lease_seconds: u64,
     worker_id: WorkerIdentity,
+    orchestration: OrchestrationSettings,
+}
+
+#[derive(Clone)]
+struct OrchestrationSettings {
+    client: Arc<dyn ExecutionClient>,
+    finalizer: Arc<dyn Finalizer>,
+    poll_interval: Duration,
 }
 
 impl<J, S, E, Q> Clone for MessageCompletionProcessor<J, S, E, Q> {
@@ -43,6 +56,7 @@ impl<J, S, E, Q> Clone for MessageCompletionProcessor<J, S, E, Q> {
             heartbeat: self.heartbeat,
             lease_seconds: self.lease_seconds,
             worker_id: self.worker_id.clone(),
+            orchestration: self.orchestration.clone(),
         }
     }
 }
@@ -78,7 +92,8 @@ impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q> {
                 input_bucket.clone(),
                 lease_seconds,
                 maximum_attempts,
-            ),
+            )
+            .with_mode(DEPLOYMENT_MODE),
             processing: OwnedAttemptProcessor::from_shared(
                 jobs.clone(),
                 storage,
@@ -92,11 +107,36 @@ impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q> {
             queue,
             heartbeat,
             lease_seconds,
+            orchestration: OrchestrationSettings {
+                client: Arc::new(UnavailableExecutionClient),
+                finalizer: Arc::new(UnpublishedFinalizer),
+                poll_interval: DEFAULT_POLL_INTERVAL,
+            },
         })
     }
 
     pub fn with_limits(mut self, limits: encoding::limits::Limits) -> Self {
         self.processing = self.processing.with_limits(limits);
+        self
+    }
+
+    pub fn with_orchestration(
+        mut self,
+        client: impl ExecutionClient + 'static,
+        finalizer: impl Finalizer + 'static,
+    ) -> Self {
+        self.orchestration.client = Arc::new(client);
+        self.orchestration.finalizer = Arc::new(finalizer);
+        self
+    }
+
+    pub fn with_deployment_mode(mut self, mode: persistence::JobMode) -> Self {
+        self.acquisition = self.acquisition.with_mode(mode);
+        self
+    }
+
+    pub fn with_poll(mut self, _poll_limit: usize, poll_interval: Duration) -> Self {
+        self.orchestration.poll_interval = poll_interval;
         self
     }
 
@@ -156,6 +196,73 @@ where
     E: Execute + Send + 'static,
     Q: ChangeVisibility + Delete + Send + 'static,
 {
+    async fn run_distributed(
+        &self,
+        job: &crate::acquisition::AcquiredJob,
+        receive_started_at: Option<Instant>,
+        cancelled: &mut watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<ProcessingOutcome, crate::retry::ProcessingError> {
+        if *cancelled.borrow() || *shutdown.borrow() {
+            return Ok(ProcessingOutcome::OwnershipLost);
+        }
+        let Some(receive_started_at) = receive_started_at else {
+            return self
+                .processing
+                .fail_owned(job, cancelled, "receive start time is missing")
+                .await;
+        };
+        let (deadline_at, deadline) = match deadline_from_receive(
+            receive_started_at,
+            self.processing.processing_budget(),
+            self.heartbeat.interval,
+        ) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                return self
+                    .processing
+                    .fail_owned(job, cancelled, error.to_string())
+                    .await;
+            }
+        };
+        let input = match ExecutionInput::for_job(job, canonical_renditions(), deadline_at) {
+            Ok(input) => input,
+            Err(error) => {
+                return self
+                    .processing
+                    .fail_owned(job, cancelled, error.to_string())
+                    .await;
+            }
+        };
+        let poll_interval = self
+            .orchestration
+            .poll_interval
+            .max(Duration::from_millis(1));
+        let bridge = OrchestrationBridge {
+            client: self.orchestration.client.clone(),
+            finalizer: self.orchestration.finalizer.clone(),
+            poll_interval,
+        };
+        match bridge
+            .run(job, &input, cancelled.clone(), shutdown.clone(), deadline)
+            .await
+        {
+            Ok(()) if *cancelled.borrow() || *shutdown.borrow() => {
+                Ok(ProcessingOutcome::OwnershipLost)
+            }
+            Ok(()) => Ok(ProcessingOutcome::Completed),
+            Err(OrchestrationError::OwnershipLost) => Ok(ProcessingOutcome::OwnershipLost),
+            Err(_) if *cancelled.borrow() || *shutdown.borrow() => {
+                Ok(ProcessingOutcome::OwnershipLost)
+            }
+            Err(error) => {
+                self.processing
+                    .fail_owned(job, cancelled, error.to_string())
+                    .await
+            }
+        }
+    }
+
     async fn process_delivery(
         &self,
         message: Message,
@@ -192,7 +299,8 @@ where
         };
         for disposition in &dispositions {
             match disposition {
-                RecordAcquisitionDisposition::Acquired(job) => {
+                RecordAcquisitionDisposition::Acquired(job)
+                | RecordAcquisitionDisposition::AcquiredWithMode { job, .. } => {
                     self.log_record(Some(&job.item), Some(job.attempt), "acquired");
                 }
                 RecordAcquisitionDisposition::NotAcquired { item, reason } => {
@@ -214,7 +322,8 @@ where
         let acquired: Vec<_> = dispositions
             .iter()
             .filter_map(|disposition| match disposition {
-                RecordAcquisitionDisposition::Acquired(job) => Some(job.clone()),
+                RecordAcquisitionDisposition::Acquired(job)
+                | RecordAcquisitionDisposition::AcquiredWithMode { job, .. } => Some(job.clone()),
                 _ => None,
             })
             .collect();
@@ -238,7 +347,73 @@ where
                 break;
             }
             match disposition {
-                RecordAcquisitionDisposition::Acquired(job) => {
+                RecordAcquisitionDisposition::AcquiredWithMode {
+                    job,
+                    mode: persistence::JobMode::Distributed,
+                } => {
+                    let handle = heartbeat.as_ref().expect("acquired record has a heartbeat");
+                    let lost = handle.ownership_lost();
+                    if *lost.borrow() {
+                        self.log_record(Some(&job.item), Some(job.attempt), "ownership_lost");
+                        acknowledge = false;
+                        break;
+                    }
+                    let activity = handle.activity(index);
+                    index += 1;
+                    let mut cancelled = lost.clone();
+                    let outcome = self
+                        .run_distributed(
+                            &job,
+                            message.receive_started_at,
+                            &mut cancelled,
+                            shutdown.clone(),
+                        )
+                        .await;
+                    activity.store(false, std::sync::atomic::Ordering::SeqCst);
+                    match outcome {
+                        Ok(ProcessingOutcome::Completed) => {
+                            self.log_record(Some(&job.item), Some(job.attempt), "completed");
+                        }
+                        Ok(ProcessingOutcome::RetryReleased { delay }) => {
+                            self.log_record(Some(&job.item), Some(job.attempt), "retry_released");
+                            acknowledge = false;
+                            retry_delay =
+                                Some(retry_delay.map_or(delay, |current| current.max(delay)));
+                        }
+                        Ok(outcome) => {
+                            acknowledge = false;
+                            let label = match outcome {
+                                ProcessingOutcome::FinalFailed => "final_failed",
+                                ProcessingOutcome::OwnershipLost => "ownership_lost",
+                                ProcessingOutcome::InfrastructureFailure => {
+                                    "infrastructure_failure"
+                                }
+                                ProcessingOutcome::Panicked => "panicked",
+                                _ => unreachable!("completed and retry outcomes handled above"),
+                            };
+                            self.log_record(Some(&job.item), Some(job.attempt), label);
+                            if matches!(
+                                outcome,
+                                ProcessingOutcome::OwnershipLost
+                                    | ProcessingOutcome::InfrastructureFailure
+                                    | ProcessingOutcome::Panicked
+                            ) {
+                                retry_delay = None;
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            self.log_record(Some(&job.item), Some(job.attempt), "processing_error");
+                            acknowledge = false;
+                            break;
+                        }
+                    }
+                }
+                RecordAcquisitionDisposition::Acquired(job)
+                | RecordAcquisitionDisposition::AcquiredWithMode {
+                    job,
+                    mode: persistence::JobMode::Cli,
+                } => {
                     let handle = heartbeat.as_ref().expect("acquired record has a heartbeat");
                     let mut lost = handle.ownership_lost();
                     if *lost.borrow() {
@@ -458,6 +633,30 @@ mod tests {
                 }
             }
         }
+        async fn acquire_lease_with_mode(
+            &mut self,
+            id: &str,
+            video_id: &str,
+            worker_id: &str,
+            lease_seconds: u64,
+            max_attempts: u32,
+            mode: persistence::JobMode,
+        ) -> Result<LeaseAcquisitionOutcome, PersistenceError> {
+            match self
+                .acquire_lease(id, video_id, worker_id, lease_seconds, max_attempts)
+                .await?
+            {
+                LeaseAcquisitionOutcome::Acquired {
+                    attempt,
+                    lease_expires_at,
+                } => Ok(LeaseAcquisitionOutcome::AcquiredWithMode {
+                    attempt,
+                    lease_expires_at,
+                    mode,
+                }),
+                other => Ok(other),
+            }
+        }
         async fn renew_lease(
             &mut self,
             id: &str,
@@ -619,12 +818,14 @@ mod tests {
         }
         fn message(ids: &[&str]) -> Message {
             let keys: Vec<_> = ids.iter().map(|id| source_key(VIDEO, id)).collect();
+            let receive_started_at = Instant::now();
             Message {
                 message_id: Some("message-test".into()),
                 delivery_id: "delivery-test".into(),
                 receipt_handle: "receipt".into(),
                 receive_count: 1,
-                visibility_deadline: Some(Instant::now() + Duration::from_secs(2)),
+                visibility_deadline: Some(receive_started_at + Duration::from_secs(2)),
+                receive_started_at: Some(receive_started_at),
                 body: records_notification(
                     &keys
                         .iter()
@@ -641,6 +842,29 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        }
+
+        fn distributed(
+            self,
+            client: crate::fakes::FakeExecutionClient,
+            finalizer: crate::fakes::FakeFinalizer,
+        ) -> Self {
+            self.distributed_with_poll(client, finalizer, 4, Duration::from_millis(1))
+        }
+
+        fn distributed_with_poll(
+            mut self,
+            client: crate::fakes::FakeExecutionClient,
+            finalizer: crate::fakes::FakeFinalizer,
+            poll_limit: usize,
+            poll_interval: Duration,
+        ) -> Self {
+            let processor = self.processor;
+            self.processor = processor
+                .with_deployment_mode(persistence::JobMode::Distributed)
+                .with_orchestration(client, finalizer)
+                .with_poll(poll_limit, poll_interval);
+            self
         }
     }
     #[tokio::test]
@@ -1141,5 +1365,201 @@ mod tests {
         message.body = "invalid".into();
         f.processor.process(message).await.unwrap();
         assert!(f.state.lock().unwrap().calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn succeeded_finalizer_reaches_existing_ack_without_cli_completion() {
+        use crate::fakes::{FakeExecutionClient, FakeFinalizer};
+        use crate::orchestration::ExecutionStatus;
+
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        let starts = client.starts.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let f = Fixture::new(Duration::ZERO, false).distributed(client, finalizer);
+        f.run(&[FIRST]).await;
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(starts.lock().unwrap().len(), 1);
+        assert_eq!(starts.lock().unwrap()[0].0, format!("job-{FIRST}-a1"));
+        let s = f.state.lock().unwrap();
+        assert!(s.calls.contains(&"delete".into()));
+        assert!(!s.calls.iter().any(|call| call.starts_with("complete:")
+            || call.starts_with("release:")
+            || call.starts_with("fail:")
+            || call == "encode"));
+    }
+
+    #[tokio::test]
+    async fn step_functions_success_does_not_ack_when_finalizer_fails() {
+        use crate::fakes::{FakeExecutionClient, FakeFinalizer};
+        use crate::orchestration::{ExecutionStatus, OrchestrationError};
+
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        let starts = client.starts.clone();
+        let finalizer =
+            FakeFinalizer::new(Err(OrchestrationError::Finalizer("invalid objects".into())));
+        let calls = finalizer.calls.clone();
+        let f = Fixture::new(Duration::ZERO, false).distributed(client, finalizer);
+        f.run(&[FIRST]).await;
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(starts.lock().unwrap().len(), 1);
+        let s = f.state.lock().unwrap();
+        assert!(s.calls.contains(&format!("release:{FIRST}")));
+        assert!(!s.calls.contains(&"delete".into()));
+        assert!(
+            !s.calls
+                .iter()
+                .any(|call| call.starts_with("complete:") || call.starts_with("fail:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_child_failure_releases_for_retry_while_owned() {
+        use crate::fakes::{FakeExecutionClient, FakeFinalizer};
+        use crate::orchestration::ExecutionStatus;
+
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Failed)]);
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let f = Fixture::new(Duration::ZERO, false).distributed(client, finalizer);
+        f.run(&[FIRST]).await;
+        assert_eq!(*calls.lock().unwrap(), 0);
+        let s = f.state.lock().unwrap();
+        assert!(s.calls.contains(&format!("release:{FIRST}")));
+        assert!(!s.calls.contains(&"delete".into()));
+        assert!(
+            !s.calls
+                .iter()
+                .any(|call| call.starts_with("complete:") || call.starts_with("fail:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_timeout_on_last_attempt_fails_terminally_while_owned() {
+        use crate::fakes::{FakeExecutionClient, FakeFinalizer};
+        use crate::orchestration::ExecutionStatus;
+
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::TimedOut)]);
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let f = Fixture::new(Duration::ZERO, false).distributed(client, finalizer);
+        f.state.lock().unwrap().attempt = 5;
+        f.run(&[FIRST]).await;
+        let s = f.state.lock().unwrap();
+        assert!(s.calls.contains(&format!("fail:{FIRST}")));
+        assert!(!s.calls.contains(&"delete".into()));
+        assert!(!s.calls.contains(&format!("release:{FIRST}")));
+    }
+
+    #[tokio::test]
+    async fn completed_redelivery_does_not_start_orchestration() {
+        use crate::fakes::{FakeExecutionClient, FakeFinalizer};
+        use crate::orchestration::ExecutionStatus;
+
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        let starts = client.starts.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let f = Fixture::new(Duration::ZERO, false).distributed(client, finalizer);
+        f.state
+            .lock()
+            .unwrap()
+            .jobs
+            .insert(FIRST.into(), "COMPLETED");
+        f.run(&[FIRST]).await;
+        assert_eq!(starts.lock().unwrap().len(), 0);
+        assert_eq!(*calls.lock().unwrap(), 0);
+        let s = f.state.lock().unwrap();
+        assert!(s.calls.contains(&"delete".into()));
+        assert!(!s.calls.contains(&"encode".into()));
+    }
+
+    #[tokio::test]
+    async fn ownership_loss_during_orchestration_does_not_release_fail_or_ack() {
+        use crate::fakes::{FakeExecutionClient, FakeFinalizer};
+        use crate::orchestration::ExecutionStatus;
+
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Running)]);
+        let cancellations = client.cancellations.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let f = Fixture::new(Duration::ZERO, false).distributed_with_poll(
+            client,
+            finalizer,
+            8,
+            Duration::from_secs(1),
+        );
+        f.state.lock().unwrap().renewal_failure = true;
+        f.run(&[FIRST]).await;
+        assert_eq!(*calls.lock().unwrap(), 0);
+        let s = f.state.lock().unwrap();
+        assert!(!s.calls.contains(&"delete".into()));
+        assert!(!s.calls.iter().any(|call| call.starts_with("complete:")
+            || call.starts_with("release:")
+            || call.starts_with("fail:")));
+        assert!(!cancellations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn distributed_deadline_at_uses_processing_budget_not_visibility() {
+        use crate::fakes::{FakeExecutionClient, FakeFinalizer};
+        use crate::orchestration::ExecutionStatus;
+        use chrono::{DateTime, Utc};
+
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        let starts = client.starts.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let f = Fixture::new(Duration::ZERO, false).distributed(client, finalizer);
+        let before = Utc::now();
+        f.run(&[FIRST]).await;
+        let deadline_at = starts.lock().unwrap()[0].1.deadline_at.clone();
+        let deadline = DateTime::parse_from_rfc3339(&deadline_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        let remaining = deadline.signed_duration_since(before).num_seconds();
+        assert!(
+            remaining >= 7_000,
+            "deadline_at should use the 7200s processing budget, not ~2s visibility remaining: {remaining}"
+        );
+        assert!(remaining <= 7_200);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_distributed_orchestration_cancels_without_finalizer_release_or_ack() {
+        use crate::fakes::{FakeExecutionClient, FakeFinalizer};
+        use crate::orchestration::ExecutionStatus;
+
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Running)]);
+        let starts = client.starts.clone();
+        let cancellations = client.cancellations.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let f = Fixture::new(Duration::ZERO, false).distributed(client, finalizer);
+        let (stop, shutdown) = watch::channel(false);
+        let processor = f.processor.clone();
+        let task = tokio::spawn(async move {
+            processor
+                .process_with_shutdown(Fixture::message(&[FIRST]), shutdown)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while starts.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("distributed execution should start before shutdown");
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown should finish orchestration")
+            .unwrap()
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 0);
+        assert!(!cancellations.lock().unwrap().is_empty());
+        let s = f.state.lock().unwrap();
+        assert!(!s.calls.contains(&"delete".into()));
+        assert!(!s.calls.iter().any(|call| call.starts_with("complete:")
+            || call.starts_with("release:")
+            || call.starts_with("fail:")));
     }
 }
