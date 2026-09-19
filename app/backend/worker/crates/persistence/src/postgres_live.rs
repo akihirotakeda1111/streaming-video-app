@@ -34,7 +34,8 @@ static SCHEMA_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn acquired_attempt(outcome: LeaseAcquisitionOutcome) -> u32 {
     match outcome {
-        LeaseAcquisitionOutcome::Acquired { attempt, .. } => attempt,
+        LeaseAcquisitionOutcome::Acquired { attempt, .. }
+        | LeaseAcquisitionOutcome::AcquiredWithMode { attempt, .. } => attempt,
         other => panic!("expected acquired lease, got {other:?}"),
     }
 }

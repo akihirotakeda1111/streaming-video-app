@@ -6,6 +6,7 @@ pub mod encoder;
 pub mod event;
 pub mod fakes;
 pub mod heartbeat;
+pub mod orchestration;
 pub mod protection;
 #[cfg(test)]
 mod protection_tests;

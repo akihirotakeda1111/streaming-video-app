@@ -192,7 +192,8 @@ where
         };
         for disposition in &dispositions {
             match disposition {
-                RecordAcquisitionDisposition::Acquired(job) => {
+                RecordAcquisitionDisposition::Acquired(job)
+                | RecordAcquisitionDisposition::AcquiredWithMode { job, .. } => {
                     self.log_record(Some(&job.item), Some(job.attempt), "acquired");
                 }
                 RecordAcquisitionDisposition::NotAcquired { item, reason } => {
@@ -214,7 +215,8 @@ where
         let acquired: Vec<_> = dispositions
             .iter()
             .filter_map(|disposition| match disposition {
-                RecordAcquisitionDisposition::Acquired(job) => Some(job.clone()),
+                RecordAcquisitionDisposition::Acquired(job)
+                | RecordAcquisitionDisposition::AcquiredWithMode { job, .. } => Some(job.clone()),
                 _ => None,
             })
             .collect();
@@ -238,7 +240,19 @@ where
                 break;
             }
             match disposition {
-                RecordAcquisitionDisposition::Acquired(job) => {
+                RecordAcquisitionDisposition::AcquiredWithMode {
+                    job,
+                    mode: persistence::JobMode::Distributed,
+                } => {
+                    self.log_record(Some(&job.item), Some(job.attempt), "distributed_disabled");
+                    acknowledge = false;
+                    break;
+                }
+                RecordAcquisitionDisposition::Acquired(job)
+                | RecordAcquisitionDisposition::AcquiredWithMode {
+                    job,
+                    mode: persistence::JobMode::Cli,
+                } => {
                     let handle = heartbeat.as_ref().expect("acquired record has a heartbeat");
                     let mut lost = handle.ownership_lost();
                     if *lost.borrow() {

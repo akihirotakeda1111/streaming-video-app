@@ -14,6 +14,14 @@ use persistence::{JobState, LeaseAcquisitionOutcome, PersistenceError};
 use queue::{ChangeVisibility, Delete, Message, QueueError, Receive};
 use storage::{ObjectError, Read, Write};
 
+use crate::acquisition::AcquiredJob;
+use crate::orchestration::{
+    ExecutionClient, ExecutionInput, ExecutionStatus, Finalizer, OrchestrationError,
+};
+use std::future::Future;
+use std::pin::Pin;
+use tokio::sync::watch;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Call {
     Receive,
@@ -324,6 +332,91 @@ pub struct FakeProcessExecutor {
     pub output: Output,
     failures: VecDeque<String>,
     write_hls: bool,
+}
+
+/// Controllable orchestration fake: start input and execution identity are
+/// observable, while status and finalization outcomes are explicit.
+#[derive(Clone)]
+pub struct FakeExecutionClient {
+    pub starts: Arc<Mutex<Vec<(String, ExecutionInput)>>>,
+    pub statuses: Arc<Mutex<VecDeque<Result<ExecutionStatus, OrchestrationError>>>>,
+    pub cancellations: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeExecutionClient {
+    pub fn new(statuses: Vec<Result<ExecutionStatus, OrchestrationError>>) -> Self {
+        Self {
+            starts: Arc::new(Mutex::new(Vec::new())),
+            statuses: Arc::new(Mutex::new(statuses.into_iter().collect())),
+            cancellations: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl ExecutionClient for FakeExecutionClient {
+    fn start(
+        &self,
+        name: &str,
+        input: &ExecutionInput,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrationError>> + Send + '_>> {
+        let name = name.to_owned();
+        let input = input.clone();
+        Box::pin(async move {
+            self.starts.lock().unwrap().push((name, input));
+            Ok(())
+        })
+    }
+    fn status(
+        &self,
+        _: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecutionStatus, OrchestrationError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            self.statuses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(ExecutionStatus::Running))
+        })
+    }
+    fn cancel(&self, name: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let name = name.to_owned();
+        Box::pin(async move {
+            self.cancellations.lock().unwrap().push(name);
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct FakeFinalizer {
+    pub result: Arc<Mutex<Result<(), OrchestrationError>>>,
+    pub calls: Arc<Mutex<usize>>,
+}
+
+impl FakeFinalizer {
+    pub fn new(result: Result<(), OrchestrationError>) -> Self {
+        Self {
+            result: Arc::new(Mutex::new(result)),
+            calls: Arc::new(Mutex::new(0)),
+        }
+    }
+}
+
+impl Finalizer for FakeFinalizer {
+    fn finalize(
+        &self,
+        _: &AcquiredJob,
+        _: &ExecutionInput,
+        ownership: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrationError>> + Send + '_>> {
+        Box::pin(async move {
+            *self.calls.lock().unwrap() += 1;
+            if *ownership.borrow() {
+                return Err(OrchestrationError::OwnershipLost);
+            }
+            self.result.lock().unwrap().clone()
+        })
+    }
 }
 impl FakeProcessExecutor {
     /// Records `Execute` and writes a minimal valid HLS layout next to the

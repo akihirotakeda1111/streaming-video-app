@@ -28,12 +28,33 @@ pub enum JobClaimOutcome {
     NotClaimed,
 }
 
+/// The immutable execution path selected for a job at first acquisition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobMode {
+    Cli,
+    Distributed,
+}
+
+impl JobMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Distributed => "distributed",
+        }
+    }
+}
+
 /// The complete result of one atomic lease-acquisition attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseAcquisitionOutcome {
     Acquired {
         attempt: u32,
         lease_expires_at: SystemTime,
+    },
+    AcquiredWithMode {
+        attempt: u32,
+        lease_expires_at: SystemTime,
+        mode: JobMode,
     },
     Busy,
     Completed,
@@ -80,6 +101,22 @@ pub trait JobState: Send {
                 "lease acquisition is not implemented".into(),
             ))
         }
+    }
+
+    /// Acquire using the deployment-selected mode. Implementations that only
+    /// support CLI retain the legacy operation and therefore fail closed for
+    /// distributed selection.
+    fn acquire_lease_with_mode(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_attempts: u32,
+        mode: JobMode,
+    ) -> impl Future<Output = Result<LeaseAcquisitionOutcome, PersistenceError>> + Send {
+        let _ = mode;
+        self.acquire_lease(job_id, video_id, worker_id, lease_seconds, max_attempts)
     }
 
     fn renew_lease(
