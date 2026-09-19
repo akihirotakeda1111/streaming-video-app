@@ -5,6 +5,7 @@ pub mod completion;
 pub mod encoder;
 pub mod event;
 pub mod fakes;
+pub mod finalizer;
 pub mod heartbeat;
 pub mod orchestration;
 pub mod protection;

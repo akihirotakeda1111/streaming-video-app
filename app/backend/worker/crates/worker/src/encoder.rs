@@ -153,7 +153,7 @@ fn streams_of(json: &Value) -> Result<&[Value], EncoderError> {
         .ok_or(EncoderError::Media("source has no streams".into()))
 }
 
-async fn probe<E: Execute>(
+pub(crate) async fn probe<E: Execute>(
     executor: &mut E,
     path: &Path,
     ffprobe: &Path,
@@ -298,6 +298,44 @@ fn rfc6381_codecs(streams: &[Value]) -> Result<String, EncoderError> {
     Ok(format!("{video_codec},{audio_codec}"))
 }
 
+pub(crate) fn encoded_media_from_probe(json: &Value) -> Result<(u32, u32, String), EncoderError> {
+    let streams = streams_of(json)?;
+    let video = streams
+        .iter()
+        .find(|s| s.get("codec_type").and_then(Value::as_str) == Some("video"))
+        .ok_or(EncoderError::Media("encoded output has no video".into()))?;
+    let width = video
+        .get("width")
+        .and_then(Value::as_u64)
+        .ok_or(EncoderError::Media("video width missing".into()))? as u32;
+    let height = video
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or(EncoderError::Media("video height missing".into()))? as u32;
+    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        return Err(EncoderError::Media(
+            "encoded dimensions must be positive and even".into(),
+        ));
+    }
+    Ok((width, height, rfc6381_codecs(streams)?))
+}
+
+pub(crate) async fn probe_encoded_file<E: Execute>(
+    executor: &mut E,
+    path: &Path,
+    ffprobe: &Path,
+) -> Result<(u32, u32, String), EncoderError> {
+    let json = ffprobe_json(
+        executor,
+        ffprobe,
+        path,
+        ENCODED_PROBE_TIMEOUT,
+        "encoded stream probe timed out",
+    )
+    .await?;
+    encoded_media_from_probe(&json)
+}
+
 pub async fn encode_child<S: Read + Write + Send>(
     storage: &mut S,
     input_bucket: &str,
@@ -421,7 +459,13 @@ where
         }
         let key = format!("{}/segment-{index:05}.ts", payload.output_prefix);
         storage
-            .write(output_bucket, &key, SEGMENT_TYPE, &contents)
+            .write_with_cache_control(
+                output_bucket,
+                &key,
+                SEGMENT_TYPE,
+                "public,max-age=31536000,immutable",
+                &contents,
+            )
             .await
             .map_err(|e| EncoderError::Storage(e.0))?;
         descriptors.push(ObjectDescriptor {
@@ -432,7 +476,13 @@ where
     }
     let playlist_key = format!("{}/index.m3u8", payload.output_prefix);
     storage
-        .write(output_bucket, &playlist_key, PLAYLIST_TYPE, &playlist)
+        .write_with_cache_control(
+            output_bucket,
+            &playlist_key,
+            PLAYLIST_TYPE,
+            "public,max-age=31536000,immutable",
+            &playlist,
+        )
         .await
         .map_err(|e| EncoderError::Storage(e.0))?;
     let result = ChildResult {
@@ -452,10 +502,11 @@ where
     let result_bytes =
         serde_json::to_vec(&result).map_err(|e| EncoderError::Json(e.to_string()))?;
     storage
-        .write(
+        .write_with_cache_control(
             output_bucket,
             &format!("{}/result.json", result.payload.output_prefix),
             "application/json",
+            "public,max-age=31536000,immutable",
             &result_bytes,
         )
         .await

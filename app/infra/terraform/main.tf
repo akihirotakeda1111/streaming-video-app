@@ -28,6 +28,31 @@ data "aws_iam_policy_document" "output_cloudfront_read" {
       values   = [aws_cloudfront_distribution.video_output.arn]
     }
   }
+
+  # Internal child descriptors are never viewer content. A broader HLS Allow
+  # still cannot serve result.json through CloudFront.
+  statement {
+    sid     = "DenyCloudFrontResultJson"
+    effect  = "Deny"
+    actions = ["s3:GetObject"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+
+    resources = [
+      format(
+        "%s/videos/%s/jobs/%s/hls/attempts/%s/%s/%s/result.json",
+        aws_s3_bucket.video_output.arn,
+        local.s3_path_wildcard,
+        local.s3_path_wildcard,
+        local.s3_path_wildcard,
+        local.s3_path_wildcard,
+        local.s3_path_wildcard,
+      ),
+    ]
+  }
 }
 
 data "aws_iam_policy_document" "encoding_queue_publish" {
@@ -298,6 +323,22 @@ resource "aws_cloudfront_cache_policy" "video_output" {
   }
 }
 
+resource "aws_cloudfront_cache_policy" "video_output_attempts" {
+  name        = "${local.name_prefix}-video-output-attempts"
+  comment     = "Cache immutable attempt-specific HLS media and playlists for one year."
+  default_ttl = 31536000
+  max_ttl     = 31536000
+  min_ttl     = 0
+
+  parameters_in_cache_key_and_forwarded_to_origin {
+    enable_accept_encoding_brotli = false
+    enable_accept_encoding_gzip   = false
+    cookies_config { cookie_behavior = "none" }
+    headers_config { header_behavior = "none" }
+    query_strings_config { query_string_behavior = "none" }
+  }
+}
+
 resource "aws_cloudfront_origin_request_policy" "video_output" {
   name = "${local.name_prefix}-video-output-preflight"
   cookies_config { cookie_behavior = "none" }
@@ -339,6 +380,17 @@ resource "aws_cloudfront_distribution" "video_output" {
     allowed_methods          = ["GET", "HEAD", "OPTIONS"]
     cached_methods            = ["GET", "HEAD", "OPTIONS"]
     cache_policy_id           = aws_cloudfront_cache_policy.video_output.id
+    origin_request_policy_id  = aws_cloudfront_origin_request_policy.video_output.id
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.video_output.id
+  }
+
+  ordered_cache_behavior {
+    path_pattern             = "/videos/*/jobs/*/hls/attempts/*"
+    target_origin_id         = "${local.name_prefix}-video-output"
+    viewer_protocol_policy   = "redirect-to-https"
+    allowed_methods          = ["GET", "HEAD", "OPTIONS"]
+    cached_methods            = ["GET", "HEAD", "OPTIONS"]
+    cache_policy_id           = aws_cloudfront_cache_policy.video_output_attempts.id
     origin_request_policy_id  = aws_cloudfront_origin_request_policy.video_output.id
     response_headers_policy_id = aws_cloudfront_response_headers_policy.video_output.id
   }

@@ -4,7 +4,9 @@ The output bucket is private. CloudFront uses an Origin Access Control (OAC)
 with SigV4 signing against the bucket's regional REST endpoint. The bucket
 policy grants `s3:GetObject` only to `cloudfront.amazonaws.com`, only below the
 legacy `videos/*/jobs/*/hls/*` prefix, and only when `AWS:SourceArn` matches
-the intended distribution. S3 CORS handles browser preflight requests forwarded
+the intended distribution. It also denies CloudFront `s3:GetObject` for
+`videos/*/jobs/*/hls/attempts/*/*/*/result.json`, so internal child descriptors
+are not viewer content even under the broader HLS Allow. S3 CORS handles browser preflight requests forwarded
 by CloudFront and authorized browser-based inspection tools. Non-browser SDKs
 do not enforce CORS; it is not an authentication mechanism. Playback CORS is applied by the
 CloudFront response-headers policy, including cache hits, for the configured
@@ -60,12 +62,13 @@ If `frontend_origins` is omitted or null, both S3 and CloudFront CORS use
 include every intended upload/playback origin. It does not automatically add
 localhost or the legacy origin.
 
-The distribution starts legacy deterministic HLS objects at TTL zero because a
-retry can overwrite those keys. An immutable attempt-key policy may be added by
-Task 24. Successful-response cache hits are not expected with these zero TTLs.
+The distribution keeps legacy deterministic HLS objects at TTL zero because a
+retry can overwrite those keys. Attempt-specific objects under
+`/videos/*/jobs/*/hls/attempts/*` use a separate cache policy whose default and
+maximum TTLs are one year, so origin `Cache-Control: public,max-age=31536000,immutable`
+headers are honored. Do not raise mutable-key TTLs to obtain cache-hit coverage.
 The response-headers policy also covers cache hits; verify multiple approved
-origins and an unapproved origin against warmed objects when Task 24 enables
-caching, without increasing mutable-key TTLs just for this test. If OPTIONS
+origins and an unapproved origin against warmed attempt-prefix objects. If OPTIONS
 caching is enabled then, include the preflight headers in the cache key.
 
 403/404 error caching minimum TTL is configured to zero. AWS documents a
@@ -100,8 +103,9 @@ settings, the distribution-scoped bucket policy, and the frontend origin in the
 CloudFront response-headers policy.
 
 The bucket-policy validator accepts the repository's distribution-scoped
-CloudFront `Allow s3:GetObject` on `videos/*/jobs/*/hls/*` and non-granting Deny
-statements. Other Allow forms, including additional broader grants, fail closed.
+CloudFront `Allow s3:GetObject` on `videos/*/jobs/*/hls/*` and the explicit
+CloudFront `Deny s3:GetObject` on attempt `result.json` objects. Other Allow
+forms, including additional broader grants, fail closed.
 Dedicated SDK permissions should be identity-based. Both 403/404 custom error
 TTLs must be explicitly zero, without status/page rewriting.
 
@@ -118,8 +122,8 @@ It requires positive media-time advancement and CloudFront manifest/segment
 responses, and checks the original manifest key and ETag using dedicated IAM
 before and after playback. Preserve the emitted
 run directories and `full-suite-*.json`; a missing/failed/unexecuted row is not
-a PASS. Cache-hit headers are deliberately not required while successful TTLs
-remain zero.
+a PASS. Cache-hit headers are deliberately not required for legacy keys while
+those successful TTLs remain zero. Attempt-specific objects may be cached.
 
 Publication is observed by continuous S3 HeadObject and CloudFront polling from
 before upload. The recovery upper bound starts at the last confirmed S3 absence
