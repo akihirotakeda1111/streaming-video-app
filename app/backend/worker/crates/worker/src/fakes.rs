@@ -10,9 +10,9 @@ use std::{
 };
 
 use encoding::{Command, Execute, Output, ProcessError};
-use persistence::{JobState, LeaseAcquisitionOutcome, PersistenceError};
+use persistence::{JobOperationOutcome, JobState, LeaseAcquisitionOutcome, PersistenceError};
 use queue::{ChangeVisibility, Delete, Message, QueueError, Receive};
-use storage::{ObjectError, Read, Write};
+use storage::{ObjectError, ObjectRead, Read, Write};
 
 use crate::acquisition::AcquiredJob;
 use crate::orchestration::{
@@ -53,6 +53,13 @@ pub enum Call {
         max_attempts: u32,
     },
     MarkProcessing(String),
+    CompleteDistributed {
+        job_id: String,
+        video_id: String,
+        worker_id: String,
+        attempt: u32,
+        published_manifest_key: String,
+    },
     Execute(Command),
     ReadSource {
         path: String,
@@ -150,6 +157,8 @@ pub struct FakeStorage {
     pub log: CallLog,
     pub reads: Vec<(String, String, Vec<u8>)>,
     pub writes: Vec<(String, String, Vec<u8>)>,
+    content_types: HashMap<(String, String), String>,
+    content_lengths: HashMap<(String, String), u64>,
     read_failures: VecDeque<String>,
     write_failures: VecDeque<String>,
     read_skip: usize,
@@ -162,6 +171,8 @@ impl FakeStorage {
             log,
             reads: Vec::new(),
             writes: Vec::new(),
+            content_types: HashMap::new(),
+            content_lengths: HashMap::new(),
             read_failures: VecDeque::new(),
             write_failures: VecDeque::new(),
             read_skip: 0,
@@ -169,6 +180,24 @@ impl FakeStorage {
         }
     }
     pub fn add_read(&mut self, bucket: &str, key: &str, contents: Vec<u8>) {
+        self.add_read_with_metadata(bucket, key, "", None, contents);
+    }
+    pub fn add_read_with_metadata(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        content_length: Option<u64>,
+        contents: Vec<u8>,
+    ) {
+        let identity = (bucket.to_owned(), key.to_owned());
+        if !content_type.is_empty() {
+            self.content_types
+                .insert(identity.clone(), content_type.into());
+        }
+        if let Some(length) = content_length {
+            self.content_lengths.insert(identity, length);
+        }
         self.reads.push((bucket.into(), key.into(), contents));
     }
     pub fn fail_read(&mut self, message: impl Into<String>) {
@@ -197,6 +226,20 @@ impl Read for FakeStorage {
             .find(|(b, k, _)| b == bucket && k == key)
             .map(|(_, _, bytes)| bytes.clone())
             .ok_or_else(|| ObjectError("object not found".into()))
+    }
+
+    async fn read_object(&mut self, bucket: &str, key: &str) -> Result<ObjectRead, ObjectError> {
+        let contents = self.read(bucket, key).await?;
+        let identity = (bucket.to_owned(), key.to_owned());
+        Ok(ObjectRead {
+            content_type: self.content_types.get(&identity).cloned(),
+            content_length: self
+                .content_lengths
+                .get(&identity)
+                .copied()
+                .or(Some(contents.len() as u64)),
+            contents,
+        })
     }
 }
 
@@ -230,6 +273,7 @@ pub struct FakeJobState {
     claim_failures: VecDeque<String>,
     processing_failures: VecDeque<String>,
     lease_acquisitions: VecDeque<Result<LeaseAcquisitionOutcome, PersistenceError>>,
+    complete_distributed_results: VecDeque<Result<JobOperationOutcome, PersistenceError>>,
     claim_skip: usize,
 }
 
@@ -241,6 +285,7 @@ impl FakeJobState {
             claim_failures: VecDeque::new(),
             processing_failures: VecDeque::new(),
             lease_acquisitions: VecDeque::new(),
+            complete_distributed_results: VecDeque::new(),
             claim_skip: 0,
         }
     }
@@ -255,6 +300,13 @@ impl FakeJobState {
     }
     pub fn fail_lease_acquisition(&mut self, message: impl Into<String>) {
         self.lease_acquisitions
+            .push_back(Err(PersistenceError(message.into())));
+    }
+    pub fn complete_distributed_outcome(&mut self, outcome: JobOperationOutcome) {
+        self.complete_distributed_results.push_back(Ok(outcome));
+    }
+    pub fn fail_complete_distributed(&mut self, message: impl Into<String>) {
+        self.complete_distributed_results
             .push_back(Err(PersistenceError(message.into())));
     }
 }
@@ -337,6 +389,26 @@ impl JobState for FakeJobState {
     ) -> Result<LeaseAcquisitionOutcome, PersistenceError> {
         self.acquire_lease(job_id, video_id, worker_id, lease_seconds, max_attempts)
             .await
+    }
+
+    async fn complete_distributed(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        published_manifest_key: &str,
+    ) -> Result<JobOperationOutcome, PersistenceError> {
+        self.log.push(Call::CompleteDistributed {
+            job_id: job_id.into(),
+            video_id: video_id.into(),
+            worker_id: worker_id.into(),
+            attempt,
+            published_manifest_key: published_manifest_key.into(),
+        });
+        self.complete_distributed_results
+            .pop_front()
+            .unwrap_or(Ok(JobOperationOutcome::Applied))
     }
 }
 

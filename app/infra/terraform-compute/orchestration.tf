@@ -294,7 +294,9 @@ resource "aws_iam_role_policy" "worker_orchestration" {
     { Effect = "Allow", Action = ["states:StartExecution"], Resource = aws_sfn_state_machine.orchestration.arn },
     { Effect = "Allow", Action = ["states:DescribeExecution", "states:StopExecution"], Resource = "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:execution:${aws_sfn_state_machine.orchestration.name}:*" },
     { Effect = "Allow", Action = ["states:GetExecutionHistory"], Resource = "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:execution:${aws_sfn_state_machine.orchestration.name}:*" },
-    { Effect = "Allow", Action = ["ecs:DescribeTasks"], Resource = ["*"], Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.main.arn } } },
-    { Effect = "Allow", Action = ["ecs:StopTask"], Resource = ["*"], Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.main.arn } } },
+    # Residual recovery is limited to tasks in this cluster. The cluster condition
+    # remains required because task ARNs alone do not bind DescribeTasks/StopTask.
+    { Effect = "Allow", Action = ["ecs:DescribeTasks"], Resource = ["arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.main.name}/*"], Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.main.arn } } },
+    { Effect = "Allow", Action = ["ecs:StopTask"], Resource = ["arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.main.name}/*"], Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.main.arn } } },
   ] })
 }

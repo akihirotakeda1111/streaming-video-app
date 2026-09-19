@@ -60,12 +60,13 @@ If `frontend_origins` is omitted or null, both S3 and CloudFront CORS use
 include every intended upload/playback origin. It does not automatically add
 localhost or the legacy origin.
 
-The distribution starts legacy deterministic HLS objects at TTL zero because a
-retry can overwrite those keys. An immutable attempt-key policy may be added by
-Task 24. Successful-response cache hits are not expected with these zero TTLs.
+The distribution keeps legacy deterministic HLS objects at TTL zero because a
+retry can overwrite those keys. Attempt-specific objects under
+`/videos/*/jobs/*/hls/attempts/*` use a separate cache policy whose default and
+maximum TTLs are one year, so origin `Cache-Control: public,max-age=31536000,immutable`
+headers are honored. Do not raise mutable-key TTLs to obtain cache-hit coverage.
 The response-headers policy also covers cache hits; verify multiple approved
-origins and an unapproved origin against warmed objects when Task 24 enables
-caching, without increasing mutable-key TTLs just for this test. If OPTIONS
+origins and an unapproved origin against warmed attempt-prefix objects. If OPTIONS
 caching is enabled then, include the preflight headers in the cache key.
 
 403/404 error caching minimum TTL is configured to zero. AWS documents a
@@ -118,8 +119,8 @@ It requires positive media-time advancement and CloudFront manifest/segment
 responses, and checks the original manifest key and ETag using dedicated IAM
 before and after playback. Preserve the emitted
 run directories and `full-suite-*.json`; a missing/failed/unexecuted row is not
-a PASS. Cache-hit headers are deliberately not required while successful TTLs
-remain zero.
+a PASS. Cache-hit headers are deliberately not required for legacy keys while
+those successful TTLs remain zero. Attempt-specific objects may be cached.
 
 Publication is observed by continuous S3 HeadObject and CloudFront polling from
 before upload. The recovery upper bound starts at the last confirmed S3 absence

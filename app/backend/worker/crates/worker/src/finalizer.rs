@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use persistence::{JobOperationOutcome, JobState};
 use serde::Deserialize;
 use storage::{Read, Write};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{watch, Mutex};
 
 use crate::{
     acquisition::AcquiredJob,
@@ -72,7 +72,7 @@ where
         &self,
         job: &AcquiredJob,
         input: &ExecutionInput,
-        mut ownership: watch::Receiver<bool>,
+        ownership: watch::Receiver<bool>,
     ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrationError>> + Send + '_>> {
         let job = job.clone();
         let input = input.clone();
@@ -233,14 +233,27 @@ async fn read_descriptor<S: Read + Write>(
     if descriptor.content_type != content_type || descriptor.size_bytes == 0 {
         return Err(finalizer_error("object descriptor metadata mismatch"));
     }
-    let bytes = store
-        .read(bucket, &descriptor.key)
+    let object = store
+        .read_object(bucket, &descriptor.key)
         .await
         .map_err(storage_error)?;
-    if bytes.len() as u64 != descriptor.size_bytes || bytes.is_empty() {
+    if mime_type(object.content_type.as_deref().unwrap_or("")) != content_type {
+        return Err(finalizer_error("object MIME type mismatch"));
+    }
+    let stored_size = object
+        .content_length
+        .ok_or_else(|| finalizer_error("object size mismatch"))?;
+    if stored_size != descriptor.size_bytes
+        || object.contents.len() as u64 != descriptor.size_bytes
+        || object.contents.is_empty()
+    {
         return Err(finalizer_error("object size mismatch"));
     }
-    Ok(bytes)
+    Ok(object.contents)
+}
+
+fn mime_type(value: &str) -> &str {
+    value.split(';').next().unwrap_or(value).trim()
 }
 
 fn build_master(
@@ -258,4 +271,326 @@ fn build_master(
         ));
     }
     Ok(master)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        acquisition::{AcquiredJob, WorkerIdentity},
+        event::WorkItem,
+        fakes::{Call, CallLog, FakeJobState, FakeStorage},
+        orchestration::canonical_renditions,
+    };
+    use persistence::JobOperationOutcome;
+    use std::time::SystemTime;
+
+    const VIDEO_ID: &str = "018f47a2-45c2-7a84-b84f-5f6dd7b5910a";
+    const JOB_ID: &str = "018f47a2-4699-7892-9fc0-fbe46d3bbd67";
+    const BUCKET: &str = "output";
+    const DEADLINE: &str = "2099-01-01T00:00:00Z";
+    const PLAYLIST: &[u8] = b"#EXTM3U\nsegment-00000.ts\n";
+    const SEGMENT: &[u8] = b"ts-bytes";
+
+    fn job(attempt: u32) -> AcquiredJob {
+        AcquiredJob {
+            item: WorkItem {
+                bucket: "in".into(),
+                key: format!("videos/{VIDEO_ID}/jobs/{JOB_ID}/source.mp4"),
+                video_id: VIDEO_ID.into(),
+                job_id: JOB_ID.into(),
+            },
+            worker_id: WorkerIdentity::from_value("worker").unwrap(),
+            attempt,
+            lease_expires_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn input_for(job: &AcquiredJob) -> ExecutionInput {
+        ExecutionInput::for_job(job, canonical_renditions(), DEADLINE).unwrap()
+    }
+
+    fn child_json(input: &ExecutionInput, rendition: &str, attempt: u32, video_id: &str) -> String {
+        let (width, height) = if rendition == "360p" {
+            (640, 360)
+        } else {
+            (1280, 720)
+        };
+        let prefix = format!("{}/{rendition}", input.output_prefix);
+        serde_json::json!({
+            "video_id": video_id,
+            "job_id": input.job_id,
+            "attempt": attempt,
+            "execution_id": input.execution_id,
+            "rendition": rendition,
+            "source_key": input.source_key,
+            "output_prefix": prefix,
+            "schema_version": 1,
+            "media_playlist": {
+                "key": format!("{prefix}/index.m3u8"),
+                "size_bytes": PLAYLIST.len() as u64,
+                "content_type": PLAYLIST_TYPE,
+            },
+            "segments": [{
+                "key": format!("{prefix}/segment-00000.ts"),
+                "size_bytes": SEGMENT.len() as u64,
+                "content_type": SEGMENT_TYPE,
+            }],
+            "width": width,
+            "height": height,
+            "bandwidth": 800_000,
+            "codecs": "avc1.64001e,mp4a.40.2",
+        })
+        .to_string()
+    }
+
+    fn seed_rendition(
+        storage: &mut FakeStorage,
+        input: &ExecutionInput,
+        rendition: &str,
+        json: &str,
+        playlist_type: &str,
+        segment_type: &str,
+    ) {
+        let prefix = format!("{}/{rendition}", input.output_prefix);
+        storage.add_read(
+            BUCKET,
+            &format!("{prefix}/result.json"),
+            json.as_bytes().to_vec(),
+        );
+        storage.add_read_with_metadata(
+            BUCKET,
+            &format!("{prefix}/index.m3u8"),
+            playlist_type,
+            Some(PLAYLIST.len() as u64),
+            PLAYLIST.to_vec(),
+        );
+        storage.add_read_with_metadata(
+            BUCKET,
+            &format!("{prefix}/segment-00000.ts"),
+            segment_type,
+            Some(SEGMENT.len() as u64),
+            SEGMENT.to_vec(),
+        );
+    }
+
+    fn seed_valid(storage: &mut FakeStorage, input: &ExecutionInput) {
+        for rendition in &input.renditions {
+            let json = child_json(input, rendition, input.attempt, &input.video_id);
+            seed_rendition(
+                storage,
+                input,
+                rendition,
+                &json,
+                PLAYLIST_TYPE,
+                SEGMENT_TYPE,
+            );
+        }
+    }
+
+    async fn run(
+        jobs: FakeJobState,
+        storage: FakeStorage,
+        job: &AcquiredJob,
+        input: &ExecutionInput,
+        lost: bool,
+    ) -> Result<(), OrchestrationError> {
+        let (_, ownership) = watch::channel(lost);
+        DistributedFinalizer::new(
+            Arc::new(Mutex::new(jobs)),
+            Arc::new(Mutex::new(storage)),
+            BUCKET,
+        )
+        .finalize(job, input, ownership)
+        .await
+    }
+
+    fn master_written(log: &CallLog, input: &ExecutionInput) -> bool {
+        let key = format!("{}/index.m3u8", input.output_prefix);
+        log.calls().iter().any(|call| {
+            matches!(
+                call,
+                Call::Write { key: written, content_type, .. }
+                    if written == &key && content_type == PLAYLIST_TYPE
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn publishes_master_then_commits_for_valid_children() {
+        let job = job(1);
+        let input = input_for(&job);
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        seed_valid(&mut storage, &input);
+        let jobs = FakeJobState::new(log.clone());
+        run(jobs, storage, &job, &input, false).await.unwrap();
+        assert!(master_written(&log, &input));
+        assert!(log.calls().iter().any(|call| matches!(
+            call,
+            Call::CompleteDistributed {
+                attempt: 1,
+                published_manifest_key,
+                ..
+            } if published_manifest_key == &format!("{}/index.m3u8", input.output_prefix)
+        )));
+    }
+
+    #[tokio::test]
+    async fn missing_child_result_does_not_publish() {
+        let job = job(1);
+        let input = input_for(&job);
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        let json = child_json(&input, "360p", 1, VIDEO_ID);
+        seed_rendition(
+            &mut storage,
+            &input,
+            "360p",
+            &json,
+            PLAYLIST_TYPE,
+            SEGMENT_TYPE,
+        );
+        let error = run(FakeJobState::new(log.clone()), storage, &job, &input, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OrchestrationError::Finalizer(_)));
+        assert!(!master_written(&log, &input));
+        assert!(!log
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::CompleteDistributed { .. })));
+    }
+
+    #[tokio::test]
+    async fn wrong_child_identity_does_not_publish() {
+        let job = job(1);
+        let input = input_for(&job);
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        for rendition in &input.renditions {
+            let video_id = if rendition == "720p" {
+                "018f47a2-45c2-7a84-b84f-5f6dd7b5910b"
+            } else {
+                VIDEO_ID
+            };
+            let json = child_json(&input, rendition, 1, video_id);
+            seed_rendition(
+                &mut storage,
+                &input,
+                rendition,
+                &json,
+                PLAYLIST_TYPE,
+                SEGMENT_TYPE,
+            );
+        }
+        let error = run(FakeJobState::new(log.clone()), storage, &job, &input, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OrchestrationError::Finalizer(_)));
+        assert!(!master_written(&log, &input));
+    }
+
+    #[tokio::test]
+    async fn wrong_attempt_does_not_publish() {
+        let job = job(1);
+        let input = input_for(&job);
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        for rendition in &input.renditions {
+            let json = child_json(&input, rendition, 2, VIDEO_ID);
+            seed_rendition(
+                &mut storage,
+                &input,
+                rendition,
+                &json,
+                PLAYLIST_TYPE,
+                SEGMENT_TYPE,
+            );
+        }
+        let error = run(FakeJobState::new(log.clone()), storage, &job, &input, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OrchestrationError::Finalizer(_)));
+        assert!(!master_written(&log, &input));
+    }
+
+    #[tokio::test]
+    async fn stored_mime_mismatch_does_not_publish() {
+        let job = job(1);
+        let input = input_for(&job);
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        for rendition in &input.renditions {
+            let json = child_json(&input, rendition, 1, VIDEO_ID);
+            let segment_type = if rendition == "720p" {
+                "application/octet-stream"
+            } else {
+                SEGMENT_TYPE
+            };
+            seed_rendition(
+                &mut storage,
+                &input,
+                rendition,
+                &json,
+                PLAYLIST_TYPE,
+                segment_type,
+            );
+        }
+        let error = run(FakeJobState::new(log.clone()), storage, &job, &input, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OrchestrationError::Finalizer(message) if message.contains("MIME"))
+        );
+        assert!(!master_written(&log, &input));
+    }
+
+    #[tokio::test]
+    async fn ownership_loss_does_not_publish() {
+        let job = job(1);
+        let input = input_for(&job);
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        seed_valid(&mut storage, &input);
+        let error = run(FakeJobState::new(log.clone()), storage, &job, &input, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OrchestrationError::OwnershipLost));
+        assert!(!master_written(&log, &input));
+        assert!(!log
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::CompleteDistributed { .. })));
+    }
+
+    #[tokio::test]
+    async fn completion_not_owner_is_ownership_loss_after_master_put() {
+        let job = job(1);
+        let input = input_for(&job);
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        seed_valid(&mut storage, &input);
+        let mut jobs = FakeJobState::new(log.clone());
+        jobs.complete_distributed_outcome(JobOperationOutcome::NotOwner);
+        let error = run(jobs, storage, &job, &input, false).await.unwrap_err();
+        assert!(matches!(error, OrchestrationError::OwnershipLost));
+        assert!(master_written(&log, &input));
+    }
+
+    #[tokio::test]
+    async fn database_completion_failure_leaves_unpublished_master() {
+        let job = job(1);
+        let input = input_for(&job);
+        let log = CallLog::default();
+        let mut storage = FakeStorage::new(log.clone());
+        seed_valid(&mut storage, &input);
+        let mut jobs = FakeJobState::new(log.clone());
+        jobs.fail_complete_distributed("commit failed");
+        let error = run(jobs, storage, &job, &input, false).await.unwrap_err();
+        assert!(
+            matches!(error, OrchestrationError::Finalizer(message) if message.contains("commit failed"))
+        );
+        assert!(master_written(&log, &input));
+    }
 }

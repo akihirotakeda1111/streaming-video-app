@@ -288,6 +288,41 @@ def _policy_text(config: Configuration, block: Block) -> str:
     return "\n".join(parts)
 
 
+def _linked_policy(config: Configuration, behavior: str, type_name: str, attribute: str) -> Block | None:
+    expression = _normalized_expression(_attribute(behavior, attribute))
+    for policy in config.resources(type_name):
+        if expression == f"{type_name}.{policy.name}.id":
+            return policy
+    return None
+
+
+def _ttl_seconds(body: str, name: str) -> int | None:
+    value = _attribute(body, name)
+    if value is None:
+        return None
+    token = value.split()[0]
+    if not token.isdigit():
+        return None
+    return int(token)
+
+
+def _cache_policy_ttls_are_zero(body: str) -> bool:
+    return all(_ttl_seconds(body, name) == 0 for name in ("min_ttl", "default_ttl", "max_ttl"))
+
+
+def _cache_policy_is_cacheable(body: str) -> bool:
+    default_ttl = _ttl_seconds(body, "default_ttl")
+    max_ttl = _ttl_seconds(body, "max_ttl")
+    min_ttl = _ttl_seconds(body, "min_ttl")
+    return (
+        min_ttl is not None
+        and default_ttl is not None
+        and max_ttl is not None
+        and default_ttl > 0
+        and max_ttl >= default_ttl
+    )
+
+
 def _nested_bodies(text: str, name: str) -> list[str]:
     # Preserve quoted strings while removing comments from structural checks.
     text = re.sub(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*|\#[^\n]*',
@@ -669,8 +704,28 @@ def check_delivery(config: Configuration, checks: Checks, output_name: str | Non
                            f"{block.location}: OPTIONS requires the three CORS preflight headers in linked request/cache policies")
         checks.require(_assignment_is(block.body, "error_code", "403") and _assignment_is(block.body, "error_code", "404") and len(re.findall(r"\berror_caching_min_ttl\s*=\s*0\b", block.body)) >= 2, f"{block.location}: 403/404 error caching must use the service minimum")
 
-    for block in cache_policies:
-        checks.require(_attribute(block.body, "default_ttl") == "0" and _attribute(block.body, "min_ttl") == "0" and _attribute(block.body, "max_ttl") == "0", f"{block.location}: legacy HLS cache TTLs must start at zero")
+        for behavior in _nested_bodies(block.body, "default_cache_behavior"):
+            policy = _linked_policy(config, behavior, "aws_cloudfront_cache_policy", "cache_policy_id")
+            checks.require(
+                policy is not None and _cache_policy_ttls_are_zero(policy.body),
+                f"{block.location}: legacy HLS cache TTLs must start at zero",
+            )
+
+        attempt_behaviors = [
+            behavior
+            for behavior in _nested_bodies(block.body, "ordered_cache_behavior")
+            if "hls/attempts" in behavior
+        ]
+        checks.require(
+            bool(attempt_behaviors),
+            f"{block.location}: attempt-specific HLS paths must have a cacheable behavior",
+        )
+        for behavior in attempt_behaviors:
+            policy = _linked_policy(config, behavior, "aws_cloudfront_cache_policy", "cache_policy_id")
+            checks.require(
+                policy is not None and _cache_policy_is_cacheable(policy.body),
+                f"{block.location}: attempt-specific HLS cache TTLs must be cacheable",
+            )
 
     for block in response_policies:
         checks.require(_has(block.body, "access_control_allow_origins") and _has(block.body, "local.frontend_origins"), f"{block.location}: CloudFront CORS must use approved frontend origins")
@@ -1461,6 +1516,33 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
         ":execution:${aws_sfn_state_machine.orchestration.name}:" in text,
         "DescribeExecution and StopExecution must target execution ARNs",
     )
+
+    worker_residual = [
+        block
+        for block in config.resources("aws_iam_role_policy")
+        if block.name == "worker_orchestration"
+    ]
+    checks.require(bool(worker_residual), "worker orchestration policy must grant residual ECS recovery")
+    for block in worker_residual:
+        policy = _policy_text(config, block)
+        for action in ("ecs:DescribeTasks", "ecs:StopTask"):
+            checks.require(action.lower() in policy.lower(), f"worker residual recovery must allow {action}")
+        for statement in _iam_statement_bodies(policy):
+            actions = _policy_actions(statement)
+            if not actions & {"ecs:describetasks", "ecs:stoptask"}:
+                continue
+            checks.reject(
+                _has_wildcard_resource(statement),
+                f"{block.location}: worker residual ECS actions must not use Resource *",
+            )
+            checks.require(
+                "task/${aws_ecs_cluster.main.name}/*" in statement,
+                f"{block.location}: worker residual ECS actions must target cluster-scoped task ARNs",
+            )
+            checks.require(
+                "ecs:cluster" in statement and "aws_ecs_cluster.main.arn" in statement,
+                f"{block.location}: worker residual ECS actions must keep the worker cluster condition",
+            )
 
 def validate(config: Configuration, stage: str, shared_config: Configuration | None = None) -> list[str]:
     checks = Checks()

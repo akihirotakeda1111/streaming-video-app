@@ -4,6 +4,14 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectError(pub String);
 
+/// Bytes plus the GetObject metadata used to verify descriptors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectRead {
+    pub contents: Vec<u8>,
+    pub content_type: Option<String>,
+    pub content_length: Option<u64>,
+}
+
 pub trait Read {
     fn read_bounded(
         &mut self,
@@ -25,6 +33,22 @@ pub trait Read {
         bucket: &str,
         key: &str,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, ObjectError>> + Send;
+
+    fn read_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+    ) -> impl std::future::Future<Output = Result<ObjectRead, ObjectError>> + Send {
+        let read = self.read(bucket, key);
+        async move {
+            let contents = read.await?;
+            Ok(ObjectRead {
+                content_length: Some(contents.len() as u64),
+                content_type: None,
+                contents,
+            })
+        }
+    }
 }
 
 pub trait Write {

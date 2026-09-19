@@ -1,10 +1,15 @@
 //! Amazon S3 adapter using configured input and output buckets.
 
-use aws_sdk_s3::{Client, primitives::ByteStream};
+use aws_sdk_s3::{primitives::ByteStream, Client};
 
-use crate::{ObjectError, Read, Write};
+use crate::{ObjectError, ObjectRead, Read, Write};
 
 trait S3Api {
+    fn get(
+        &mut self,
+        bucket: &str,
+        key: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
     fn get_bounded(
         &mut self,
         bucket: &str,
@@ -20,11 +25,22 @@ trait S3Api {
             Ok(bytes)
         }
     }
-    fn get(
+    fn get_object(
         &mut self,
         bucket: &str,
         key: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
+        maximum: u64,
+    ) -> impl std::future::Future<Output = Result<ObjectRead, String>> + Send {
+        let read = self.get_bounded(bucket, key, maximum);
+        async move {
+            let contents = read.await?;
+            Ok(ObjectRead {
+                content_length: Some(contents.len() as u64),
+                content_type: None,
+                contents,
+            })
+        }
+    }
     fn put(
         &mut self,
         bucket: &str,
@@ -66,30 +82,15 @@ impl S3Api for AwsS3Api {
         key: &str,
         maximum: u64,
     ) -> Result<Vec<u8>, String> {
-        let response = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        if response
-            .content_length()
-            .is_some_and(|length| length < 0 || length as u64 > maximum)
-        {
-            return Err("source size exceeds limit".into());
-        }
-        let mut stream = response.body;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| "source download failed")?;
-            if bytes.len() as u64 + chunk.len() as u64 > maximum {
-                return Err("source size exceeds limit".into());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+        Ok(self.fetch(bucket, key, maximum).await?.contents)
+    }
+    async fn get_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        maximum: u64,
+    ) -> Result<ObjectRead, String> {
+        self.fetch(bucket, key, maximum).await
     }
     async fn put(
         &mut self,
@@ -129,6 +130,48 @@ impl S3Api for AwsS3Api {
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+}
+
+impl AwsS3Api {
+    async fn fetch(&mut self, bucket: &str, key: &str, maximum: u64) -> Result<ObjectRead, String> {
+        let response = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let content_type = response
+            .content_type()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let content_length = response.content_length().and_then(|length| {
+            if length < 0 {
+                None
+            } else {
+                Some(length as u64)
+            }
+        });
+        if content_length.is_some_and(|length| length > maximum) {
+            return Err("source size exceeds limit".into());
+        }
+        let mut stream = response.body;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| "source download failed")?;
+            if bytes.len() as u64 + chunk.len() as u64 > maximum {
+                return Err("source size exceeds limit".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(ObjectRead {
+            contents: bytes,
+            content_type,
+            content_length,
+        })
     }
 }
 
@@ -180,6 +223,17 @@ impl<A: S3Api + Send> Read for S3Storage<A> {
             ));
         }
         self.api.get(bucket, key).await.map_err(ObjectError)
+    }
+    async fn read_object(&mut self, bucket: &str, key: &str) -> Result<ObjectRead, ObjectError> {
+        if bucket != self.input_bucket && bucket != self.output_bucket {
+            return Err(ObjectError(
+                "read bucket is not the configured input bucket".into(),
+            ));
+        }
+        self.api
+            .get_object(bucket, key, 64 * 1024 * 1024)
+            .await
+            .map_err(ObjectError)
     }
 }
 impl<A: S3Api + Send> Write for S3Storage<A> {
@@ -329,12 +383,10 @@ mod tests {
             .await
             .unwrap();
         assert!(storage.read("other", "source").await.is_err());
-        assert!(
-            storage
-                .write("input", "manifest", "application/vnd.apple.mpegurl", b"hls")
-                .await
-                .is_err()
-        );
+        assert!(storage
+            .write("input", "manifest", "application/vnd.apple.mpegurl", b"hls")
+            .await
+            .is_err());
         assert_eq!(storage.api.calls.len(), 2);
         assert_eq!(storage.api.calls[1].0, "application/vnd.apple.mpegurl");
     }
@@ -362,11 +414,43 @@ async fn actual_s3_stream_rejects_oversize_without_content_length() {
     let mut api = AwsS3Api {
         client: Client::from_conf(config),
     };
-    assert!(
-        api.get_bounded("input", "key", 5)
+    assert!(api
+        .get_bounded("input", "key", 5)
+        .await
+        .unwrap_err()
+        .contains("size exceeds"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn get_object_returns_content_type_and_length() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd")
             .await
-            .unwrap_err()
-            .contains("size exceeds")
-    );
+            .unwrap();
+    });
+    let config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "test", "test", None, None, "test",
+        ))
+        .endpoint_url(format!("http://{address}"))
+        .force_path_style(true)
+        .build();
+    let mut api = AwsS3Api {
+        client: Client::from_conf(config),
+    };
+    let object = api.get_object("input", "key", 64).await.unwrap();
+    assert_eq!(object.contents, b"abcd");
+    assert_eq!(object.content_type.as_deref(), Some("video/mp2t"));
+    assert_eq!(object.content_length, Some(4));
     server.await.unwrap();
 }
