@@ -23,6 +23,7 @@ pub const ALLOWED_RENDITIONS: [&str; 2] = ["360p", "720p"];
 pub const MAX_ACTIVE_CHILD_ENCODERS: usize = ALLOWED_RENDITIONS.len();
 
 const START_RECOVERY_ATTEMPTS: usize = 3;
+const NOT_FOUND_CONFIRMATIONS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionInput {
@@ -564,7 +565,10 @@ where
             let mut pending = false;
             for attempt in 1..job.attempt {
                 let name = execution_name(&job.item.job_id, attempt);
-                match self.observe_prior_execution(&name, deadline).await {
+                match self
+                    .observe_prior_execution(&name, deadline, ownership, shutdown)
+                    .await
+                {
                     Ok(PriorObservation::Residual(count)) => {
                         residual = residual.saturating_add(count);
                     }
@@ -590,35 +594,65 @@ where
         &self,
         name: &str,
         deadline: Instant,
+        ownership: &mut watch::Receiver<bool>,
+        shutdown: &mut watch::Receiver<bool>,
     ) -> Result<PriorObservation, OrchestrationError> {
-        let inspection = match until_deadline(deadline, self.client.inspect(name)).await {
-            Ok(result) => result,
-            Err(_) => return Err(OrchestrationError::TimedOut),
-        };
-        match inspection {
-            Ok(ExecutionInspection::NotFound) => Ok(PriorObservation::Residual(0)),
-            Ok(ExecutionInspection::Found { status, .. }) => match status {
-                ExecutionStatus::Running => {
-                    self.client.cancel(name).await;
-                    Ok(PriorObservation::Pending)
-                }
-                ExecutionStatus::Succeeded
-                | ExecutionStatus::Failed
-                | ExecutionStatus::TimedOut => {
-                    match until_deadline(deadline, self.client.residual_running_children(name))
-                        .await
-                    {
-                        Ok(Ok(count)) => Ok(PriorObservation::Residual(count)),
-                        Ok(Err(error)) if describe_is_retryable(&error) => {
-                            Ok(PriorObservation::Pending)
-                        }
-                        Ok(Err(error)) => Err(error),
-                        Err(_) => Err(OrchestrationError::TimedOut),
+        let mut delay = self.poll_interval.max(Duration::from_millis(1));
+        let mut not_found = 0usize;
+        loop {
+            if lost(ownership, shutdown) {
+                return Err(OrchestrationError::OwnershipLost);
+            }
+            if Instant::now() >= deadline {
+                return Err(OrchestrationError::TimedOut);
+            }
+            let inspection = match until_deadline(deadline, self.client.inspect(name)).await {
+                Ok(result) => result,
+                Err(_) => return Err(OrchestrationError::TimedOut),
+            };
+            match inspection {
+                Ok(ExecutionInspection::NotFound) => {
+                    not_found += 1;
+                    if not_found >= NOT_FOUND_CONFIRMATIONS {
+                        return Ok(PriorObservation::Residual(0));
                     }
+                    wait_or_signal(delay, deadline, ownership, shutdown).await?;
+                    delay = (delay * 2).min(MAX_POLL_INTERVAL);
                 }
-            },
-            Err(error) if describe_is_retryable(&error) => Ok(PriorObservation::Pending),
-            Err(error) => Err(error),
+                Ok(ExecutionInspection::Found { status, .. }) => {
+                    return self
+                        .observe_found_prior_execution(name, status, deadline)
+                        .await;
+                }
+                Err(error) if describe_is_retryable(&error) => {
+                    return Ok(PriorObservation::Pending);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn observe_found_prior_execution(
+        &self,
+        name: &str,
+        status: ExecutionStatus,
+        deadline: Instant,
+    ) -> Result<PriorObservation, OrchestrationError> {
+        match status {
+            ExecutionStatus::Running => {
+                self.client.cancel(name).await;
+                Ok(PriorObservation::Pending)
+            }
+            ExecutionStatus::Succeeded | ExecutionStatus::Failed | ExecutionStatus::TimedOut => {
+                match until_deadline(deadline, self.client.residual_running_children(name)).await {
+                    Ok(Ok(count)) => Ok(PriorObservation::Residual(count)),
+                    Ok(Err(error)) if describe_is_retryable(&error) => {
+                        Ok(PriorObservation::Pending)
+                    }
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(OrchestrationError::TimedOut),
+                }
+            }
         }
     }
 
@@ -1450,6 +1484,58 @@ mod tests {
             OrchestrationError::Describe("residual children unavailable".into()),
         );
         client.set_residual_running(&second, 0);
+        let starts = client.starts.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer: FakeFinalizer::new(Ok(())),
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, _shutdown_stop, shutdown) = channels();
+        let deadline = Instant::now() + Duration::from_millis(8);
+        assert_eq!(
+            bridge
+                .run(&job, &input, ownership, shutdown, deadline)
+                .await,
+            Err(OrchestrationError::Describe(
+                "previous execution bound not established".into()
+            ))
+        );
+        assert!(starts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_not_found_previous_execution_allows_start() {
+        let job = job_with(2);
+        let input = input_for(&job);
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        let starts = client.starts.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer: FakeFinalizer::new(Ok(())),
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, _shutdown_stop, shutdown) = channels();
+        bridge
+            .run(&job, &input, ownership, shutdown, far_deadline())
+            .await
+            .unwrap();
+        assert_eq!(starts.lock().unwrap()[0].0, execution_name(JOB_ID, 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn not_found_then_found_previous_execution_still_inspects_residual_children() {
+        let job = job_with(2);
+        let input = input_for(&job);
+        let previous = execution_name(JOB_ID, 1);
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        client.queue_inspection(Ok(ExecutionInspection::NotFound));
+        client.queue_inspection(Ok(ExecutionInspection::NotFound));
+        client.seed_execution_with_status(
+            &previous,
+            input_for(&job_with(1)),
+            ExecutionStatus::Failed,
+        );
+        client.set_residual_running(&previous, 1);
         let starts = client.starts.clone();
         let bridge = OrchestrationBridge {
             client,

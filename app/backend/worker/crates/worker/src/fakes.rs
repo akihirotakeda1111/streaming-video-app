@@ -402,6 +402,10 @@ impl FakeExecutionClient {
             .insert(name.to_owned(), error);
     }
 
+    pub fn queue_inspection(&self, result: Result<ExecutionInspection, OrchestrationError>) {
+        self.inspections.lock().unwrap().push_back(result);
+    }
+
     pub fn fail_start(&self, error: OrchestrationError) {
         self.start_results.lock().unwrap().push_back(Err(error));
     }
