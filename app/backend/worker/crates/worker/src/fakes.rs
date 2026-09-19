@@ -360,6 +360,8 @@ pub struct FakeExecutionClient {
     pub cancellations: Arc<Mutex<Vec<String>>>,
     cancel_stops: Arc<Mutex<bool>>,
     status_fallback: Arc<Mutex<Option<Result<ExecutionStatus, OrchestrationError>>>>,
+    residual_running: Arc<Mutex<HashMap<String, usize>>>,
+    residual_errors: Arc<Mutex<HashMap<String, OrchestrationError>>>,
 }
 
 impl FakeExecutionClient {
@@ -373,6 +375,8 @@ impl FakeExecutionClient {
             cancellations: Arc::new(Mutex::new(Vec::new())),
             cancel_stops: Arc::new(Mutex::new(true)),
             status_fallback: Arc::new(Mutex::new(None)),
+            residual_running: Arc::new(Mutex::new(HashMap::new())),
+            residual_errors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -382,6 +386,20 @@ impl FakeExecutionClient {
 
     pub fn keep_failing_status(&self, error: OrchestrationError) {
         *self.status_fallback.lock().unwrap() = Some(Err(error));
+    }
+
+    pub fn set_residual_running(&self, name: &str, count: usize) {
+        self.residual_running
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), count);
+    }
+
+    pub fn fail_residual_inspection(&self, name: &str, error: OrchestrationError) {
+        self.residual_errors
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), error);
     }
 
     pub fn fail_start(&self, error: OrchestrationError) {
@@ -482,6 +500,25 @@ impl ExecutionClient for FakeExecutionClient {
                     *status = ExecutionStatus::Failed;
                 }
             }
+        })
+    }
+
+    fn residual_running_children(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, OrchestrationError>> + Send + '_>> {
+        let name = name.to_owned();
+        Box::pin(async move {
+            if let Some(error) = self.residual_errors.lock().unwrap().get(&name).cloned() {
+                return Err(error);
+            }
+            Ok(self
+                .residual_running
+                .lock()
+                .unwrap()
+                .get(&name)
+                .copied()
+                .unwrap_or(0))
         })
     }
 }

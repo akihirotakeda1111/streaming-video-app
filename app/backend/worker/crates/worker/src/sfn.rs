@@ -4,6 +4,7 @@ use std::{future::Future, pin::Pin};
 
 use aws_sdk_sfn::{
     Client, error::ProvideErrorMetadata, types::ExecutionStatus as AwsExecutionStatus,
+    types::HistoryEventType,
 };
 
 use crate::orchestration::{
@@ -36,6 +37,10 @@ trait StepFunctionsApi: Send + Sync {
         execution_arn: &str,
     ) -> Pin<Box<dyn Future<Output = Result<DescribedExecution, SfnApiError>> + Send + '_>>;
     fn stop_execution(&self, execution_arn: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    fn running_child_count(
+        &self,
+        execution_arn: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, SfnApiError>> + Send + '_>>;
 }
 
 #[derive(Clone)]
@@ -95,6 +100,38 @@ impl StepFunctionsApi for AwsSfnApi {
                 .execution_arn(execution_arn)
                 .send()
                 .await;
+        })
+    }
+
+    fn running_child_count(
+        &self,
+        execution_arn: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, SfnApiError>> + Send + '_>> {
+        let execution_arn = execution_arn.to_owned();
+        Box::pin(async move {
+            let mut next_token = None;
+            let mut started = 0usize;
+            let mut confirmed_stopped = 0usize;
+            loop {
+                let mut request = self
+                    .client
+                    .get_execution_history()
+                    .execution_arn(&execution_arn)
+                    .include_execution_data(false)
+                    .max_results(1000);
+                if let Some(token) = &next_token {
+                    request = request.next_token(token);
+                }
+                let response = request.send().await.map_err(map_sdk_error)?;
+                for event in response.events() {
+                    account_task_event(event.r#type(), &mut started, &mut confirmed_stopped);
+                }
+                next_token = response.next_token().map(str::to_owned);
+                if next_token.is_none() {
+                    break;
+                }
+            }
+            Ok(started.saturating_sub(confirmed_stopped))
         })
     }
 }
@@ -198,6 +235,50 @@ impl<A: StepFunctionsApi> ExecutionClient for SfnExecutionClient<A> {
             }
         })
     }
+
+    fn residual_running_children(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, OrchestrationError>> + Send + '_>> {
+        let name = name.to_owned();
+        Box::pin(async move {
+            let execution_arn = execution_arn(&self.state_machine_arn, &name)?;
+            match self.api.running_child_count(&execution_arn).await {
+                Ok(count) => Ok(count),
+                Err(SfnApiError::NotFound) => Ok(0),
+                Err(SfnApiError::Permission) => Err(OrchestrationError::Permission),
+                Err(_) => Err(OrchestrationError::Describe(
+                    "residual children could not be inspected".into(),
+                )),
+            }
+        })
+    }
+}
+
+fn account_task_event(
+    event_type: &HistoryEventType,
+    started: &mut usize,
+    confirmed_stopped: &mut usize,
+) {
+    match event_type {
+        HistoryEventType::TaskStarted => *started += 1,
+        HistoryEventType::TaskSucceeded | HistoryEventType::TaskFailed => {
+            *confirmed_stopped += 1;
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+fn residual_running_from_task_events<'a>(
+    types: impl IntoIterator<Item = &'a HistoryEventType>,
+) -> usize {
+    let mut started = 0usize;
+    let mut confirmed_stopped = 0usize;
+    for event_type in types {
+        account_task_event(event_type, &mut started, &mut confirmed_stopped);
+    }
+    started.saturating_sub(confirmed_stopped)
 }
 
 fn execution_arn(state_machine_arn: &str, name: &str) -> Result<String, OrchestrationError> {
@@ -253,6 +334,7 @@ mod tests {
         start_results: Arc<Mutex<VecDeque<Result<(), SfnApiError>>>>,
         descriptions: Arc<Mutex<HashMap<String, Result<DescribedExecution, SfnApiError>>>>,
         stops: Arc<Mutex<Vec<String>>>,
+        running_children: Arc<Mutex<HashMap<String, Result<usize, SfnApiError>>>>,
     }
 
     impl StepFunctionsApi for FakeSfnApi {
@@ -301,6 +383,21 @@ mod tests {
             let execution_arn = execution_arn.to_owned();
             Box::pin(async move {
                 self.stops.lock().unwrap().push(execution_arn);
+            })
+        }
+
+        fn running_child_count(
+            &self,
+            execution_arn: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<usize, SfnApiError>> + Send + '_>> {
+            let execution_arn = execution_arn.to_owned();
+            Box::pin(async move {
+                self.running_children
+                    .lock()
+                    .unwrap()
+                    .get(&execution_arn)
+                    .cloned()
+                    .unwrap_or(Ok(0))
             })
         }
     }
@@ -388,6 +485,42 @@ mod tests {
         assert_eq!(
             stops.lock().unwrap().as_slice(),
             ["arn:aws:states:ap-northeast-1:123:execution:orchestration:job-x-a1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn residual_children_are_counted_from_the_execution_history() {
+        let api = FakeSfnApi::default();
+        let arn = "arn:aws:states:ap-northeast-1:123:execution:orchestration:job-x-a1";
+        api.running_children
+            .lock()
+            .unwrap()
+            .insert(arn.to_owned(), Ok(2));
+        let client = client(api);
+        assert_eq!(
+            client.residual_running_children("job-x-a1").await.unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn timed_out_tasks_are_residual_until_succeeded_or_failed() {
+        assert_eq!(
+            residual_running_from_task_events([
+                &HistoryEventType::TaskStarted,
+                &HistoryEventType::TaskSucceeded,
+                &HistoryEventType::TaskStarted,
+                &HistoryEventType::TaskFailed,
+            ]),
+            0
+        );
+        assert_eq!(
+            residual_running_from_task_events([
+                &HistoryEventType::TaskStarted,
+                &HistoryEventType::TaskTimedOut,
+                &HistoryEventType::TaskStarted,
+            ]),
+            2
         );
     }
 

@@ -18,6 +18,9 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub const SQS_VISIBILITY_LIFETIME: Duration = Duration::from_secs(43_200);
 pub const ALLOWED_RENDITIONS: [&str; 2] = ["360p", "720p"];
+/// Per-parent encoder cap: one child per allowed rendition. Residual children
+/// from a failed previous execution count against the same bound.
+pub const MAX_ACTIVE_CHILD_ENCODERS: usize = ALLOWED_RENDITIONS.len();
 
 const START_RECOVERY_ATTEMPTS: usize = 3;
 
@@ -170,6 +173,12 @@ fn parse_deadline(value: &str) -> Result<DateTime<Utc>, OrchestrationError> {
         .map_err(|_| OrchestrationError::Start("invalid deadline_at".into()))
 }
 
+/// A new attempt may start only when residual running children plus the children
+/// it would launch still fit the per-parent encoder cap.
+pub fn child_bound_holds(residual_running: usize, planned_children: usize) -> bool {
+    residual_running.saturating_add(planned_children) <= MAX_ACTIVE_CHILD_ENCODERS
+}
+
 fn input_matches(expected: &ExecutionInput, json: &str) -> bool {
     let Ok(actual) = serde_json::from_str::<serde_json::Value>(json) else {
         return false;
@@ -242,6 +251,10 @@ pub trait ExecutionClient: Send + Sync {
         name: &str,
     ) -> Pin<Box<dyn Future<Output = Result<ExecutionInspection, OrchestrationError>> + Send + '_>>;
     fn cancel(&self, name: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    fn residual_running_children(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, OrchestrationError>> + Send + '_>>;
 }
 
 impl<T: ExecutionClient + ?Sized> ExecutionClient for Arc<T> {
@@ -271,6 +284,13 @@ impl<T: ExecutionClient + ?Sized> ExecutionClient for Arc<T> {
 
     fn cancel(&self, name: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         (**self).cancel(name)
+    }
+
+    fn residual_running_children(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, OrchestrationError>> + Send + '_>> {
+        (**self).residual_running_children(name)
     }
 }
 
@@ -360,6 +380,17 @@ impl ExecutionClient for UnavailableExecutionClient {
     fn cancel(&self, _: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
+
+    fn residual_running_children(
+        &self,
+        _: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, OrchestrationError>> + Send + '_>> {
+        Box::pin(async {
+            Err(OrchestrationError::Describe(
+                "execution client is not configured".into(),
+            ))
+        })
+    }
 }
 
 pub struct OrchestrationBridge<C, F> {
@@ -390,8 +421,14 @@ where
         if Instant::now() >= deadline {
             return Err(OrchestrationError::TimedOut);
         }
-        self.establish_previous_bound(job, &mut ownership, &mut shutdown, deadline)
-            .await?;
+        self.establish_previous_bound(
+            job,
+            input.renditions.len(),
+            &mut ownership,
+            &mut shutdown,
+            deadline,
+        )
+        .await?;
         self.start_or_attach(&name, input, &mut ownership, &mut shutdown, deadline)
             .await?;
         let mut delay = self.poll_interval.max(Duration::from_millis(1));
@@ -506,6 +543,7 @@ where
     async fn establish_previous_bound(
         &self,
         job: &AcquiredJob,
+        planned_children: usize,
         ownership: &mut watch::Receiver<bool>,
         shutdown: &mut watch::Receiver<bool>,
         deadline: Instant,
@@ -530,38 +568,69 @@ where
             match inspection {
                 Ok(ExecutionInspection::NotFound) => return Ok(()),
                 Ok(ExecutionInspection::Found { status, .. }) => match status {
-                    ExecutionStatus::Failed
-                    | ExecutionStatus::TimedOut
-                    | ExecutionStatus::Succeeded => return Ok(()),
+                    ExecutionStatus::Succeeded => return Ok(()),
+                    ExecutionStatus::Failed | ExecutionStatus::TimedOut => {
+                        match until_deadline(
+                            deadline,
+                            self.client.residual_running_children(&previous),
+                        )
+                        .await
+                        {
+                            Ok(Ok(residual)) if child_bound_holds(residual, planned_children) => {
+                                return Ok(());
+                            }
+                            Ok(Ok(_)) => {
+                                self.wait_for_previous_bound(
+                                    &previous, &mut delay, ownership, shutdown, deadline,
+                                )
+                                .await?;
+                            }
+                            Ok(Err(error)) if describe_is_retryable(&error) => {
+                                self.wait_for_previous_bound(
+                                    &previous, &mut delay, ownership, shutdown, deadline,
+                                )
+                                .await?;
+                            }
+                            Ok(Err(error)) => return Err(error),
+                            Err(_) => return Err(self.fail_previous_bound(&previous).await),
+                        }
+                    }
                     ExecutionStatus::Running => {
                         self.client.cancel(&previous).await;
-                        match wait_or_signal(delay, deadline, ownership, shutdown).await {
-                            Ok(()) => {}
-                            Err(OrchestrationError::TimedOut) => {
-                                return Err(self.fail_previous_bound(&previous).await);
-                            }
-                            Err(error) => {
-                                self.client.cancel(&previous).await;
-                                return Err(error);
-                            }
-                        }
-                        delay = (delay * 2).min(MAX_POLL_INTERVAL);
+                        self.wait_for_previous_bound(
+                            &previous, &mut delay, ownership, shutdown, deadline,
+                        )
+                        .await?;
                     }
                 },
                 Err(error) if describe_is_retryable(&error) => {
-                    match wait_or_signal(delay, deadline, ownership, shutdown).await {
-                        Ok(()) => {}
-                        Err(OrchestrationError::TimedOut) => {
-                            return Err(self.fail_previous_bound(&previous).await);
-                        }
-                        Err(wait_error) => {
-                            self.client.cancel(&previous).await;
-                            return Err(wait_error);
-                        }
-                    }
-                    delay = (delay * 2).min(MAX_POLL_INTERVAL);
+                    self.wait_for_previous_bound(
+                        &previous, &mut delay, ownership, shutdown, deadline,
+                    )
+                    .await?;
                 }
                 Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn wait_for_previous_bound(
+        &self,
+        previous: &str,
+        delay: &mut Duration,
+        ownership: &mut watch::Receiver<bool>,
+        shutdown: &mut watch::Receiver<bool>,
+        deadline: Instant,
+    ) -> Result<(), OrchestrationError> {
+        match wait_or_signal(*delay, deadline, ownership, shutdown).await {
+            Ok(()) => {
+                *delay = (*delay * 2).min(MAX_POLL_INTERVAL);
+                Ok(())
+            }
+            Err(OrchestrationError::TimedOut) => Err(self.fail_previous_bound(previous).await),
+            Err(error) => {
+                self.client.cancel(previous).await;
+                Err(error)
             }
         }
     }
@@ -1163,5 +1232,114 @@ mod tests {
                 .iter()
                 .all(|name| name == &previous)
         );
+    }
+
+    #[test]
+    fn residual_children_plus_new_attempt_must_fit_encoder_cap() {
+        assert!(child_bound_holds(0, 2));
+        assert!(child_bound_holds(0, 1));
+        assert!(child_bound_holds(1, 1));
+        assert!(!child_bound_holds(1, 2));
+        assert!(!child_bound_holds(2, 2));
+        assert!(!child_bound_holds(2, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_previous_execution_with_residual_children_does_not_start() {
+        assert_previous_terminal_with_residual_does_not_start(ExecutionStatus::Failed).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_previous_execution_with_residual_children_does_not_start() {
+        assert_previous_terminal_with_residual_does_not_start(ExecutionStatus::TimedOut).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_previous_execution_without_residual_children_starts() {
+        let job = job_with(2);
+        let input = input_for(&job);
+        let previous = execution_name(JOB_ID, 1);
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        client.seed_execution_with_status(
+            &previous,
+            input_for(&job_with(1)),
+            ExecutionStatus::Failed,
+        );
+        client.set_residual_running(&previous, 0);
+        let starts = client.starts.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer: FakeFinalizer::new(Ok(())),
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, _shutdown_stop, shutdown) = channels();
+        bridge
+            .run(&job, &input, ownership, shutdown, far_deadline())
+            .await
+            .unwrap();
+        assert_eq!(starts.lock().unwrap()[0].0, execution_name(JOB_ID, 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_previous_execution_without_residual_inspection_does_not_start() {
+        let job = job_with(2);
+        let input = input_for(&job);
+        let previous = execution_name(JOB_ID, 1);
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        client.seed_execution_with_status(
+            &previous,
+            input_for(&job_with(1)),
+            ExecutionStatus::Failed,
+        );
+        client.fail_residual_inspection(
+            &previous,
+            OrchestrationError::Describe("residual children unavailable".into()),
+        );
+        let starts = client.starts.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer: FakeFinalizer::new(Ok(())),
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, _shutdown_stop, shutdown) = channels();
+        let deadline = Instant::now() + Duration::from_millis(8);
+        assert_eq!(
+            bridge
+                .run(&job, &input, ownership, shutdown, deadline)
+                .await,
+            Err(OrchestrationError::Describe(
+                "previous execution bound not established".into()
+            ))
+        );
+        assert!(starts.lock().unwrap().is_empty());
+    }
+
+    async fn assert_previous_terminal_with_residual_does_not_start(status: ExecutionStatus) {
+        let job = job_with(2);
+        let input = input_for(&job);
+        let previous = execution_name(JOB_ID, 1);
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        client.seed_execution_with_status(&previous, input_for(&job_with(1)), status);
+        client.set_residual_running(&previous, 1);
+        let starts = client.starts.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer,
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, _shutdown_stop, shutdown) = channels();
+        let deadline = Instant::now() + Duration::from_millis(8);
+        assert_eq!(
+            bridge
+                .run(&job, &input, ownership, shutdown, deadline)
+                .await,
+            Err(OrchestrationError::Describe(
+                "previous execution bound not established".into()
+            ))
+        );
+        assert!(starts.lock().unwrap().is_empty());
+        assert_eq!(*calls.lock().unwrap(), 0);
     }
 }
