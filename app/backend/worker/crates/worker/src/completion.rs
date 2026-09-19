@@ -32,6 +32,7 @@ pub struct MessageCompletionProcessor<J, S, E, Q> {
     acquisition: LeaseAcquisitionProcessor<J>,
     processing: OwnedAttemptProcessor<J, S, E>,
     heartbeat_jobs: Arc<Mutex<J>>,
+    publication_storage: Arc<Mutex<S>>,
     queue: Arc<Mutex<Q>>,
     heartbeat: HeartbeatSettings,
     lease_seconds: u64,
@@ -52,6 +53,7 @@ impl<J, S, E, Q> Clone for MessageCompletionProcessor<J, S, E, Q> {
             acquisition: self.acquisition.clone(),
             processing: self.processing.clone(),
             heartbeat_jobs: self.heartbeat_jobs.clone(),
+            publication_storage: self.publication_storage.clone(),
             queue: self.queue.clone(),
             heartbeat: self.heartbeat,
             lease_seconds: self.lease_seconds,
@@ -80,6 +82,7 @@ impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q> {
     ) -> Result<Self, crate::retry::RetrySettingsError> {
         let jobs = Arc::new(Mutex::new(jobs));
         let storage = Arc::new(Mutex::new(storage));
+        let publication_storage = storage.clone();
         let executor = Arc::new(Mutex::new(executor));
         let queue = Arc::new(Mutex::new(queue));
         let input_bucket = input_bucket.into();
@@ -104,6 +107,7 @@ impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q> {
                 settings,
             ),
             heartbeat_jobs: jobs,
+            publication_storage,
             queue,
             heartbeat,
             lease_seconds,
@@ -127,6 +131,27 @@ impl<J, S, E, Q> MessageCompletionProcessor<J, S, E, Q> {
     ) -> Self {
         self.orchestration.client = Arc::new(client);
         self.orchestration.finalizer = Arc::new(finalizer);
+        self
+    }
+
+    pub fn with_sfn_orchestration(
+        mut self,
+        client: impl ExecutionClient + 'static,
+        output_bucket: impl Into<String>,
+    ) -> Self
+    where
+        J: JobState + Send + 'static,
+        S: Read + Write + Send + 'static,
+    {
+        self.acquisition = self
+            .acquisition
+            .with_mode(persistence::JobMode::Distributed);
+        self.orchestration.client = Arc::new(client);
+        self.orchestration.finalizer = Arc::new(crate::finalizer::DistributedFinalizer::new(
+            self.heartbeat_jobs.clone(),
+            self.publication_storage.clone(),
+            output_bucket,
+        ));
         self
     }
 

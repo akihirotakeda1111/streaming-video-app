@@ -35,6 +35,18 @@ pub trait Write {
         content_type: &str,
         contents: &[u8],
     ) -> impl std::future::Future<Output = Result<(), ObjectError>> + Send;
+
+    fn write_with_cache_control(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        cache_control: &str,
+        contents: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), ObjectError>> + Send {
+        let _ = cache_control;
+        self.write(bucket, key, content_type, contents)
+    }
 }
 
 pub mod s3;

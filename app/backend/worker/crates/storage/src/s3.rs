@@ -32,6 +32,17 @@ trait S3Api {
         content_type: &str,
         contents: &[u8],
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    fn put_with_cache_control(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        cache_control: &str,
+        contents: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let _ = cache_control;
+        self.put(bucket, key, content_type, contents)
+    }
 }
 
 pub struct AwsS3Api {
@@ -99,6 +110,26 @@ impl S3Api for AwsS3Api {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+    async fn put_with_cache_control(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        cache_control: &str,
+        contents: &[u8],
+    ) -> Result<(), String> {
+        self.client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .content_type(content_type)
+            .cache_control(cache_control)
+            .body(ByteStream::from(contents.to_vec()))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 pub struct S3Storage<A = AwsS3Api> {
@@ -132,7 +163,7 @@ impl<A: S3Api + Send> Read for S3Storage<A> {
         key: &str,
         maximum: u64,
     ) -> Result<Vec<u8>, ObjectError> {
-        if bucket != self.input_bucket {
+        if bucket != self.input_bucket && bucket != self.output_bucket {
             return Err(ObjectError(
                 "read bucket is not the configured input bucket".into(),
             ));
@@ -143,7 +174,7 @@ impl<A: S3Api + Send> Read for S3Storage<A> {
             .map_err(ObjectError)
     }
     async fn read(&mut self, bucket: &str, key: &str) -> Result<Vec<u8>, ObjectError> {
-        if bucket != self.input_bucket {
+        if bucket != self.input_bucket && bucket != self.output_bucket {
             return Err(ObjectError(
                 "read bucket is not the configured input bucket".into(),
             ));
@@ -166,6 +197,24 @@ impl<A: S3Api + Send> Write for S3Storage<A> {
         }
         self.api
             .put(bucket, key, content_type, contents)
+            .await
+            .map_err(ObjectError)
+    }
+    async fn write_with_cache_control(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        cache_control: &str,
+        contents: &[u8],
+    ) -> Result<(), ObjectError> {
+        if bucket != self.output_bucket {
+            return Err(ObjectError(
+                "write bucket is not the configured output bucket".into(),
+            ));
+        }
+        self.api
+            .put_with_cache_control(bucket, key, content_type, cache_control, contents)
             .await
             .map_err(ObjectError)
     }

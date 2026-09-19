@@ -35,6 +35,17 @@ the execution does not exist. A `FAILED` or `TIMED_OUT` execution is not proof
 that its children stopped. Operator inspection uses the same ECS query; never
 delete completed-job objects or objects belonging to another attempt.
 
+## Safe enablement
+
+Enable distributed mode only after the worker image contains the concrete
+finalizer and the deployed task definition supplies the Phase 3 state-machine
+ARN. The ARN is intentionally absent from local/CLI environments; when it is
+present the worker must initialize Step Functions successfully or fail startup.
+Before serving traffic, verify the worker role can read execution history,
+recover child task ARNs, describe those tasks, and best-effort stop only tasks
+in the configured encoder cluster. Keep StartExecution, DescribeExecution,
+and StopExecution scoped to this state machine and its executions.
+
 ```bash
 aws ecs list-tasks --cluster "$CLUSTER" --desired-status RUNNING --output json
 aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" --output json \

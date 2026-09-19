@@ -60,6 +60,7 @@ resource "aws_iam_role_policy" "worker" {
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes", "sqs:GetQueueUrl"], Resource = local.worker_queue_arn },
     { Effect = "Allow", Action = ["s3:GetObject"], Resource = "arn:aws:s3:::${local.shared.video_input_bucket_name}/videos/*/jobs/*/source.mp4" },
+    { Effect = "Allow", Action = ["s3:GetObject"], Resource = "arn:aws:s3:::${local.shared.video_output_bucket_name}/videos/*/jobs/*/hls/attempts/*/*/*" },
     { Effect = "Allow", Action = ["s3:PutObject"], Resource = "arn:aws:s3:::${local.shared.video_output_bucket_name}/videos/*/jobs/*/hls/*" },
     { Effect = "Allow", Action = ["ecs:UpdateTaskProtection", "ecs:GetTaskProtection"], Resource = "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.main.name}/*" },
   ] })

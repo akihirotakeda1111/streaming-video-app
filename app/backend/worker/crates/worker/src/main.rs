@@ -145,8 +145,9 @@ async fn main() {
         Ok(processor) => {
             let processor = if let Some(arn) = config.orchestration_state_machine_arn.as_deref() {
                 match worker::sfn::SfnExecutionClient::new(&config.aws_region, arn).await {
-                    Ok(client) => processor
-                        .with_orchestration(client, worker::orchestration::UnpublishedFinalizer),
+                    Ok(client) => {
+                        processor.with_sfn_orchestration(client, config.output_bucket.clone())
+                    }
                     Err(error) => {
                         error!(%error, "orchestration client initialization failed");
                         std::process::exit(1);

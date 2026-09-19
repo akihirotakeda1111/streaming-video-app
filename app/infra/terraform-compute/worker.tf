@@ -34,6 +34,7 @@ locals {
       { name = "VIDEO_INPUT_BUCKET", value = local.shared.video_input_bucket_name },
       { name = "VIDEO_OUTPUT_BUCKET", value = local.shared.video_output_bucket_name },
       { name = "WORKER_RUNTIME_MODE", value = "ecs" },
+      { name = "ORCHESTRATION_STATE_MACHINE_ARN", value = aws_sfn_state_machine.orchestration.arn },
       { name = "WORKER_MAX_CONCURRENCY", value = "1" },
       { name = "WORKER_HEARTBEAT_INTERVAL_SECONDS", value = tostring(local.shared.runtime_configuration.worker_heartbeat_interval_seconds) },
       { name = "WORKER_VISIBILITY_EXTENSION_SECONDS", value = tostring(local.shared.runtime_configuration.worker_visibility_extension_seconds) },
