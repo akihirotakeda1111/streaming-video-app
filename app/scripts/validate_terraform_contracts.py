@@ -1277,6 +1277,40 @@ def check_reliability(
         )
 
 
+def _api_up_migrations() -> list[str]:
+    directory = (
+        Path(__file__).resolve().parents[1]
+        / "backend"
+        / "api"
+        / "internal"
+        / "persistence"
+        / "migrations"
+    )
+    return sorted(path.name for path in directory.glob("*.up.sql"))
+
+
+def _migration_task_definitions(config: Configuration) -> list[Block]:
+    return [
+        block
+        for block in config.resources("aws_ecs_task_definition")
+        if "migration" in (block.name or "").lower()
+    ]
+
+
+def _check_migration_task(config: Configuration, checks: Checks) -> None:
+    tasks = _migration_task_definitions(config)
+    checks.require(bool(tasks), "a one-off migration task definition is required")
+    required = _api_up_migrations()
+    checks.require(bool(required), "API persistence migrations (*.up.sql) must exist")
+    for block in tasks:
+        missing = [name for name in required if name not in block.body]
+        checks.require(
+            not missing,
+            f"{block.location}: migration task must apply every bundled up migration "
+            f"({', '.join(required)}); missing {', '.join(missing)}",
+        )
+
+
 def check_compute(config: Configuration, checks: Checks) -> None:
     """Check the Phase 3 compute root without evaluating Terraform or AWS."""
     resources = {block.type_name for block in config.resources()}
@@ -1307,11 +1341,7 @@ def check_compute(config: Configuration, checks: Checks) -> None:
                    "database ingress must be restricted to application security groups")
     checks.require(any("acm_certificate" in block.body for block in config.resources("aws_lb_listener")),
                    "ALB HTTPS listener must use an operator-supplied ACM certificate")
-    checks.require(any("migration" in (block.name or "").lower()
-                       for block in config.resources("aws_ecs_task_definition")),
-                       "a one-off migration task definition is required")
-    checks.require("0001_phase1_schema.up.sql" in config.text and "0002_job_lease_persistence.up.sql" in config.text,
-                   "migration task must apply migrations 0001 and 0002")
+    _check_migration_task(config, checks)
 
 def check_workers(config: Configuration, checks: Checks) -> None:
     """Check the Fargate worker deployment without evaluating Terraform."""
@@ -1539,6 +1569,11 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
     checks.require(
         ":execution:${aws_sfn_state_machine.orchestration.name}:" in text,
         "DescribeExecution and StopExecution must target execution ARNs",
+    )
+
+    checks.require(
+        any("0003_publication_state.up.sql" in block.body for block in _migration_task_definitions(config)),
+        "orchestration deployment must apply 0003_publication_state.up.sql through the migration task",
     )
 
     worker_residual = [

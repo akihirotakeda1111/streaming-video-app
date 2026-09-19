@@ -37,6 +37,11 @@ delete completed-job objects or objects belonging to another attempt.
 
 ## Safe enablement
 
+Publication state (`jobs.mode`, `jobs.published_manifest_key`) must already be
+present. A new database applies 0001–0003 through the registered migration task.
+An existing database that already has 0001/0002 applies only
+`0003_publication_state.up.sql`; do not re-run the all-files task.
+
 Enable distributed mode only after the worker image contains the concrete
 finalizer and the deployed task definition supplies the Phase 3 state-machine
 ARN. The ARN is intentionally absent from local/CLI environments; when it is
