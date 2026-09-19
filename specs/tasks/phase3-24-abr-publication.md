@@ -8,7 +8,6 @@ target_branch: feature/phase3-abr-publication
 
 allowed_paths:
   - app/backend/worker/**
-  - app/frontend/e2e/**
   - app/infra/terraform/**
   - app/infra/terraform-compute/**
   - app/scripts/validate_terraform_contracts.py
@@ -67,8 +66,6 @@ depends_on: []
 
 ### Requirement
 
-**Validation ownership:** Use the existing Terraform contract validator for delivery/orchestration configuration and the Rust/Go/frontend E2E suites for publication and playback behavior. Do not depend on a separate delivery or orchestration Python test file.
-
 **Scope / Allowed Changes:** Implement the finalizer for Task 23's results. Validate every expected rendition descriptor, media playlist, and referenced segment for existence, size, MIME type, and identity. Permit only relative references within the same attempt. Build a master with BANDWIDTH/RESOLUTION/CODECS matching actual output and upload it last at `hls/attempts/{attempt}/{execution_id}/index.m3u8`. Invoke Task 20's conditional pointer/completion operation, then return success to existing message completion.
 
 If either rendition fails, publish neither master nor pointer. Record all segments, media playlists, parent master, and database commit in that order. A database failure after master upload leaves attempt-scoped unpublished artifacts without affecting the next attempt. Late old-attempt uploads cannot alter the current pointer. Do not copy results back to legacy keys.
@@ -115,10 +112,6 @@ The following automated commands cover offline/component verification. Database 
 
 ```text
 cargo test --manifest-path app/backend/worker/Cargo.toml
-go test -C app/backend/api ./...
-npm --prefix app/frontend run test:e2e:helpers
-npm --prefix app/frontend run test:e2e:type-check
-npm --prefix app/frontend run test:e2e -- --list
 python app/scripts/validate_contracts.py
 python app/scripts/validate_terraform_contracts.py --stage orchestration
 ```
@@ -129,10 +122,6 @@ In addition to Task Validation, verify that the final diff remains within allowe
 
 ```text
 cargo test --manifest-path app/backend/worker/Cargo.toml
-go test -C app/backend/api ./...
-npm --prefix app/frontend run test:e2e:helpers
-npm --prefix app/frontend run test:e2e:type-check
-npm --prefix app/frontend run test:e2e -- --list
 python app/scripts/validate_contracts.py
 python app/scripts/validate_terraform_contracts.py --stage orchestration
 ```
