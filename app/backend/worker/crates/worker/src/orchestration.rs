@@ -551,72 +551,80 @@ where
         if job.attempt <= 1 {
             return Ok(());
         }
-        let previous = execution_name(&job.item.job_id, job.attempt - 1);
         let mut delay = self.poll_interval.max(Duration::from_millis(1));
         loop {
             if lost(ownership, shutdown) {
-                self.client.cancel(&previous).await;
+                self.cancel_prior_attempts(job).await;
                 return Err(OrchestrationError::OwnershipLost);
             }
             if Instant::now() >= deadline {
-                return Err(self.fail_previous_bound(&previous).await);
+                return Err(self.fail_previous_bound(job).await);
             }
-            let inspection = match until_deadline(deadline, self.client.inspect(&previous)).await {
-                Ok(result) => result,
-                Err(_) => return Err(self.fail_previous_bound(&previous).await),
-            };
-            match inspection {
-                Ok(ExecutionInspection::NotFound) => return Ok(()),
-                Ok(ExecutionInspection::Found { status, .. }) => match status {
-                    ExecutionStatus::Succeeded => return Ok(()),
-                    ExecutionStatus::Failed | ExecutionStatus::TimedOut => {
-                        match until_deadline(
-                            deadline,
-                            self.client.residual_running_children(&previous),
-                        )
-                        .await
-                        {
-                            Ok(Ok(residual)) if child_bound_holds(residual, planned_children) => {
-                                return Ok(());
-                            }
-                            Ok(Ok(_)) => {
-                                self.wait_for_previous_bound(
-                                    &previous, &mut delay, ownership, shutdown, deadline,
-                                )
-                                .await?;
-                            }
-                            Ok(Err(error)) if describe_is_retryable(&error) => {
-                                self.wait_for_previous_bound(
-                                    &previous, &mut delay, ownership, shutdown, deadline,
-                                )
-                                .await?;
-                            }
-                            Ok(Err(error)) => return Err(error),
-                            Err(_) => return Err(self.fail_previous_bound(&previous).await),
-                        }
+            let mut residual = 0usize;
+            let mut pending = false;
+            for attempt in 1..job.attempt {
+                let name = execution_name(&job.item.job_id, attempt);
+                match self.observe_prior_execution(&name, deadline).await {
+                    Ok(PriorObservation::Residual(count)) => {
+                        residual = residual.saturating_add(count);
                     }
-                    ExecutionStatus::Running => {
-                        self.client.cancel(&previous).await;
-                        self.wait_for_previous_bound(
-                            &previous, &mut delay, ownership, shutdown, deadline,
-                        )
-                        .await?;
+                    Ok(PriorObservation::Pending) => pending = true,
+                    Err(OrchestrationError::TimedOut) => {
+                        return Err(self.fail_previous_bound(job).await);
                     }
-                },
-                Err(error) if describe_is_retryable(&error) => {
-                    self.wait_for_previous_bound(
-                        &previous, &mut delay, ownership, shutdown, deadline,
-                    )
-                    .await?;
+                    Err(error) => {
+                        self.cancel_prior_attempts(job).await;
+                        return Err(error);
+                    }
                 }
-                Err(error) => return Err(error),
             }
+            if !pending && child_bound_holds(residual, planned_children) {
+                return Ok(());
+            }
+            self.wait_for_previous_bound(job, &mut delay, ownership, shutdown, deadline)
+                .await?;
+        }
+    }
+
+    async fn observe_prior_execution(
+        &self,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<PriorObservation, OrchestrationError> {
+        let inspection = match until_deadline(deadline, self.client.inspect(name)).await {
+            Ok(result) => result,
+            Err(_) => return Err(OrchestrationError::TimedOut),
+        };
+        match inspection {
+            Ok(ExecutionInspection::NotFound) => Ok(PriorObservation::Residual(0)),
+            Ok(ExecutionInspection::Found { status, .. }) => match status {
+                ExecutionStatus::Running => {
+                    self.client.cancel(name).await;
+                    Ok(PriorObservation::Pending)
+                }
+                ExecutionStatus::Succeeded
+                | ExecutionStatus::Failed
+                | ExecutionStatus::TimedOut => {
+                    match until_deadline(deadline, self.client.residual_running_children(name))
+                        .await
+                    {
+                        Ok(Ok(count)) => Ok(PriorObservation::Residual(count)),
+                        Ok(Err(error)) if describe_is_retryable(&error) => {
+                            Ok(PriorObservation::Pending)
+                        }
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(OrchestrationError::TimedOut),
+                    }
+                }
+            },
+            Err(error) if describe_is_retryable(&error) => Ok(PriorObservation::Pending),
+            Err(error) => Err(error),
         }
     }
 
     async fn wait_for_previous_bound(
         &self,
-        previous: &str,
+        job: &AcquiredJob,
         delay: &mut Duration,
         ownership: &mut watch::Receiver<bool>,
         shutdown: &mut watch::Receiver<bool>,
@@ -627,17 +635,25 @@ where
                 *delay = (*delay * 2).min(MAX_POLL_INTERVAL);
                 Ok(())
             }
-            Err(OrchestrationError::TimedOut) => Err(self.fail_previous_bound(previous).await),
+            Err(OrchestrationError::TimedOut) => Err(self.fail_previous_bound(job).await),
             Err(error) => {
-                self.client.cancel(previous).await;
+                self.cancel_prior_attempts(job).await;
                 Err(error)
             }
         }
     }
 
-    async fn fail_previous_bound(&self, previous: &str) -> OrchestrationError {
-        self.client.cancel(previous).await;
+    async fn fail_previous_bound(&self, job: &AcquiredJob) -> OrchestrationError {
+        self.cancel_prior_attempts(job).await;
         OrchestrationError::Describe("previous execution bound not established".into())
+    }
+
+    async fn cancel_prior_attempts(&self, job: &AcquiredJob) {
+        for attempt in 1..job.attempt {
+            self.client
+                .cancel(&execution_name(&job.item.job_id, attempt))
+                .await;
+        }
     }
 
     async fn start_or_attach(
@@ -727,6 +743,11 @@ where
 enum Attach {
     Ready,
     Terminal(OrchestrationError),
+}
+
+enum PriorObservation {
+    Residual(usize),
+    Pending,
 }
 
 fn lost(ownership: &watch::Receiver<bool>, shutdown: &watch::Receiver<bool>) -> bool {
@@ -1341,5 +1362,110 @@ mod tests {
         );
         assert!(starts.lock().unwrap().is_empty());
         assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn older_attempt_residual_children_block_a_later_attempt() {
+        let job = job_with(3);
+        let input = input_for(&job);
+        let first = execution_name(JOB_ID, 1);
+        let second = execution_name(JOB_ID, 2);
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        client.seed_execution_with_status(&first, input_for(&job_with(1)), ExecutionStatus::Failed);
+        client.seed_execution_with_status(
+            &second,
+            input_for(&job_with(2)),
+            ExecutionStatus::Failed,
+        );
+        client.set_residual_running(&first, 1);
+        client.set_residual_running(&second, 0);
+        let starts = client.starts.clone();
+        let finalizer = FakeFinalizer::new(Ok(()));
+        let calls = finalizer.calls.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer,
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, _shutdown_stop, shutdown) = channels();
+        let deadline = Instant::now() + Duration::from_millis(8);
+        assert_eq!(
+            bridge
+                .run(&job, &input, ownership, shutdown, deadline)
+                .await,
+            Err(OrchestrationError::Describe(
+                "previous execution bound not established".into()
+            ))
+        );
+        assert!(starts.lock().unwrap().is_empty());
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_prior_attempts_without_residual_children_allow_start() {
+        let job = job_with(3);
+        let input = input_for(&job);
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        client.seed_execution_with_status(
+            &execution_name(JOB_ID, 1),
+            input_for(&job_with(1)),
+            ExecutionStatus::Failed,
+        );
+        client.seed_execution_with_status(
+            &execution_name(JOB_ID, 2),
+            input_for(&job_with(2)),
+            ExecutionStatus::TimedOut,
+        );
+        client.set_residual_running(&execution_name(JOB_ID, 1), 0);
+        client.set_residual_running(&execution_name(JOB_ID, 2), 0);
+        let starts = client.starts.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer: FakeFinalizer::new(Ok(())),
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, _shutdown_stop, shutdown) = channels();
+        bridge
+            .run(&job, &input, ownership, shutdown, far_deadline())
+            .await
+            .unwrap();
+        assert_eq!(starts.lock().unwrap()[0].0, execution_name(JOB_ID, 3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn older_attempt_inspection_failure_blocks_a_later_attempt() {
+        let job = job_with(3);
+        let input = input_for(&job);
+        let first = execution_name(JOB_ID, 1);
+        let second = execution_name(JOB_ID, 2);
+        let client = FakeExecutionClient::new(vec![Ok(ExecutionStatus::Succeeded)]);
+        client.seed_execution_with_status(&first, input_for(&job_with(1)), ExecutionStatus::Failed);
+        client.seed_execution_with_status(
+            &second,
+            input_for(&job_with(2)),
+            ExecutionStatus::Failed,
+        );
+        client.fail_residual_inspection(
+            &first,
+            OrchestrationError::Describe("residual children unavailable".into()),
+        );
+        client.set_residual_running(&second, 0);
+        let starts = client.starts.clone();
+        let bridge = OrchestrationBridge {
+            client,
+            finalizer: FakeFinalizer::new(Ok(())),
+            poll_interval: Duration::from_millis(1),
+        };
+        let (_stop, ownership, _shutdown_stop, shutdown) = channels();
+        let deadline = Instant::now() + Duration::from_millis(8);
+        assert_eq!(
+            bridge
+                .run(&job, &input, ownership, shutdown, deadline)
+                .await,
+            Err(OrchestrationError::Describe(
+                "previous execution bound not established".into()
+            ))
+        );
+        assert!(starts.lock().unwrap().is_empty());
     }
 }

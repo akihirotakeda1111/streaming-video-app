@@ -29,11 +29,12 @@ re-check `describe-tasks` until each reaches `STOPPED`. Bound this inspection
 and cleanup window by the parent deadline; escalate tasks that remain running
 after the window rather than assuming execution cancellation terminated them.
 A `FAILED` or `TIMED_OUT` execution is not proof that its children stopped.
-The parent inspects residual running children before `StartExecution` of the
-next attempt and starts only when residual children plus the new renditions
-still fit the two-encoder-per-parent cap. If inspection cannot establish that
-bound, it does not start a new execution and returns to the existing retry
-policy. Never delete completed-job objects or objects belonging to another
+The parent inspects every prior attempt `1..current_attempt` by deterministic
+execution name before `StartExecution`. Residual running children across those
+executions plus the new renditions must still fit the two-encoder-per-parent
+cap. If any prior execution cannot be inspected, or the combined bound cannot
+be established, it does not start a new execution and returns to the existing
+retry policy. Never delete completed-job objects or objects belonging to another
 attempt.
 
 ## Live acceptance
