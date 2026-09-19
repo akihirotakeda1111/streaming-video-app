@@ -67,7 +67,11 @@ depends_on: []
 
 Keep the deployment-selected mode set to cli until Task 24 is complete and distributed publication/finalization is available.
 
-Continue both database-lease and SQS-visibility heartbeats while starting and polling executions with bounded backoff. Reuse the S3 event gate, all-record COMPLETED acknowledgement, and non-acknowledgement for busy/failed/unknown records. Pass results to the processing path's finalizer port; do not duplicate Task 24's master assembly.
+Continue both database-lease and SQS-visibility heartbeats while starting and polling executions with bounded backoff. Reuse the S3 event gate, all-record COMPLETED acknowledgement, and non-acknowledgement for busy/failed/unknown records. Task 23 owns the finalizer port/interface required to hand off a successful Step Functions outcome, but does not implement distributed publication or parent master assembly. Define and connect this port within the worker runtime so orchestration completion can be handed off without treating Step Functions SUCCEEDED as job completion.
+
+Provide test/fake implementations of the finalizer port sufficient to verify orchestration-to-finalizer control flow, ownership fencing, failure propagation, and acknowledgement gating. Task 24 owns the concrete distributed finalizer implementation that validates child result descriptors and referenced objects, publishes the parent master manifest last, and performs distributed database completion.
+
+Do not duplicate or partially implement Task 24's child-result validation, master-playlist assembly, publication ordering, or distributed completion logic in this task.
 
 Resolve lost StartExecution responses using a deterministic job/attempt name and exactly identical input. Do not generate new names when an execution has conflicting input or has already failed. Map permission, timeout, and child failures to existing owned release/terminal-failure operations only while ownership remains valid; only reacquisition increments the attempt. On loss of either the SQS visibility heartbeat or the database lease heartbeat, mark local ownership lost and attempt Step Functions execution cancellation on a best-effort basis.
 
@@ -86,7 +90,9 @@ After a parent crash, a new attempt derives the previous execution identity and 
 - SF SUCCEEDED alone does not authorize acknowledgement. Only successful object/master validation and database completion through the finalizer can reach the existing acknowledgement decision.
 - Preserve existing attempt/retry/DLQ rules. COMPLETED redelivery starts neither Step Functions nor FFmpeg.
 - Bound polling/deadlines without starving heartbeats, and reject work limits exceeding the SQS visibility lifetime.
-- Connect the finalizer port in tests without success-returning TODO stubs. Keep real deployments on CLI mode until final publication is available.
+- Define and connect the Task 23 finalizer port in tests using controllable fakes that can return success, failure, and ownership-loss outcomes. Do not use an unconditional success-returning TODO stub. Verify that Step Functions SUCCEEDED reaches the finalizer port but does not by itself authorize database completion or SQS acknowledgement. Only a successful finalizer outcome while ownership remains valid may reach the existing acknowledgement decision.
+
+Do not implement Task 24's concrete publication/finalization behavior in these fakes. Keep real deployments on cli mode until Task 24 provides the concrete distributed finalizer and publication path.
 
 ### Validation
 
