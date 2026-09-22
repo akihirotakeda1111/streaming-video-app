@@ -59,7 +59,7 @@ WRITE_ACTIONS = {
 }
 
 BLOCK_RE = re.compile(
-    r'(?m)^\s*(resource|data|variable|output|provider)\s+"([^"\r\n]+)"'
+    r'(?m)^\s*(resource|data|variable|output|provider|module)\s+"([^"\r\n]+)"'
     r'(?:\s+"([^"\r\n]+)")?\s*\{'
 )
 STRING_RE = re.compile(r'"((?:\\.|[^"\\])*)"', re.DOTALL)
@@ -1343,6 +1343,45 @@ def check_compute(config: Configuration, checks: Checks) -> None:
                    "ALB HTTPS listener must use an operator-supplied ACM certificate")
     _check_migration_task(config, checks)
 
+
+def check_scalability_e2e(config: Configuration, checks: Checks) -> None:
+    """Check the module-only scalability E2E wiring without evaluating Terraform."""
+    modules = [block for block in config.blocks if block.kind == "module"]
+    foundation = [block for block in modules if block.type_name == "foundation"]
+    checks.require(len(foundation) == 1, "scalability E2E must instantiate one foundation module")
+    if foundation:
+        checks.require(
+            _attribute(foundation[0].body, "source") == '"../../terraform"',
+            "scalability E2E foundation must reuse app/infra/terraform",
+        )
+        checks.require(
+            "scalability-e2e" in foundation[0].body,
+            "scalability E2E foundation must use a dedicated environment identity",
+        )
+    checks.require(not config.resources(), "scalability E2E must not duplicate compute resources")
+    checks.require(
+        'backend "local"' in config.text and "terraform.tfstate" in config.text,
+        "scalability E2E delivery must declare an explicit local backend",
+    )
+    for output in (
+        "video_input_bucket_name",
+        "video_input_bucket_arn",
+        "video_output_bucket_name",
+        "video_output_bucket_arn",
+        "video_encoding_queue_url",
+        "video_encoding_queue_arn",
+        "cloudfront_distribution_domain_name",
+        "cloudfront_distribution_id",
+    ):
+        checks.require(
+            any(block.type_name == output for block in config.blocks if block.kind == "output"),
+            f"scalability E2E must expose non-secret output {output}",
+        )
+    checks.require(
+        "compute_shared_state_contract" in config.text,
+        "scalability E2E must expose the unchanged compute shared-state contract",
+    )
+
 def check_workers(config: Configuration, checks: Checks) -> None:
     """Check the Fargate worker deployment without evaluating Terraform."""
     resources = {block.type_name for block in config.resources()}
@@ -1606,6 +1645,9 @@ def check_orchestration(config: Configuration, checks: Checks) -> None:
 def validate(config: Configuration, stage: str, shared_config: Configuration | None = None) -> list[str]:
     checks = Checks()
     check_foundation(config, checks)
+    if stage == "orchestration" and config.root.name == "scalability":
+        check_scalability_e2e(config, checks)
+        return checks.errors
     check_forbidden_resources(config, checks, stage)
     check_dangerous_configuration(config, checks, stage)
 
