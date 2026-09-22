@@ -1344,6 +1344,20 @@ def check_compute(config: Configuration, checks: Checks) -> None:
     _check_migration_task(config, checks)
 
 
+def _worst_case_output_bucket_length(prefix_template: str) -> int:
+    """Return the longest output bucket name for the capped instance and region."""
+    prefix = prefix_template.replace("${var.instance}", "a" * 12)
+    return len(f"{prefix}-{'0' * 12}-{'r' * 16}-output")
+
+
+def _read_optional_text(path: Path) -> str:
+    """Read a companion file, or return an empty string when it is missing."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
 def check_scalability_e2e(config: Configuration, checks: Checks) -> None:
     """Check the module-only scalability E2E wiring without evaluating Terraform."""
     modules = [block for block in config.blocks if block.kind == "module"]
@@ -1360,8 +1374,72 @@ def check_scalability_e2e(config: Configuration, checks: Checks) -> None:
         )
     checks.require(not config.resources(), "scalability E2E must not duplicate compute resources")
     checks.require(
-        'backend "local"' in config.text and "terraform.tfstate" in config.text,
-        "scalability E2E delivery must declare an explicit local backend",
+        'path = "/dev/null/streaming-video-scalability-e2e-delivery.tfstate"' in config.text,
+        "scalability E2E delivery backend must use an unusable sentinel path",
+    )
+    checks.reject(
+        "/var/lib/streaming-video-e2e/scalability/delivery/terraform.tfstate" in config.text,
+        "scalability E2E delivery configuration must not fall back to a writable state path",
+    )
+    prefix_match = re.search(r'(?m)^\s*s3_bucket_prefix\s*=\s*"([^"]+)"', config.text)
+    checks.require(prefix_match is not None, "scalability E2E must declare a short S3 bucket prefix")
+    if prefix_match:
+        prefix_template = prefix_match.group(1)
+        checks.require(
+            "${var.instance}" in prefix_template and "streaming-video-scalability-e2e" not in prefix_template,
+            "S3 bucket prefix must keep the instance suffix and stay shorter than the resource prefix",
+        )
+        checks.require(
+            _worst_case_output_bucket_length(prefix_template) <= 63,
+            "scalability S3 bucket names must stay within 63 characters",
+        )
+    checks.require(
+        'can(regex("^[a-z0-9][a-z0-9-]{0,10}[a-z0-9]$", var.instance))' in config.text,
+        "instance length must stay capped so the short S3 prefix fits",
+    )
+    checks.require(
+        "length(var.aws_region) <= 16" in config.text,
+        "aws_region must be bounded so S3 bucket names fit",
+    )
+    for suffix in ("input", "output"):
+        checks.require(
+            re.search(
+                rf'video_{suffix}_bucket\s*=\s*"\$\{{local\.s3_bucket_prefix\}}-\$\{{var\.aws_account_id\}}-\$\{{var\.aws_region\}}-{suffix}"',
+                config.text,
+            ) is not None,
+            f"scalability {suffix} bucket must use the short prefix, account, and region",
+        )
+    backend_example = _read_optional_text(config.root / "backend-delivery.tfbackend.example")
+    checks.require(
+        'path = "/var/lib/streaming-video-e2e/scalability/delivery/terraform.tfstate"' in backend_example,
+        "delivery backend example must keep the operator state path outside the sentinel",
+    )
+    compute_tfvars = _read_optional_text(config.root / "compute.tfvars.example")
+    for name in (
+        "worker_autoscaling_min_capacity",
+        "worker_autoscaling_max_capacity",
+        "worker_acceptable_queue_delay_seconds",
+        "worker_representative_processing_seconds",
+        "worker_scale_out_cooldown_seconds",
+        "worker_scale_in_cooldown_seconds",
+    ):
+        checks.require(name in compute_tfvars, f"compute tfvars example must record {name} for the Task 90 handoff")
+    runbook = _read_optional_text(config.root.parents[2] / "docs" / "runbooks" / "scalability-e2e.md")
+    for snippet in (
+        "-target=aws_ecr_repository.api",
+        "-target=aws_ecr_repository.worker",
+        "-lockfile=readonly",
+        "worker_acceptable_queue_delay_seconds",
+        "worker_representative_processing_seconds",
+        "worker_scale_out_cooldown_seconds",
+        "worker_scale_in_cooldown_seconds",
+    ):
+        checks.require(snippet in runbook, f"scalability runbook must document {snippet}")
+    lockfile = config.root.parents[1] / "terraform-compute" / ".terraform.lock.hcl"
+    lock_text = _read_optional_text(lockfile)
+    checks.require(
+        "hashicorp/aws" in lock_text,
+        "terraform-compute dependency lockfile must be committed for readonly init",
     )
     for output in (
         "video_input_bucket_name",
@@ -1702,14 +1780,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Validate one Terraform stage and, for orchestration, the scalability root too."""
     args = parse_args()
+    include_scalability = False
     try:
+        repo_root = Path(__file__).resolve().parents[2]
         terraform_dir = args.terraform_dir.resolve()
-        if terraform_dir == Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform" and args.stage in {"compute", "workers", "scaling", "orchestration"}:
-            terraform_dir = Path(__file__).resolve().parents[2] / "app" / "infra" / "terraform-compute"
+        if terraform_dir == repo_root / "app" / "infra" / "terraform" and args.stage in {"compute", "workers", "scaling", "orchestration"}:
+            terraform_dir = repo_root / "app" / "infra" / "terraform-compute"
         config = load_configuration(terraform_dir)
         shared_config = load_configuration(args.shared_terraform_dir.resolve()) if args.shared_terraform_dir else None
         errors = validate(config, args.stage, shared_config)
+        include_scalability = args.stage == "orchestration" and config.root.name == "terraform-compute"
+        if include_scalability:
+            scalability = load_configuration(repo_root / "app" / "infra" / "terraform-e2e" / "scalability")
+            errors.extend(
+                f"scalability root: {error}" for error in validate(scalability, "orchestration")
+            )
     except TerraformContractError as exc:
         print(f"Terraform contract validation failed: {exc}", file=sys.stderr)
         return 1
@@ -1720,9 +1807,10 @@ def main() -> int:
             print(f"- {error}", file=sys.stderr)
         return 1
 
+    scalability_note = ", scalability=checked" if include_scalability else ""
     print(
         f"Terraform contracts valid: stage={args.stage}, "
-        f"files={len(config.files)}, resources={len(config.resources())}"
+        f"files={len(config.files)}, resources={len(config.resources())}{scalability_note}"
     )
     return 0
 

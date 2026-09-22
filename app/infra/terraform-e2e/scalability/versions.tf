@@ -7,10 +7,11 @@ terraform {
     }
   }
 
-  # This is a scalability-only fallback, outside the source tree. Operators
-  # should replace it with their private absolute path via backend config.
+  # Unusable sentinel. Init must pass -backend-config with a private absolute
+  # state path. Without that override Terraform cannot open a state file, so a
+  # missing backend config cannot fall back to the example path or any default.
   backend "local" {
-    path = "/var/lib/streaming-video-e2e/scalability/delivery/terraform.tfstate"
+    path = "/dev/null/streaming-video-scalability-e2e-delivery.tfstate"
   }
 }
 
@@ -24,10 +25,25 @@ provider "aws" {
 
 locals {
   prefix = "streaming-video-scalability-e2e-${var.instance}"
+  # S3 names are limited to 63 characters. The resource prefix above exceeds
+  # that once account, region, and instance are included. Buckets alone use
+  # this shorter prefix. Worst case with a 12-character instance, 12-digit
+  # account, and 16-character region is 62 characters for the output bucket.
+  s3_bucket_prefix = "sv-scale-e2e-${var.instance}"
   tags = {
     Environment = "scalability-e2e"
     Disposable  = "true"
     Scope       = local.prefix
+  }
+}
+
+check "s3_bucket_names" {
+  assert {
+    condition = (
+      length("${local.s3_bucket_prefix}-${var.aws_account_id}-${var.aws_region}-input") <= 63
+      && length("${local.s3_bucket_prefix}-${var.aws_account_id}-${var.aws_region}-output") <= 63
+    )
+    error_message = "Scalability S3 bucket names must be 63 characters or fewer."
   }
 }
 
@@ -38,8 +54,8 @@ module "foundation" {
   project_name        = "streaming-video"
   environment         = "scalability-e2e-${var.instance}"
   aws_region          = var.aws_region
-  video_input_bucket  = "${local.prefix}-${var.aws_account_id}-${var.aws_region}-input"
-  video_output_bucket = "${local.prefix}-${var.aws_account_id}-${var.aws_region}-output"
+  video_input_bucket  = "${local.s3_bucket_prefix}-${var.aws_account_id}-${var.aws_region}-input"
+  video_output_bucket = "${local.s3_bucket_prefix}-${var.aws_account_id}-${var.aws_region}-output"
   frontend_origin     = var.frontend_origin
   frontend_origins    = var.frontend_origins
 

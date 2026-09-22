@@ -10,6 +10,10 @@ variable "aws_account_id" {
 variable "aws_region" {
   type    = string
   default = "ap-northeast-1"
+  validation {
+    condition     = can(regex("^[a-z]{2}-[a-z0-9-]+-[0-9]+$", var.aws_region)) && length(var.aws_region) <= 16
+    error_message = "aws_region must be a region identifier of at most 16 characters so S3 bucket names stay within 63 characters."
+  }
 }
 
 variable "instance" {

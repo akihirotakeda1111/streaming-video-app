@@ -1,3 +1,5 @@
-# Copy to a private operator runtime directory and pass its absolute path to
-# `terraform init -backend-config`. Never store state under this source tree.
+# Required. versions.tf uses an unusable /dev/null sentinel, so init without
+# this file cannot select a state. Copy it to a private operator runtime
+# directory and pass that absolute path to `terraform init -backend-config`.
+# Never store state under the source tree.
 path = "/var/lib/streaming-video-e2e/scalability/delivery/terraform.tfstate"

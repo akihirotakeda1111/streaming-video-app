@@ -15,4 +15,10 @@ worker_desired_count          = 0
 worker_autoscaling_enabled    = false
 worker_autoscaling_min_capacity = 1
 worker_autoscaling_max_capacity = 4
-# Supply immutable api_image_digest and worker_image_digest after publishing.
+# backlog-per-worker target = acceptable queue delay / representative processing time.
+# 900 / 300 = 3 messages per worker. Record these with the cooldowns for Task 90.
+worker_acceptable_queue_delay_seconds = 900
+worker_representative_processing_seconds = 300
+worker_scale_out_cooldown_seconds = 180
+worker_scale_in_cooldown_seconds = 600
+# Supply immutable api_image_digest and worker_image_digest after the ECR bootstrap.
