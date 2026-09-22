@@ -15,10 +15,11 @@ absolute local state paths. State, plans, `.terraform` metadata, provider data,
 and credentials must remain in that private directory.
 
 Before any live operation, verify `aws sts get-caller-identity`, the expected
-account and region, the resource prefix
-`streaming-video-scalability-e2e-<instance>`, the shorter S3-only prefix
-`sv-scale-e2e-<instance>`, both absolute state paths, and these distinct
-absolute data directories:
+account and region, the delivery resource prefix
+`streaming-video-scalability-e2e-<instance>`, the compute resource prefix
+`streaming-video-scale-e2e-<instance>` (at most 32 characters), the shorter
+S3-only prefix `sv-scale-e2e-<instance>`, both absolute state paths, and these
+distinct absolute data directories:
 
 ```bash
 export SCALABILITY_RUNTIME=/var/lib/streaming-video-e2e/scalability
@@ -70,8 +71,11 @@ input/output bucket names and ARNs, queue URL/ARN, CloudFront domain and
 distribution ID. Confirm both bucket names are at most 63 characters and use
 the `sv-scale-e2e-<instance>` prefix.
 
-Copy `compute.tfvars.example` to the private compute tfvars file. Set the
-absolute delivery `shared_state_path`, certificate, and database secret. Leave
+Copy `compute.tfvars.example` to the private compute tfvars file. Keep
+`environment` short enough that the compute resource prefix
+`streaming-video-scale-e2e-<instance>` is at most 32 characters; the example
+uses `scale-e2e-load`. Set the absolute delivery `shared_state_path`,
+certificate, and database secret. Leave
 `api_image_digest` and `worker_image_digest` unset. Keep
 `api_desired_count = 0`, `worker_desired_count = 0`, and
 `worker_autoscaling_enabled = false`. Initialize the unchanged compute root
@@ -149,7 +153,9 @@ Record these non-secret values after the full apply. Task 90 reads them and
 does not change autoscaling, services, or Terraform:
 
 - Account, region, and environment identity `scalability-e2e-<instance>`
-- Resource prefix `streaming-video-scalability-e2e-<instance>` and S3 prefix `sv-scale-e2e-<instance>`
+- Delivery resource prefix `streaming-video-scalability-e2e-<instance>`
+- Compute resource prefix `streaming-video-scale-e2e-<instance>` (at most 32 characters)
+- S3 prefix `sv-scale-e2e-<instance>`
 - Input and output bucket names and ARNs, queue URL and ARN, CloudFront domain, distribution ID, and playback base URL
 - API base URL and CloudFront URL
 - ECS cluster, API service, Worker service, API, Worker, and migration task-definition identifiers

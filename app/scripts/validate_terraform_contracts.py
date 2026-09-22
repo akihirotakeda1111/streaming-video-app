@@ -1424,11 +1424,16 @@ def check_scalability_e2e(config: Configuration, checks: Checks) -> None:
         "worker_scale_in_cooldown_seconds",
     ):
         checks.require(name in compute_tfvars, f"compute tfvars example must record {name} for the Task 90 handoff")
+    checks.require(
+        'environment        = "scale-e2e-load"' in compute_tfvars,
+        "compute environment must stay short enough for a 32-character resource prefix",
+    )
     runbook = _read_optional_text(config.root.parents[2] / "docs" / "runbooks" / "scalability-e2e.md")
     for snippet in (
         "-target=aws_ecr_repository.api",
         "-target=aws_ecr_repository.worker",
         "-lockfile=readonly",
+        "streaming-video-scale-e2e-<instance>",
         "worker_acceptable_queue_delay_seconds",
         "worker_representative_processing_seconds",
         "worker_scale_out_cooldown_seconds",
@@ -1450,11 +1455,16 @@ def check_scalability_e2e(config: Configuration, checks: Checks) -> None:
         "video_encoding_queue_arn",
         "cloudfront_distribution_domain_name",
         "cloudfront_distribution_id",
+        "runtime_configuration",
     ):
         checks.require(
             any(block.type_name == output for block in config.blocks if block.kind == "output"),
             f"scalability E2E must expose non-secret output {output}",
         )
+    checks.require(
+        "module.foundation.runtime_configuration" in config.text,
+        "scalability E2E must re-export foundation runtime_configuration for terraform-compute",
+    )
     checks.require(
         "compute_shared_state_contract" in config.text,
         "scalability E2E must expose the unchanged compute shared-state contract",

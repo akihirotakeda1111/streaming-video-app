@@ -3,6 +3,11 @@ output "environment_identity" {
   value       = "scalability-e2e-${var.instance}"
 }
 
+output "runtime_configuration" {
+  description = "Non-secret runtime values consumed by terraform-compute."
+  value       = module.foundation.runtime_configuration
+}
+
 output "aws_region" { value = module.foundation.aws_region }
 
 output "video_input_bucket_name" { value = module.foundation.video_input_bucket_name }
