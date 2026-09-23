@@ -169,3 +169,44 @@ does not change autoscaling, services, or Terraform:
 - `worker_scale_in_cooldown_seconds = 600`
 
 The parent orchestration contract remains at most two children per parent.
+
+## Task 90 integrated validation
+
+Task 90 consumes a non-secret JSON handoff from the deployed environment; it
+does not apply Terraform, update ECS services, change database mode, or create
+resources. Set `SCALABILITY_E2E_CONFIG` to that handoff and use the following
+offline gate before any live work:
+
+```bash
+python app/scripts/run_scalability_e2e.py --check
+```
+
+The handoff records `account_id`, `region`, the environment identity, API and
+frontend origins, CloudFront playback origin, cluster and service identities,
+Step Functions ARN, `distributed_mode: true`, `parent_min_capacity: 1`,
+API/Worker image digests, the 720p-or-higher fixture path
+and duration, worker limits, backlog-per-worker target, representative
+processing time, cooldowns, and the total runtime budget. The fixture path is
+never copied into evidence and must be readable only by the operator running
+the test.
+
+The runner derives and records one fixed batch before submission. Its initial
+batch is `ceil(backlog_per_worker_target * worker_min_capacity) + 1`; the
+rationale and all inputs are written to `planned-workload.json`. No later
+submission is permitted. `--check` makes no AWS calls. A live run additionally
+requires `SCALABILITY_E2E_ALLOW_LIVE=true` and an explicit dedicated-environment
+handoff:
+
+```bash
+SCALABILITY_E2E_ALLOW_LIVE=true \
+python app/scripts/run_scalability_e2e.py --full
+```
+
+The live project is explicitly selected as `scalability`; ordinary
+`npm --prefix app/frontend run test:e2e` and the Reliability runner do not
+discover its scenarios. Evidence must identify every checkpoint as PASS, FAIL,
+or NOT RUN, including worker task identities/timestamps, child task ARNs and
+Step Functions intervals, publication/API completion, CloudFront browser
+requests and media advancement, per-job completion, and scale-in. A failed or
+timed-out job is not a partial acceptance. Operators retain cleanup ownership
+and must leave unresolved workload status recorded before environment teardown.

@@ -1,10 +1,11 @@
 import process from 'node:process'
 import { assertLiveBoundary, validateSettings } from './reliability/safety.mjs'
 
-export const e2eProjects = ['chromium', 'firefox', 'webkit'] as const
+export const e2eProjects = ['chromium', 'firefox', 'webkit', 'scalability'] as const
 export type E2EProject = (typeof e2eProjects)[number]
 
 export const reliabilityProject = 'reliability' as const
+export const scalabilityProject = 'scalability' as const
 
 export interface E2ETimeouts {
   navigation: number

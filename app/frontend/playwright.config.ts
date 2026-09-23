@@ -3,6 +3,7 @@ import { defineConfig, devices } from '@playwright/test'
 import { e2eConfig, reliabilityDiscoveryConfig } from './e2e/config.js'
 
 const browserTestIgnore = ['**/*.test.ts', '**/reliability/**/*.spec.ts',
+  '**/scalability/**/*.spec.ts',
   ...(process.env.E2E_INCLUDE_DELIVERY_REPLAY === 'true' || process.env.E2E_DISCOVERY === 'true'
     ? [] : ['**/delivery-regression.spec.ts'])]
 
@@ -87,6 +88,16 @@ export default defineConfig({
         baseURL: reliabilityDiscoveryConfig().frontendUrl,
       },
     },
+    {
+      name: 'scalability',
+      testMatch: '**/scalability/**/*.spec.ts',
+      retries: 0,
+      workers: 1,
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: e2eConfig.frontendUrl,
+      },
+    },
 
     /* Test against mobile viewports. */
     // {
@@ -119,7 +130,11 @@ export default defineConfig({
     ({ name }) =>
       name === e2eConfig.project ||
       (name === 'reliability' &&
-        (process.env.E2E_DISCOVERY === 'true' || process.env.E2E_INCLUDE_RELIABILITY === 'true')),
+        (process.env.E2E_DISCOVERY === 'true' || process.env.E2E_INCLUDE_RELIABILITY === 'true')) ||
+      (name === 'scalability' &&
+        (process.env.E2E_INCLUDE_SCALABILITY === 'true' ||
+          process.argv.some((argument, index) => argument === '--project=scalability' ||
+            (argument === '--project' && process.argv[index + 1] === 'scalability')))),
   ),
 
   /* Folder for test artifacts such as screenshots, videos, traces, etc. */
