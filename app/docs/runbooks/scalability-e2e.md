@@ -185,9 +185,10 @@ The handoff records `account_id`, `region`, the environment identity, API and
 frontend origins, CloudFront playback origin, cluster, `api_service`,
 `worker_service`, and `parent_service`, the dedicated `input_bucket` name,
 Step Functions ARN, `distributed_mode: true`, `parent_min_capacity: 1`,
-`worker_max_concurrency`, API/Worker image digests, the 720p-or-higher fixture
-path and duration, worker limits, backlog-per-worker target, representative
-processing time, cooldowns, and the total runtime budget. `api_service` is the
+`worker_max_concurrency`, `submission_window_seconds`, API/Worker image digests,
+the 720p-or-higher fixture path and duration, worker limits, backlog-per-worker
+target, representative processing time, cooldowns, and the total runtime budget.
+`api_service` is the
 ECS API service name from the compute outputs. `input_bucket` is that
 environment's video input bucket name. `worker_max_concurrency` is the deployed
 `WORKER_MAX_CONCURRENCY`. The fixture path is never copied into evidence and
@@ -203,16 +204,19 @@ visible backlog per running worker stays strictly above the target. For target
 four remain visible, so the ratio is 4. A batch of 4 would leave a ratio of 3
 and would not hold the scale-out condition across the evaluation periods.
 
-That predetermined batch is uploaded in parallel. The submission window recorded
-in the plan is one concurrent upload of the fixed batch. Representative
-processing time must cover the scale-out evaluation window after the batch is
-visible, and the runtime budget must cover that window, drain on at least two
-workers, both cooldowns, the scale-in evaluation window, and playback. Offline
-`--check` uses the target-tracking defaults of 3 one-minute periods to scale
-out and 15 one-minute periods to scale in. A budget that cannot cover that plan
-is rejected before any job is submitted. The rationale and fixture identity are
-written to `planned-workload.json`. The fixture record is the file name,
-duration, size, and SHA-256 only. No later submission is permitted.
+That predetermined batch is uploaded in parallel. `submission_window_seconds`
+is the planned upper bound for the whole parallel upload. Representative
+processing time must be at least that window plus the scale-out evaluation,
+because the first object can start processing while later uploads in the same
+batch are still finishing. The runtime budget includes the submission window,
+drain on at least two workers, both cooldowns, the scale-in evaluation window,
+and playback. If the measured batch submission time exceeds the planned window,
+the run fails. Offline `--check` uses the target-tracking defaults of 3
+one-minute periods to scale out and 15 one-minute periods to scale in. A budget
+that cannot cover that plan is rejected before any job is submitted. The
+rationale and fixture identity are written to `planned-workload.json`. The
+fixture record is the file name, measured duration when ffprobe supplied one,
+size, and SHA-256 only. No later submission is permitted.
 
 API and CloudFront URLs in the handoff must be `https`. The frontend URL may be
 `https`, or `http` on `localhost`, `127.0.0.1`, or `::1`. `--check` makes no
@@ -224,7 +228,12 @@ SCALABILITY_E2E_ALLOW_LIVE=true \
 python app/scripts/run_scalability_e2e.py --full
 ```
 
-Live preflight reads AWS before submission. The handoff's own account, target,
+Live preflight probes the fixture with ffprobe before AWS submission. The file
+must contain a video stream whose display dimensions are at least 1280×720 in
+either orientation, and a positive duration. A smaller stream, a missing video
+stream, or unavailable ffprobe stops `--full` before jobs are created. Evidence
+uses that measured duration. The runner then reads AWS. The handoff's own
+account, target,
 cooldowns, image digests, and `distributed_mode` flag are not sufficient. The
 runner compares the caller account, requires the parent service to be steady at
 one running and desired task, and checks the worker image digest,
@@ -255,8 +264,12 @@ as `scalability`; ordinary `npm --prefix app/frontend run test:e2e` and the
 Reliability runner do not discover its scenarios.
 
 The scenario uploads the predetermined batch in parallel, then measures all of
-the following from the same jobs. Each checkpoint is `PASS`, `FAIL`, or
-`NOT RUN`. Overall status is `passed` only when every checkpoint is `PASS`:
+the following from the same jobs. A video created by `POST /videos` is recorded
+immediately. If the presigned upload then fails, that job stays in the evidence
+as `SUBMISSION_FAILED` with its video ID, job ID, and error so cleanup can see
+every run-owned job. Each checkpoint is `PASS`, `FAIL`, or `NOT RUN`. Overall
+status is `passed` only when every checkpoint is `PASS` and the measured
+submission time is within `submission_window_seconds`:
 
 - parent service running tasks move from 1 to at least 2
 - different parent tasks process different job IDs over overlapping log intervals

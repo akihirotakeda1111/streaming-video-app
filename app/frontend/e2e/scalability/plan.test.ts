@@ -38,6 +38,7 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
     worker_min_capacity: 1,
     worker_max_capacity: 4,
     backlog_per_worker_target: 3,
+    submission_window_seconds: 60,
     processing_seconds: 300,
     scale_out_cooldown_seconds: 180,
     scale_in_cooldown_seconds: 600,
@@ -92,8 +93,16 @@ describe('scalability offline plan', () => {
       batchSize: number
       inFlightMessages: number
       sustainedBacklogPerWorker: number
+      submissionWindowSeconds: number
+      requiredBudgetSeconds: number
     }
-    expect(steadyReport).toMatchObject({ batchSize: 5, inFlightMessages: 1, sustainedBacklogPerWorker: 4 })
+    expect(steadyReport).toMatchObject({
+      batchSize: 5,
+      inFlightMessages: 1,
+      sustainedBacklogPerWorker: 4,
+      submissionWindowSeconds: 60,
+      requiredBudgetSeconds: 2940,
+    })
 
     const wider = check(handoff({ worker_max_concurrency: 2 }))
     expect(wider.status, wider.stderr).toBe(0)
@@ -121,10 +130,15 @@ describe('scalability offline plan', () => {
     expect(short.stderr).toContain('runtime budget')
   })
 
-  it('rejects processing that ends before the scale-out evaluation window', () => {
-    const result = check(handoff({ processing_seconds: 30 }))
-    expect(result.status).toBe(2)
-    expect(result.stderr).toContain('scale-out evaluation')
+  it('rejects processing that ends before the submission window and scale-out evaluation', () => {
+    const early = check(handoff({ processing_seconds: 30 }))
+    expect(early.status).toBe(2)
+    expect(early.stderr).toContain('scale-out evaluation')
+    const overrun = check(handoff({ submission_window_seconds: 130 }))
+    expect(overrun.status).toBe(2)
+    expect(overrun.stderr).toContain('submission window')
+    const { submission_window_seconds: _window, ...withoutWindow } = handoff()
+    expect(check(withoutWindow).stderr).toContain('submission_window_seconds')
   })
 
   it('requires https for the API and CloudFront and allows loopback http for the frontend', () => {
@@ -203,6 +217,41 @@ except ValueError as error:
     })
     expect(disagree).toContain('metric periods disagree')
     expect(above).toContain('scale-in alarm threshold')
+  })
+})
+
+describe('fixture media probe', () => {
+  it('requires a video stream of at least 1280x720 and uses the measured duration', () => {
+    const result = spawnSync('python', ['-c', `
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import run_scalability_e2e as runner
+hd = runner.media_from_probe({
+  "streams": [{"codec_type": "video", "width": 1920, "height": 1080, "duration": "12.25"}],
+  "format": {"duration": "99"},
+})
+portrait = runner.media_from_probe({
+  "streams": [{"codec_type": "video", "width": 1080, "height": 1920, "tags": {"rotate": "-90"}}],
+  "format": {"duration": "30.5"},
+})
+print(json.dumps({"hd": hd, "portrait": portrait}))
+try:
+  runner.media_from_probe({"streams": [{"codec_type": "video", "width": 640, "height": 360, "duration": "10"}]})
+except ValueError as error:
+  print(error)
+try:
+  runner.media_from_probe({"streams": [{"codec_type": "video", "disposition": {"attached_pic": 1}, "width": 1920, "height": 1080}]})
+except ValueError as error:
+  print(error)
+`, scriptsDir], { encoding: 'utf8' })
+    expect(result.status, result.stderr ?? '').toBe(0)
+    const [reportLine, below, missing] = result.stdout.trim().split(/\r?\n/)
+    expect(JSON.parse(reportLine ?? '{}')).toEqual({
+      hd: { width: 1920, height: 1080, durationSeconds: 12.25 },
+      portrait: { width: 1920, height: 1080, durationSeconds: 30.5 },
+    })
+    expect(below).toContain('below 720p')
+    expect(missing).toContain('no video stream')
   })
 })
 

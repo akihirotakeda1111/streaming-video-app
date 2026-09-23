@@ -40,7 +40,7 @@ REQUIRED = {
     "playback_base_url", "cluster", "api_service", "worker_service", "parent_service",
     "step_functions_arn", "api_image_digest", "worker_image_digest",
     "distributed_mode", "parent_min_capacity", "input_bucket", "worker_max_concurrency",
-    "fixture_path", "fixture_duration_seconds", "worker_min_capacity",
+    "fixture_path", "fixture_duration_seconds", "submission_window_seconds", "worker_min_capacity",
     "worker_max_capacity", "backlog_per_worker_target", "processing_seconds",
     "scale_out_cooldown_seconds", "scale_in_cooldown_seconds", "runtime_budget_seconds",
 }
@@ -114,7 +114,8 @@ def _validate(config: dict[str, Any], live: bool) -> None:
     if config["distributed_mode"] is not True or config["parent_min_capacity"] != 1:
         raise ValueError("distributed mode and parent minimum capacity 1 are required")
     for name in ("backlog_per_worker_target", "processing_seconds", "runtime_budget_seconds",
-                 "scale_out_cooldown_seconds", "scale_in_cooldown_seconds", "fixture_duration_seconds"):
+                 "scale_out_cooldown_seconds", "scale_in_cooldown_seconds", "fixture_duration_seconds",
+                 "submission_window_seconds"):
         if isinstance(config[name], bool) or not isinstance(config[name], (int, float)) or config[name] <= 0:
             raise ValueError(f"{name} must be positive")
     fixture = Path(str(config["fixture_path"])).expanduser()
@@ -128,14 +129,124 @@ def _whole(value: float) -> int | float:
     return int(value) if float(value).is_integer() else value
 
 
-def fixture_record(path: Path, duration_seconds: float) -> dict[str, Any]:
+def fixture_record(path: Path, duration_seconds: float, media: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a portable fixture identity. The filesystem path is omitted."""
     record: dict[str, Any] = {"name": path.name, "durationSeconds": duration_seconds}
+    if media is not None:
+        record["durationSeconds"] = media["durationSeconds"]
+        record["width"] = media["width"]
+        record["height"] = media["height"]
     if path.is_file():
         data = path.read_bytes()
         record["sizeBytes"] = len(data)
         record["sha256"] = hashlib.sha256(data).hexdigest()
     return record
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    number = int(value)
+    return number if number > 0 else None
+
+
+def _quarter_turn(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return False
+    try:
+        rotation = abs(int(float(value))) % 360
+    except ValueError:
+        return False
+    return rotation in (90, 270)
+
+
+def _display_size(stream: dict[str, Any]) -> tuple[int, int]:
+    width = _positive_int(stream.get("width"))
+    height = _positive_int(stream.get("height"))
+    if width is None or height is None:
+        raise ValueError("fixture video stream has no resolution")
+    tags = stream.get("tags") if isinstance(stream.get("tags"), dict) else {}
+    turned = _quarter_turn(tags.get("rotate"))
+    side_data = stream.get("side_data_list")
+    if isinstance(side_data, list):
+        turned = turned or any(_quarter_turn(item.get("rotation")) for item in side_data if isinstance(item, dict))
+    if turned:
+        return height, width
+    return width, height
+
+
+def _positive_duration(*sources: object) -> float:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        raw = source.get("duration")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            continue
+        try:
+            duration = float(raw)
+        except ValueError:
+            continue
+        if duration > 0:
+            return round(duration, 3)
+    raise ValueError("fixture video stream has no duration")
+
+
+def _video_stream(probe: dict[str, Any]) -> dict[str, Any]:
+    streams = probe.get("streams")
+    if not isinstance(streams, list):
+        raise ValueError("fixture has no video stream")
+    for stream in streams:
+        if not isinstance(stream, dict) or stream.get("codec_type") != "video":
+            continue
+        disposition = stream.get("disposition")
+        if isinstance(disposition, dict) and disposition.get("attached_pic") in (1, True):
+            continue
+        return stream
+    raise ValueError("fixture has no video stream")
+
+
+def media_from_probe(probe: dict[str, Any]) -> dict[str, Any]:
+    """Accept a fixture only when a real video stream is at least 1280x720."""
+    stream = _video_stream(probe)
+    width, height = _display_size(stream)
+    if max(width, height) < 1280 or min(width, height) < 720:
+        raise ValueError(f"fixture video stream is {width}x{height}, below 720p")
+    format_info = probe.get("format") if isinstance(probe.get("format"), dict) else {}
+    return {
+        "width": width,
+        "height": height,
+        "durationSeconds": _positive_duration(stream, format_info),
+    }
+
+
+def probe_fixture(path: Path) -> dict[str, Any]:
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        raise ValueError("ffprobe is required to verify a 720p-or-higher fixture")
+    try:
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-print_format", "json",
+                "-show_streams", "-show_format", "-select_streams", "v", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError("ffprobe could not read the fixture video stream") from error
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ValueError("ffprobe could not read the fixture video stream")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("ffprobe could not read the fixture video stream") from error
+    if not isinstance(payload, dict):
+        raise ValueError("ffprobe could not read the fixture video stream")
+    return media_from_probe(payload)
 
 
 def _plan(config: dict[str, Any], scale_out_evaluation: float, scale_in_evaluation: float) -> dict[str, Any]:
@@ -145,6 +256,7 @@ def _plan(config: dict[str, Any], scale_out_evaluation: float, scale_in_evaluati
     if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
         raise ValueError("worker_max_concurrency must be a positive integer")
     processing = float(config["processing_seconds"])
+    submission_window = float(config["submission_window_seconds"])
     budget = float(config["runtime_budget_seconds"])
     scale_out_cooldown = float(config["scale_out_cooldown_seconds"])
     scale_in_cooldown = float(config["scale_in_cooldown_seconds"])
@@ -157,29 +269,34 @@ def _plan(config: dict[str, Any], scale_out_evaluation: float, scale_in_evaluati
     sustained = visible / capacity
     if count < 2 or sustained <= target:
         raise ValueError("batch does not keep visible backlog per worker above the scaling target")
-    if processing < scale_out_evaluation:
+    visible_after_submit = submission_window + scale_out_evaluation
+    if processing < visible_after_submit:
         raise ValueError(
-            "processing time is shorter than the scale-out evaluation window; "
-            f"need at least {scale_out_evaluation:g}s so backlog stays observable"
+            "processing time must cover the submission window and the scale-out evaluation window; "
+            f"need at least {visible_after_submit:g}s so backlog stays observable after uploads finish"
         )
-    # The fixed batch is uploaded together, so the submission window is one
-    # object upload. Scale-out is then sampled before a second worker joins.
-    # The remaining jobs drain on at least two workers. Scale-in waits out its
-    # own evaluation period and cooldown after that work finishes.
+    # Uploads run together, but the first object can start processing while the
+    # rest of the batch is still uploading. The submission window is that
+    # overlap. Scale-out is then sampled before a second worker joins. The
+    # remaining jobs drain on at least two workers. Scale-in waits out its own
+    # evaluation period and cooldown after that work finishes.
     drain = scale_out_evaluation + processing * math.ceil(count / 2)
-    required = drain + scale_out_cooldown + scale_in_evaluation + scale_in_cooldown + PLAYBACK_ALLOWANCE_SECONDS
+    required = (
+        submission_window + drain + scale_out_cooldown + scale_in_evaluation
+        + scale_in_cooldown + PLAYBACK_ALLOWANCE_SECONDS
+    )
     if required > budget:
         raise ValueError(
             f"runtime budget {budget:g}s cannot observe scale-out and scale-in; "
-            f"need at least {required:g}s for processing, cooldown, evaluation, and playback"
+            f"need at least {required:g}s for submission, processing, cooldown, evaluation, and playback"
         )
     rationale = (
         f"floor(target {target:g} * initial workers {capacity}) + 1 + "
         f"in-flight {in_flight} (workers {capacity} * concurrency {concurrency}) = {count}; "
         f"after the initial workers receive {in_flight} messages, visible backlog/worker "
         f"{sustained:g} exceeds {target:g}; "
-        f"the fixed batch is uploaded in parallel so the submission window is one object upload; "
-        f"processing {processing:g}s covers scale-out evaluation {scale_out_evaluation:g}s; "
+        f"parallel submission window {submission_window:g}s; "
+        f"processing {processing:g}s covers that window plus scale-out evaluation {scale_out_evaluation:g}s; "
         f"required budget {required:g}s fits within {budget:g}s"
     )
     return {
@@ -188,7 +305,7 @@ def _plan(config: dict[str, Any], scale_out_evaluation: float, scale_in_evaluati
         "rationale": rationale,
         "target": target,
         "submissionMode": "parallel",
-        "submissionWindow": "one concurrent upload of the predetermined batch",
+        "submissionWindowSeconds": _whole(submission_window),
         "inFlightMessages": in_flight,
         "sustainedVisibleBacklog": visible,
         "sustainedBacklogPerWorker": _whole(sustained),
@@ -222,6 +339,7 @@ def _check() -> int:
             "batchSize": plan["batchSize"],
             "inFlightMessages": plan["inFlightMessages"],
             "submissionMode": plan["submissionMode"],
+            "submissionWindowSeconds": plan["submissionWindowSeconds"],
             "sustainedBacklogPerWorker": plan["sustainedBacklogPerWorker"],
             "requiredBudgetSeconds": plan["requiredBudgetSeconds"],
             "rationale": plan["rationale"],
@@ -684,7 +802,8 @@ def _playwright(config: dict[str, Any], evidence: Path, plan: dict[str, Any], fi
         "SCALABILITY_BATCH_SIZE": str(plan["batchSize"]),
         "SCALABILITY_FIXTURE_PATH": str(Path(str(config["fixture_path"])).expanduser()),
         "SCALABILITY_FIXTURE_NAME": str(fixture["name"]),
-        "SCALABILITY_FIXTURE_DURATION_SECONDS": str(config["fixture_duration_seconds"]),
+        "SCALABILITY_FIXTURE_DURATION_SECONDS": str(fixture["durationSeconds"]),
+        "SCALABILITY_SUBMISSION_WINDOW_SECONDS": str(plan["submissionWindowSeconds"]),
         "SCALABILITY_RUNTIME_BUDGET_SECONDS": str(config["runtime_budget_seconds"]),
         "SCALABILITY_PLAYWRIGHT_TIMEOUT_MS": str(int((budget + EVIDENCE_FLUSH_SECONDS) * 1000)),
         "SCALABILITY_EVIDENCE_DIR": str(evidence),
@@ -701,6 +820,9 @@ def _playwright(config: dict[str, Any], evidence: Path, plan: dict[str, Any], fi
         env["SCALABILITY_FIXTURE_BYTES"] = str(fixture["sizeBytes"])
     if "sha256" in fixture:
         env["SCALABILITY_FIXTURE_SHA256"] = str(fixture["sha256"])
+    if "width" in fixture and "height" in fixture:
+        env["SCALABILITY_FIXTURE_WIDTH"] = str(fixture["width"])
+        env["SCALABILITY_FIXTURE_HEIGHT"] = str(fixture["height"])
     return subprocess.run(
         [node, str(CLI), "test", "--grep", "@scalability", "--project", "scalability", "--retries", "0"],
         cwd=ROOT / "app/frontend",
@@ -715,10 +837,17 @@ def _full(config: dict[str, Any]) -> int:
     evidence.mkdir(parents=True, exist_ok=False)
     batch_size = 0
     try:
+        fixture_path = Path(str(config["fixture_path"])).expanduser()
+        media = probe_fixture(fixture_path)
         observed = _preflight(config)
+        observed["summary"]["fixture"] = {
+            "width": media["width"],
+            "height": media["height"],
+            "durationSeconds": media["durationSeconds"],
+        }
         plan = _plan(config, float(observed["scaleOutEvaluationSeconds"]), float(observed["scaleInEvaluationSeconds"]))
         batch_size = int(plan["batchSize"])
-        fixture = fixture_record(Path(str(config["fixture_path"])).expanduser(), float(config["fixture_duration_seconds"]))
+        fixture = fixture_record(fixture_path, float(config["fixture_duration_seconds"]), media)
         recorded = {
             **plan,
             "recordedAt": _now(),

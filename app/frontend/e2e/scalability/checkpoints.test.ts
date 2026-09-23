@@ -246,5 +246,12 @@ describe('workload evidence', () => {
     const finalized = buildWorkloadDocument({ ...input, finalized: true })
     expect(finalized.finalized).toBe(true)
     expect(finalized.status).toBe('passed')
+    const slow = buildWorkloadDocument({
+      ...input,
+      finalized: true,
+      submission: { windowSeconds: 60, elapsedSeconds: 61, withinWindow: false },
+    })
+    expect(slow.status).toBe('failed')
+    expect(slow.submission).toMatchObject({ elapsedSeconds: 61, withinWindow: false })
   })
 })

@@ -38,6 +38,7 @@ interface Settings {
   stateMachineArn: string
   minimumCapacity: number
   inputBucket: string
+  submissionWindowSeconds: number
 }
 
 function required(name: string): string {
@@ -57,13 +58,17 @@ function readSettings(): Settings {
   const budgetSeconds = Number(required('SCALABILITY_RUNTIME_BUDGET_SECONDS'))
   const playwrightTimeoutMs = Number(required('SCALABILITY_PLAYWRIGHT_TIMEOUT_MS'))
   const durationSeconds = Number(required('SCALABILITY_FIXTURE_DURATION_SECONDS'))
+  const submissionWindowSeconds = Number(required('SCALABILITY_SUBMISSION_WINDOW_SECONDS'))
   const minimumCapacity = Number(process.env.SCALABILITY_MIN_CAPACITY ?? '1')
   if (!Number.isInteger(batchSize) || batchSize < 1) throw new Error('SCALABILITY_BATCH_SIZE must be a positive integer')
   if (!Number.isFinite(budgetSeconds) || budgetSeconds <= 0) throw new Error('SCALABILITY_RUNTIME_BUDGET_SECONDS must be positive')
   if (!Number.isInteger(playwrightTimeoutMs) || playwrightTimeoutMs <= 0) throw new Error('SCALABILITY_PLAYWRIGHT_TIMEOUT_MS must be a positive integer')
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new Error('SCALABILITY_FIXTURE_DURATION_SECONDS must be positive')
+  if (!Number.isFinite(submissionWindowSeconds) || submissionWindowSeconds <= 0) throw new Error('SCALABILITY_SUBMISSION_WINDOW_SECONDS must be positive')
   if (!Number.isInteger(minimumCapacity) || minimumCapacity < 1) throw new Error('SCALABILITY_MIN_CAPACITY must be a positive integer')
   const sizeBytes = Number(process.env.SCALABILITY_FIXTURE_BYTES)
+  const width = Number(process.env.SCALABILITY_FIXTURE_WIDTH)
+  const height = Number(process.env.SCALABILITY_FIXTURE_HEIGHT)
   const sha256 = process.env.SCALABILITY_FIXTURE_SHA256?.trim()
   return {
     fixturePath: required('SCALABILITY_FIXTURE_PATH'),
@@ -72,6 +77,8 @@ function readSettings(): Settings {
       durationSeconds,
       ...(Number.isInteger(sizeBytes) && sizeBytes > 0 ? { sizeBytes } : {}),
       ...(sha256 ? { sha256 } : {}),
+      ...(Number.isInteger(width) && width > 0 ? { width } : {}),
+      ...(Number.isInteger(height) && height > 0 ? { height } : {}),
     },
     batchSize,
     budgetMs: budgetSeconds * 1000,
@@ -85,6 +92,7 @@ function readSettings(): Settings {
     stateMachineArn: required('SCALABILITY_STATE_MACHINE_ARN'),
     minimumCapacity,
     inputBucket: required('SCALABILITY_INPUT_BUCKET'),
+    submissionWindowSeconds,
   }
 }
 
@@ -108,13 +116,27 @@ async function submit(request: APIRequestContext, bytes: Buffer, index: number, 
     job: { jobId: string }
     upload: { url: string; headers: Record<string, string> }
   }
-  const bucket = presignedUploadBucket(created.upload.url)
-  if (bucket !== inputBucket) {
-    throw new Error(`presigned upload bucket ${bucket ?? 'unknown'} does not match the dedicated input bucket ${inputBucket}`)
+  if (!created.videoId || !created.job?.jobId) throw new Error('video create did not return a job id')
+  const job: JobRecord = {
+    videoId: created.videoId,
+    jobId: created.job.jobId,
+    status: 'UPLOADING',
+    createdAt: created.createdAt || new Date().toISOString(),
   }
-  const upload = await request.put(created.upload.url, { headers: created.upload.headers, data: bytes })
-  if (!upload.ok()) throw new Error(`upload failed (${upload.status()})`)
-  return { videoId: created.videoId, jobId: created.job.jobId, status: 'UPLOADING', createdAt: created.createdAt }
+  try {
+    const bucket = presignedUploadBucket(created.upload?.url ?? '')
+    if (bucket !== inputBucket) {
+      throw new Error(`presigned upload bucket ${bucket ?? 'unknown'} does not match the dedicated input bucket ${inputBucket}`)
+    }
+    const upload = await request.put(created.upload.url, { headers: created.upload.headers, data: bytes })
+    if (!upload.ok()) throw new Error(`upload failed (${upload.status()})`)
+    return job
+  } catch (error) {
+    job.status = 'SUBMISSION_FAILED'
+    const message = error instanceof Error ? error.message : 'upload failed'
+    job.error = /https?:\/\//i.test(message) || message.includes('X-Amz-') ? 'upload failed' : message
+    return job
+  }
 }
 
 async function refreshJob(request: APIRequestContext, job: JobRecord): Promise<void> {
@@ -140,7 +162,7 @@ async function refreshJob(request: APIRequestContext, job: JobRecord): Promise<v
 }
 
 function terminal(status: string): boolean {
-  return status === 'COMPLETED' || status === 'FAILED' || status === 'TIMED_OUT'
+  return status === 'COMPLETED' || status === 'FAILED' || status === 'TIMED_OUT' || status === 'SUBMISSION_FAILED'
 }
 
 test.describe('@scalability', () => {
@@ -161,6 +183,7 @@ test.describe('@scalability', () => {
       let playbackAttempted = false
       let failure: string | undefined
       let finalWriteError: string | undefined
+      let submission: { windowSeconds: number; elapsedSeconds: number; withinWindow: boolean } | undefined
       const forbidden = [active.fixturePath]
       const snapshot = (finalized: boolean) => buildWorkloadDocument({
         attempted: true,
@@ -177,6 +200,7 @@ test.describe('@scalability', () => {
         fixture: active.fixture,
         playbackDetails: playback,
         ...(failure ? { error: failure } : {}),
+        ...(submission ? { submission } : {}),
         finalized,
         forbiddenPaths: forbidden,
       })
@@ -214,13 +238,31 @@ test.describe('@scalability', () => {
         }
         if (bytes) {
           const payload = bytes
+          const submissionStarted = Date.now()
           const results = await Promise.allSettled(Array.from({ length: active.batchSize }, (_, index) => (
             submit(request, payload, index, active.inputBucket)
           )))
+          const elapsedSeconds = (Date.now() - submissionStarted) / 1000
+          const errors: string[] = []
           for (const result of results) {
-            if (result.status === 'fulfilled') jobs.push(result.value)
-            else failure = safeMessage(result.reason, forbidden)
+            if (result.status === 'fulfilled') {
+              jobs.push(result.value)
+              if (result.value.status === 'SUBMISSION_FAILED') {
+                errors.push(`${result.value.jobId}: ${result.value.error ?? 'submission failed'}`)
+              }
+            } else {
+              errors.push(safeMessage(result.reason, forbidden))
+            }
           }
+          submission = {
+            windowSeconds: active.submissionWindowSeconds,
+            elapsedSeconds,
+            withinWindow: elapsedSeconds <= active.submissionWindowSeconds,
+          }
+          if (!submission.withinWindow) {
+            errors.push(`batch submission took ${elapsedSeconds}s, above the planned submission window of ${active.submissionWindowSeconds}s`)
+          }
+          if (errors.length > 0) failure = errors.join('; ')
         }
         await publish(false)
         if (jobs.length > 0) {

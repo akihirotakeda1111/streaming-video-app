@@ -48,6 +48,14 @@ export interface FixtureIdentity {
   durationSeconds: number
   sizeBytes?: number
   sha256?: string
+  width?: number
+  height?: number
+}
+
+export interface SubmissionObservation {
+  windowSeconds: number
+  elapsedSeconds: number
+  withinWindow: boolean
 }
 
 export interface WorkloadDocument {
@@ -67,6 +75,7 @@ export interface WorkloadDocument {
   playback?: unknown
   observationErrors: string[]
   finalized: boolean
+  submission?: SubmissionObservation
   error?: string
 }
 
@@ -77,6 +86,7 @@ export function buildWorkloadDocument(
     playbackDetails?: unknown
     error?: string
     finalized?: boolean
+    submission?: SubmissionObservation
     forbiddenPaths?: readonly string[]
   },
 ): WorkloadDocument {
@@ -84,10 +94,11 @@ export function buildWorkloadDocument(
   const incompleteJobIds = input.jobs.filter((job) => job.status !== 'COMPLETED').map((job) => job.jobId)
   const finalized = input.finalized === true
   const acceptance = overallStatus(checkpoints)
+  const submissionOk = input.submission?.withinWindow !== false
   const document: WorkloadDocument = {
     scenario: 'scalability',
     finalized,
-    status: finalized ? acceptance : 'failed',
+    status: finalized && submissionOk ? acceptance : 'failed',
     startedAt: input.startedAt,
     observedAt: new Date().toISOString(),
     batchSize: input.batchSize,
@@ -101,6 +112,7 @@ export function buildWorkloadDocument(
     childIntervals: [...input.childIntervals],
     ...(input.playbackDetails !== undefined ? { playback: input.playbackDetails } : {}),
     observationErrors: [...input.observationErrors],
+    ...(input.submission ? { submission: input.submission } : {}),
     ...(input.error ? { error: input.error } : {}),
   }
   return sanitizeEvidence(document, input.forbiddenPaths ?? [])
