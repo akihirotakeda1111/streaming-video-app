@@ -283,7 +283,7 @@ submission time is within `submission_window_seconds`:
 - at least one job has distinct 360p and 720p child task ARNs whose Step Functions and ECS intervals overlap
 - every submitted job reaches API `COMPLETED`
 - after that completion, the parent service returns to its configured minimum
-- the completed output plays through the installed video.js player on the frontend origin, including master, 360p, and 720p playlist and segment requests, decoded `readyState`, advancing `currentTime`, and a rendition switch selected by the `360p` or `720p` playlist or representation path
+- the completed output plays through the installed video.js player on the frontend origin, including master, 360p, and 720p playlist and segment requests, decoded `readyState`, advancing `currentTime`, and a rendition switch selected by the `360p` or `720p` playlist or representation path. The switch is confirmed only after a `.ts`, `.m4s`, or `.mp4` media segment for that rendition is requested
 
 `workload.json` is updated while observations progress. Those intermediate
 writes are best-effort, keep `finalized: false`, and never record overall

@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module'
 import { expect, type Page, type Request } from '@playwright/test'
 import type { PlaybackSummary } from './checkpoints.js'
-import { isPlaybackMediaRequest, summarizePlayback } from './urls.js'
+import { isPlaybackMediaRequest, isRenditionMediaSegment, summarizePlayback } from './urls.js'
 
 type RenditionToken = '360p' | '720p'
 
@@ -147,11 +147,9 @@ async function selectAndWait(
   const from = requests.length
   const selected = await inspectRenditions(page, token)
   if (selected.matched < 1) throw new Error(`video.js could not select the ${token} rendition`)
-  await expect.poll(() => requests.slice(from).some((request) => (
-    request.path.split('/').includes(token) && /\.(m3u8|ts|m4s|mp4)$/i.test(request.path)
-  )), {
+  await expect.poll(() => requests.slice(from).some((request) => isRenditionMediaSegment(request.path, token)), {
     timeout: remaining(),
-    message: `video.js did not request the ${token} rendition after the switch`,
+    message: `video.js did not request a ${token} media segment after the switch`,
   }).toBe(true)
 }
 

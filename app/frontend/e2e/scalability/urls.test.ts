@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { remainingPlaybackTimeout } from './playback.js'
-import { apiUrl, classifyPlaybackPath, isPlaybackMediaRequest, presignedUploadBucket, renditionToken, summarizePlayback } from './urls.js'
+import { apiUrl, classifyPlaybackPath, isPlaybackMediaRequest, isRenditionMediaSegment, presignedUploadBucket, renditionToken, summarizePlayback } from './urls.js'
 
 describe('scalability API URLs', () => {
   it('keeps a configured /api/v1 prefix', () => {
@@ -77,5 +77,10 @@ describe('CloudFront playback requests', () => {
       segment720: true,
     })
     expect(classifyPlaybackPath('/videos/job/hls/360p/index.m3u8', manifest).master).toBe(false)
+    expect(isRenditionMediaSegment('/videos/job/hls/720p/index.m3u8', '720p')).toBe(false)
+    expect(isRenditionMediaSegment('/videos/job/hls/720p/segment-00001.ts', '720p')).toBe(true)
+    expect(isRenditionMediaSegment('/videos/job/hls/720p/segment-00001.m4s', '720p')).toBe(true)
+    expect(isRenditionMediaSegment('/videos/job/hls/360p/init.mp4', '360p')).toBe(true)
+    expect(isRenditionMediaSegment('/videos/job/hls/360p/segment-00001.ts', '720p')).toBe(false)
   })
 })

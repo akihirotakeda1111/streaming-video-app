@@ -108,6 +108,12 @@ export interface PlaybackPathClasses {
 
 const SEGMENT = /\.(ts|m4s|mp4)$/i
 
+/** A rendition switch counts only after a media segment for that rendition is requested. */
+export function isRenditionMediaSegment(pathname: string, rendition: '360p' | '720p'): boolean {
+  const path = pathname.split(/[?#]/, 1)[0] ?? pathname
+  return path.split('/').includes(rendition) && SEGMENT.test(path)
+}
+
 export function classifyPlaybackPath(pathname: string, manifestPath: string): PlaybackPathClasses {
   const manifest = manifestPath.split(/[?#]/, 1)[0] ?? manifestPath
   const segments = pathname.split('/')
