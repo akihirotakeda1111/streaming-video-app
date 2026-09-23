@@ -280,7 +280,7 @@ its duration/content on the deployed Worker image and task CPU/memory:
 mkdir -p "$SCALABILITY_RUNTIME/fixtures"
 export FIXTURE_PATH="$SCALABILITY_RUNTIME/fixtures/scalability-720p.mp4"
 ffmpeg -f lavfi -i 'testsrc2=size=1280x720:rate=30' -t 150 \
-  -c:v libx264 -preset fast -crf 35 -pix_fmt yuv420p -an -movflags +faststart \
+  -c:v libx264 -preset fast -crf 50 -pix_fmt yuv420p -an -movflags +faststart \
   "$FIXTURE_PATH"
 chmod 600 "$FIXTURE_PATH"
 ffprobe -v error -select_streams v:0 \
