@@ -280,7 +280,7 @@ its duration/content on the deployed Worker image and task CPU/memory:
 mkdir -p "$SCALABILITY_RUNTIME/fixtures"
 export FIXTURE_PATH="$SCALABILITY_RUNTIME/fixtures/scalability-720p.mp4"
 ffmpeg -f lavfi -i 'testsrc2=size=1280x720:rate=30' -t 150 \
-  -c:v libx264 -preset fast -crf 35 -pix_fmt yuv420p -an -movflags +faststart \
+  -c:v libx264 -preset fast -crf 50 -pix_fmt yuv420p -an -movflags +faststart \
   "$FIXTURE_PATH"
 chmod 600 "$FIXTURE_PATH"
 ffprobe -v error -select_streams v:0 \
@@ -336,6 +336,55 @@ frontend can be used instead, with its API URL and both roots' CORS origins
 configured consistently. The runner does not start the frontend.
 
 ### Create the handoff JSON
+
+#### Automated read-only setup (recommended)
+
+After deployment, fixture calibration and frontend startup, source the setup
+wrapper from WSL/Linux. It uses the runtime layout above, with the initialized
+local backends and literal values in the private tfvars files:
+
+```bash
+source app/scripts/setup_scalability_env.sh \
+  --runtime "$SCALABILITY_RUNTIME" \
+  --account 123456789012 \
+  --api-url "$API_URL" \
+  --frontend-url "$FRONTEND_URL" \
+  --fixture "$FIXTURE_PATH"
+```
+
+Replace the account with the expected dedicated account. Optional arguments are
+`--profile NAME`, `--submission-window-seconds 60`, and
+`--runtime-budget-seconds 3600`. The setup checks Node, Python, AWS CLI,
+Terraform, ffmpeg and ffprobe; both private backend/state/data directories;
+allowlisted Terraform outputs; STS account; Task 89 fixed tfvars; video
+resolution/duration; frontend/API reachability; and exact-origin API CORS.
+It calls `generate_scalability_env.mjs`'s shared discovery/generation functions
+and runs `python app/scripts/run_scalability_e2e.py --check` against a temporary
+handoff before publishing `handoff.json`. It never calls Terraform init/apply,
+changes AWS, starts services, installs dependencies, or submits workload.
+Docker/npm/jq/curl remain prerequisites for the separate deployment/manual
+steps, not for this setup. Install Playwright dependencies/browser as above
+before the live run.
+
+Only successful setup exports `SCALABILITY_RUNTIME`, `SCALABILITY_E2E_CONFIG`,
+`AWS_REGION`, `AWS_DEFAULT_REGION`, `SCALABILITY_E2E_EVIDENCE_ROOT` and, when
+explicitly selected, `AWS_PROFILE` into the current shell. It does not enable
+live execution or select/create a per-run evidence directory. Use the exported
+evidence root to choose a fresh directory for each `--full` run as below.
+Failure leaves the shell unchanged and suppresses child-command diagnostics
+that could contain secrets. An identical existing handoff can be reused;
+a different existing handoff is preserved and blocks setup. Review and move
+that handoff to a retained backup before deliberately regenerating it.
+
+For generation alone, use `node app/scripts/generate_scalability_env.mjs` with
+the same arguments. This writes a new private `handoff.json` without shell
+exports or network health checks and refuses to overwrite any existing file.
+Neither ffprobe nor `--check` proves 300-second processing calibration or live
+AWS configuration; those still require the calibration and `--full` checks.
+All generated configuration stays in the private runtime, never in evidence
+or source control. The scripts read only named non-secret Terraform outputs.
+
+#### Manual alternative
 
 After the full apply and startup, export the non-secret delivery and compute
 outputs using the same initialized backend and data directories:
