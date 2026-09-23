@@ -4,7 +4,7 @@
 
 このリポジトリは、ストリーミング動画アプリケーションと、その実装作業をMarkdownのTask Specから実行するオーケストレーターを含むモノレポです。
 
-アプリケーションは個人開発、自己学習、ポートフォリオを目的としています。Phase 2では、動画アップロードからHLS再生までのPhase 1に加え、lease・heartbeat・再試行・DLQ・キュー監視とReliability E2Eを実装しています。
+アプリケーションは個人開発、自己学習、ポートフォリオを目的としています。`dev/phase3` では、動画アップロード・HLS再生とPhase 2の信頼性機能に加え、CloudFront + OAC、private Output S3、Fargate / RDS、Worker Auto Scaling、Step Functionsによる分散エンコード・ABR、Scalability E2Eを実装しています。
 
 ```text
 Browser
@@ -12,9 +12,11 @@ Browser
   -> Input S3へ直接upload
   -> S3 ObjectCreated notification
   -> SQS
-  -> Rust Worker / FFmpeg
-  -> Output S3へHLSを配置
-  -> Frontend / video.jsで再生
+  -> Rust Worker（lease・heartbeat・再試行）
+     -> cli: Worker内でFFmpegを実行
+     -> distributed: Step Functions -> Fargate encoders（360p / 720p）
+  -> private Output S3へHLSを配置、DBで公開を確定
+  -> CloudFront / OAC -> Frontend / video.jsで再生
 ```
 
 アプリケーションのアーキテクチャ、状態遷移、S3 object layout、環境変数、起動方法、テスト、Phaseごとの範囲は [app/README.md](./app/README.md) を参照してください。
@@ -31,7 +33,7 @@ Browser
 | `pyproject.toml` | Pythonオーケストレーターのpackage・dependency・lint設定 |
 | `.coderabbit.yaml` | CodeRabbitのrepository設定 |
 
-`specs/tasks/` にはPhase 1の38件とPhase 2の20件のTask Specがあります。実装済み機能と将来計画は以下のPhase Scopeを参照してください。
+`specs/tasks/` にはPhase 1〜3のTask Specがあります。実装済み機能と未対応範囲は以下のPhase Scopeを参照してください。
 
 ## Application
 
@@ -39,7 +41,7 @@ Browser
 
 API process内で動画を同期変換せず、upload、job管理、queue consumption、encoding、playbackを別の責務として実装しています。
 
-Frontend、Go API、Rust Worker、PostgreSQLをローカルで実行し、S3、SQS/DLQ、IAM、CloudWatchアラームは実AWSを利用します。CloudFrontは使用せず、ブラウザがOutput S3のHLS objectsをCORS経由で直接取得します。
+ローカルComposeではFrontend、Go API、Rust Worker、PostgreSQLを起動し、S3、SQS/DLQ、CloudFrontは実AWSを利用します。クラウド用TerraformではAPI・Worker・encoderをECS/Fargate、PostgreSQLをprivate RDSに配置します。Frontendのホスティングは別途用意します。
 
 ### Components
 
@@ -47,9 +49,9 @@ Frontend、Go API、Rust Worker、PostgreSQLをローカルで実行し、S3、S
 | --- | --- | --- |
 | Frontend | MP4選択、S3 direct upload、status polling、HLS playback | Vue 3、TypeScript、Vite、video.js |
 | Go API | video/job作成、Presigned PUT URL、status、playback情報 | Go、AWS SDK for Go v2、pgx |
-| Rust Worker | SQS受信、lease・heartbeat、再試行、FFmpeg、job状態更新 | Rust、Tokio、AWS SDK for Rust、FFmpeg |
-| PostgreSQL | video metadata、job status、lease所有者・期限・試行回数 | PostgreSQL 16 |
-| Infra | Input/Output S3、SQS/DLQ、IAM、CORS、CloudWatchアラーム | Terraform、AWS |
+| Rust Worker | SQS受信、lease・heartbeat、再試行、FFmpeg / 分散処理、公開確定 | Rust、Tokio、AWS SDK for Rust、FFmpeg |
+| PostgreSQL | video metadata、job status、lease・attempt、処理mode・公開manifest key | PostgreSQL 16 / RDS |
+| Infra | S3、SQS/DLQ、CloudFront/OAC、ECS/Fargate、RDS、Step Functions、Auto Scaling | Terraform、AWS |
 | Contracts | REST API、job statuses、S3/HLS conventions、examples | OpenAPI 3.1、JSON Schema、Markdown |
 
 公開APIのjob statusesは次の5つを維持します。再試行可能な失敗ではPROCESSINGからQUEUEDへ戻り、試行上限に達した失敗をFAILEDにします。
@@ -60,7 +62,7 @@ UPLOADING -> QUEUED -> PROCESSING -> COMPLETED
              QUEUED <- PROCESSING (retry)
 ```
 
-Input S3とOutput S3は分離されています。WorkerはHLS segmentsを先にuploadし、`index.m3u8` を最後にuploadしてからjobを `COMPLETED` にします。
+Input S3とOutput S3は分離されています。`cli` は単一品質HLSを生成します。`distributed` は最大2つのrenditionを並列生成し、親Workerが子の成果物を検証してmaster playlistを最後に公開します。公開manifest keyと `COMPLETED` の確定後にSQSをackします。配信はCloudFront経由で、Output S3への匿名アクセスと内部 `result.json` の配信は拒否します。
 
 詳細:
 
@@ -70,6 +72,10 @@ Input S3とOutput S3は分離されています。WorkerはHLS segmentsを先に
 - [Storage conventions](./app/contracts/domain/storage-conventions.md)
 - [Reliability contract](./app/contracts/domain/reliability-conventions.md)
 - [Reliability E2E運用ガイド](./app/frontend/e2e/reliability/runner.md)
+- [Scalability contract](./app/contracts/domain/scalability-conventions.md)
+- [Cloud runtime](./app/docs/runbooks/cloud-runtime.md)
+- [Distributed encoding](./app/docs/runbooks/distributed-encoding.md)
+- [Scalability E2E](./app/docs/runbooks/scalability-e2e.md)
 - [Architecture decision](./app/docs/adr/adr-001-video-streaming-mvp-architecture.md)
 
 ## Task Specs
@@ -148,13 +154,13 @@ Frontend、Go API、Rust Worker、E2Eに必要なtoolchainは、Task Specの `al
 
 [`.github/workflows/merge-tests.yml`](./.github/workflows/merge-tests.yml) は `main` または `dev` で始まるブランチの `app/**` 変更時、またはmanual dispatchで実行されます。
 
-- Contracts: API・storage・reliabilityyの静的検証
+- Contracts: API・storage・reliability・scalabilityとTerraform orchestration構成の静的検証
 - Frontend: dependency install、unit tests、build
 - Go API: `go test ./...`
 - Rust Worker: Cargo workspace tests
 - E2E: helper tests、Compose runtime、Playwrightによる実パイプライン確認
 
-変更pathに応じて必要なjobだけを実行します。障害注入を伴うReliability E2Eの実環境シナリオは専用環境で手動実行します。
+変更pathに応じて必要なjobだけを実行します。Reliability E2Eの障害注入とScalability E2Eの実AWS負荷試験は、それぞれの専用環境で手動実行します。
 
 ## Repository Structure
 
@@ -165,8 +171,9 @@ streaming-video-app/
 │   ├── backend/
 │   │   ├── api/                 # Go API
 │   │   └── worker/              # Rust Worker
-│   ├── infra/terraform/         # S3 / SQS / DLQ / IAM / alarms
-│   ├── infra/terraform-e2e/     # Reliability E2E専用AWS環境
+│   ├── infra/terraform/         # S3 / SQS / DLQ / CloudFront / IAM / alarms
+│   ├── infra/terraform-compute/ # VPC / RDS / ECS / Step Functions / scaling
+│   ├── infra/terraform-e2e/     # Reliability E2E（scalability/ は別環境）
 │   ├── contracts/               # OpenAPI、job status、storage conventions
 │   ├── docs/                    # ADRとrunbook
 │   ├── scripts/                 # contract validationとE2E起動
@@ -191,6 +198,8 @@ streaming-video-app/
 Docker Composeによる起動、AWS prerequisites、環境変数、component単位のtest、Full E2E手順は [app/README.md](./app/README.md#local-development--setup) を参照してください。
 
 Reliability E2E専用AWS環境、認証、統合セットアップ、障害注入テストは [Reliability E2E運用ガイド](./app/frontend/e2e/reliability/runner.md) に集約しています。統合セットアップはWorker・DB・API・Frontendの起動とE2E設定のシェル反映を行います。
+
+クラウド配置は [Cloud runtime](./app/docs/runbooks/cloud-runtime.md)、分散処理と負荷試験の専用環境は [Scalability E2E runbook](./app/docs/runbooks/scalability-e2e.md) を参照してください。Scalability E2Eはdelivery / computeのstateを分離し、配備済み環境のhandoffを使って検証します。
 
 ### Orchestrator
 
@@ -234,6 +243,7 @@ E2Eは次のrepository variablesを使用します。
 - `VIDEO_ENCODING_QUEUE_URL`
 - `VIDEO_INPUT_BUCKET`
 - `VIDEO_OUTPUT_BUCKET`
+- `PLAYBACK_BASE_URL`（対象Output bucketを配信するCloudFront HTTPS origin）
 
 FrontendにはAWS credentialsを渡しません。APIとWorkerのcredentialsは分離されています。
 
@@ -241,7 +251,7 @@ FrontendにはAWS credentialsを渡しません。APIとWorkerのcredentialsは�
 
 ### Phase 1
 
-現在実装されている範囲です。
+基礎パイプラインとして実装した範囲です。配信方式はPhase 3でCloudFrontへ移行しています。
 
 - BrowserからInput S3へのdirect upload
 - S3 ObjectCreatedからSQSへのnotification
@@ -263,24 +273,34 @@ FrontendにはAWS credentialsを渡しません。APIとWorkerのcredentialsは�
 - 重複配送、crash recovery、長時間heartbeat、試行上限、poison隔離、監視と最終再生のE2E
 - 専用Terraform/Compose環境、統合セットアップ、証跡・復旧runbook
 
+### Phase 3 — implemented delivery and scalability
+
+- CloudFront + OAC、private Output S3、内部result JSONの配信拒否
+- 公開manifest keyを解決するAPI、CloudFront配信・S3直アクセス拒否のE2E
+- VPC、private Single-AZ RDS、HTTPS ALB配下のAPI、Fargate Worker、migration task
+- Workerのリソース制限、TLS接続、SIGTERM対応、ECS task protection、CloudWatch logs
+- 可視SQS backlog / running Worker tasksによるAuto Scaling（初期範囲1〜4）
+- Standard Step Functionsと最大2つのFargate encoderによる360p / 720pのrendition並列処理
+- attempt別出力、成果物検証、ABR masterの最終公開、owner / attempt条件付き完了確定
+- 独立したScalability E2E環境、セットアップ、負荷・並列処理・scale-in・ABR再生の検証と証跡
+
 ### Future scope
 
 以下は未実装です。
 
-- CloudFront + OAC、private Output S3
-- API、Worker、PostgreSQLのAWS deployment
-- Step Functions、distributed encoding、Auto Scaling
-- ABR、複数renditions、FFmpeg C APIによる最適化
+- FrontendのAWSホスティング、viewer認証・署名付き配信
+- segment単位の分散処理、AWS Batch、scale-to-zero
+- FFmpeg C API / libav FFIによる最適化（現在はFFmpeg CLI）
 
 ## Current Limitations
 
-- 入力は空でないMP4 1ファイル、最大5 GiBです。
-- HLSはH.264/AAC、MPEG-TSの単一品質です。
+- APIは空でないMP4 1ファイル、最大5 GiBを受け付けますが、Workerのsource上限は既定64 MiBです。処理可能範囲はWorker設定にも制約されます。
+- HLSはH.264/AAC、MPEG-TSです。`cli` は単一品質、`distributed` は固定の360p / 720pで、upscaleは行いません。
 - Authentication、user management、authorizationはありません。
-- Phase 1のOutput HLS prefixはpublic `s3:GetObject` を使用します。
+- Output S3はprivateですが、CloudFrontのviewer配信は公開HTTPSです。APIの未完了時409応答はアクセス認可ではありません。
 - crash後の復旧はSQS再配送と残り試行回数が前提です。全ジョブを巡回する自動修復やDLQ自動再投入はありません。
 - SQS受信回数とDB試行回数は異なり、DLQ移動だけでは非終端ジョブの状態は更新されません。
-- Application computeとPostgreSQLはTerraform管理されていません。
+- Frontendホスティング、DNS・証明書、DB application secretの準備は運用者が行います。
 - Terraform CLIによるinit、validate、plan、applyはAgent pipelineの対象外です。
 - Full E2Eには設定済みの実AWS resourcesと専用credentialsが必要です。
 
