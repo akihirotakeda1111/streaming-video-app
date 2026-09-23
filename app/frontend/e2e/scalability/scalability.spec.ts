@@ -4,7 +4,7 @@ import { e2eConfig } from '../config.js'
 import { type JobRecord, type ServiceSample } from './checkpoints.js'
 import { buildWorkloadDocument, notRunDocument, sanitizeEvidence, writeWorkload, type FixtureIdentity, type WorkloadDocument } from './evidence.js'
 import { parentActivities, sampleParentService, startLiveObserver, type LiveObserver } from './observe.js'
-import { proveAbrPlayback, type PlaybackProof } from './playback.js'
+import { proveAbrPlayback, remainingPlaybackTimeout, type PlaybackProof } from './playback.js'
 import { apiUrl, presignedUploadBucket } from './urls.js'
 
 function failedPlayback(error: string): PlaybackProof {
@@ -236,8 +236,20 @@ test.describe('@scalability', () => {
         } catch (error) {
           failure = safeMessage(error, forbidden)
         }
+        let deadline = 0
         if (bytes) {
           const payload = bytes
+          deadline = Date.now() + active.budgetMs
+          observer = startLiveObserver({
+            region: active.region,
+            account: active.account,
+            cluster: active.cluster,
+            service: active.service,
+            stateMachineArn: active.stateMachineArn,
+            jobIds: () => jobs.map((job) => job.jobId),
+            samples,
+            deadlineMs: deadline,
+          })
           const submissionStarted = Date.now()
           const results = await Promise.allSettled(Array.from({ length: active.batchSize }, (_, index) => (
             submit(request, payload, index, active.inputBucket)
@@ -266,16 +278,6 @@ test.describe('@scalability', () => {
         }
         await publish(false)
         if (jobs.length > 0) {
-          observer = startLiveObserver({
-            region: active.region,
-            account: active.account,
-            cluster: active.cluster,
-            service: active.service,
-            stateMachineArn: active.stateMachineArn,
-            jobIds: () => jobs.map((job) => job.jobId),
-            samples,
-          })
-          const deadline = Date.now() + active.budgetMs
           while (Date.now() < deadline) {
             for (const job of jobs) {
               if (terminal(job.status)) continue
@@ -291,7 +293,13 @@ test.describe('@scalability', () => {
                   const body = await playbackResponse.json() as { manifestUrl?: string; jobId?: string }
                   if (body.jobId !== completed.jobId) throw new Error('playback response job id did not match the completed job')
                   if (!body.manifestUrl) throw new Error('playback response did not include a manifest URL')
-                  playback = await proveAbrPlayback(page, e2eConfig.frontendUrl, body.manifestUrl, active.playbackBaseUrl, e2eConfig.timeouts.playback)
+                  playback = await proveAbrPlayback(
+                    page,
+                    e2eConfig.frontendUrl,
+                    body.manifestUrl,
+                    active.playbackBaseUrl,
+                    remainingPlaybackTimeout(e2eConfig.timeouts.playback, deadline, Date.now()),
+                  )
                 } catch (error) {
                   playback = failedPlayback(safeMessage(error, forbidden))
                 }
@@ -310,7 +318,9 @@ test.describe('@scalability', () => {
             ))
             if (allTerminal && playbackAttempted && (!allCompleted || scaledIn)) break
             if (allTerminal && !jobs.some((job) => job.status === 'COMPLETED')) break
-            await sleep(2_000)
+            const pause = Math.min(2_000, deadline - Date.now())
+            if (pause <= 0) break
+            await sleep(pause)
           }
           for (const job of jobs) {
             if (terminal(job.status)) continue

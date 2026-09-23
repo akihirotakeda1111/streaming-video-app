@@ -257,8 +257,12 @@ alarm periods replace the offline evaluation defaults, and the batch plan is
 checked again against those periods. `preflight.json` records the non-secret
 observation.
 
-The Playwright project timeout is the runtime budget plus two minutes so the
-scenario can wait through scale-in and still write evidence. Other Playwright
+The runtime budget deadline is fixed before submission starts. Scale-out
+sampling, job completion, playback, and scale-in all use that same instant.
+Playback waits no longer than the playback timeout or the time remaining until
+the deadline, whichever is shorter. The Playwright project timeout is the
+runtime budget plus two minutes so evidence can still be written after the
+deadline. Other Playwright
 projects keep their existing timeout. The live project is explicitly selected
 as `scalability`; ordinary `npm --prefix app/frontend run test:e2e` and the
 Reliability runner do not discover its scenarios.

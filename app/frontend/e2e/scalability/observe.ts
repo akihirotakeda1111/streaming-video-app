@@ -183,6 +183,7 @@ export function startLiveObserver(options: {
   stateMachineArn: string
   jobIds: () => readonly string[]
   samples: ServiceSample[]
+  deadlineMs: number
   intervalMs?: number
 }): LiveObserver {
   const hits: LogHit[] = []
@@ -245,10 +246,11 @@ export function startLiveObserver(options: {
   }
 
   const loop = async () => {
-    while (!stopped) {
+    while (!stopped && Date.now() < options.deadlineMs) {
       await tick()
-      if (stopped) break
-      await pause(options.intervalMs ?? 15_000)
+      if (stopped || Date.now() >= options.deadlineMs) break
+      const interval = options.intervalMs ?? 15_000
+      await pause(Math.min(interval, options.deadlineMs - Date.now()))
     }
   }
   tail = loop()

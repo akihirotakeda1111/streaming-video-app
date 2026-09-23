@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { remainingPlaybackTimeout } from './playback.js'
 import { apiUrl, classifyPlaybackPath, isPlaybackMediaRequest, presignedUploadBucket, renditionToken, summarizePlayback } from './urls.js'
 
 describe('scalability API URLs', () => {
@@ -20,6 +21,15 @@ describe('presigned upload buckets', () => {
     expect(presignedUploadBucket('https://sv-scale-e2e-test.s3.amazonaws.com/key')).toBe('sv-scale-e2e-test')
     expect(presignedUploadBucket('https://my.bucket.s3.dualstack.us-east-1.amazonaws.com/key')).toBe('my.bucket')
     expect(presignedUploadBucket('https://evil.example.com/sv-scale-e2e-test/key')).toBeUndefined()
+  })
+})
+
+describe('runtime budget playback cap', () => {
+  it('limits playback to the time remaining before the absolute deadline', () => {
+    expect(remainingPlaybackTimeout(120_000, 10_000, 4_000)).toBe(6_000)
+    expect(remainingPlaybackTimeout(5_000, 10_000, 4_000)).toBe(5_000)
+    expect(remainingPlaybackTimeout(120_000, 10_000, 10_000)).toBe(0)
+    expect(remainingPlaybackTimeout(120_000, 10_000, 11_000)).toBe(0)
   })
 })
 

@@ -13,6 +13,13 @@ export interface PlaybackProof extends PlaybackSummary {
   requests: string[]
 }
 
+/** Cap playback at the configured timeout and the time left until the run deadline. */
+export function remainingPlaybackTimeout(playbackTimeoutMs: number, deadlineMs: number, nowMs: number): number {
+  if (!Number.isFinite(playbackTimeoutMs) || playbackTimeoutMs <= 0) return 0
+  if (!Number.isFinite(deadlineMs) || !Number.isFinite(nowMs)) return 0
+  return Math.min(playbackTimeoutMs, Math.max(0, deadlineMs - nowMs))
+}
+
 export async function proveAbrPlayback(
   page: Page,
   frontendUrl: string,
@@ -21,7 +28,11 @@ export async function proveAbrPlayback(
   timeoutMs: number,
 ): Promise<PlaybackProof> {
   const started = Date.now()
-  const remaining = () => Math.max(1_000, timeoutMs - (Date.now() - started))
+  const remaining = () => {
+    const left = timeoutMs - (Date.now() - started)
+    if (left <= 0) throw new Error('playback exceeded the runtime budget')
+    return left
+  }
   const manifest = new URL(manifestUrl)
   const manifestPath = manifest.pathname
   const requests: { path: string; at: number }[] = []
@@ -54,7 +65,11 @@ export async function proveAbrPlayback(
   }
   page.on('request', onRequest)
   try {
-    await page.goto(frontendUrl)
+    if (timeoutMs <= 0) throw new Error('playback exceeded the runtime budget')
+    page.setDefaultTimeout(timeoutMs)
+    page.setDefaultNavigationTimeout(timeoutMs)
+    await page.goto(frontendUrl, { timeout: remaining() })
+    page.setDefaultTimeout(remaining())
     await page.addScriptTag({ path: createRequire(import.meta.url).resolve('video.js/dist/video.min.js') })
     await page.evaluate((source) => {
       const libraries = window as unknown as {
