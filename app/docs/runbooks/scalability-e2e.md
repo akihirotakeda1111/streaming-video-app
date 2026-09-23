@@ -191,22 +191,61 @@ never copied into evidence and must be readable only by the operator running
 the test.
 
 The runner derives and records one fixed batch before submission. Its initial
-batch is `ceil(backlog_per_worker_target * worker_min_capacity) + 1`; the
-rationale and all inputs are written to `planned-workload.json`. No later
-submission is permitted. `--check` makes no AWS calls. A live run additionally
-requires `SCALABILITY_E2E_ALLOW_LIVE=true` and an explicit dedicated-environment
-handoff:
+batch is `math.ceil(backlog_per_worker_target * worker_min_capacity) + 1`.
+The plan also has to leave scale-out observable: representative
+processing time must cover the scale-out evaluation window, and the runtime
+budget must cover that window, drain on at least two workers, both cooldowns,
+the scale-in evaluation window, and playback. Offline `--check` uses the
+target-tracking defaults of 3 one-minute periods to scale out and 15 one-minute
+periods to scale in. A budget that cannot cover that plan is rejected before
+any job is submitted. The rationale and fixture identity are written to
+`planned-workload.json`. The fixture record is the file name, duration, size,
+and SHA-256 only. No later submission is permitted.
+
+API and CloudFront URLs in the handoff must be `https`. The frontend URL may be
+`https`, or `http` on `localhost`, `127.0.0.1`, or `::1`. `--check` makes no
+AWS calls. A live run additionally requires `SCALABILITY_E2E_ALLOW_LIVE=true`
+and an explicit dedicated-environment handoff:
 
 ```bash
 SCALABILITY_E2E_ALLOW_LIVE=true \
 python app/scripts/run_scalability_e2e.py --full
 ```
 
-The live project is explicitly selected as `scalability`; ordinary
-`npm --prefix app/frontend run test:e2e` and the Reliability runner do not
-discover its scenarios. Evidence must identify every checkpoint as PASS, FAIL,
-or NOT RUN, including worker task identities/timestamps, child task ARNs and
-Step Functions intervals, publication/API completion, CloudFront browser
-requests and media advancement, per-job completion, and scale-in. A failed or
-timed-out job is not a partial acceptance. Operators retain cleanup ownership
-and must leave unresolved workload status recorded before environment teardown.
+Live preflight reads AWS before submission. The handoff's own account, target,
+cooldowns, image digests, and `distributed_mode` flag are not sufficient. The
+runner compares the caller account, requires the parent service to be steady at
+one running and desired task, and checks the worker image digest plus
+`ORCHESTRATION_STATE_MACHINE_ARN` on that task definition. It also requires an
+API service using the API image digest, an active state machine whose
+definition is the distributed 360p/720p `runTask.sync` workflow, an autoscaling
+target and target-tracking policy whose metric is visible queue depth divided
+by running workers, and the managed scale-out and scale-in alarms. Observed
+alarm periods replace the offline evaluation defaults, and the batch plan is
+checked again against those periods. `preflight.json` records the non-secret
+observation.
+
+The Playwright project timeout is the runtime budget plus two minutes so the
+scenario can wait through scale-in and still write evidence. Other Playwright
+projects keep their existing timeout. The live project is explicitly selected
+as `scalability`; ordinary `npm --prefix app/frontend run test:e2e` and the
+Reliability runner do not discover its scenarios.
+
+The scenario submits the fixed batch, then measures all of the following from
+the same jobs. Each checkpoint is `PASS`, `FAIL`, or `NOT RUN`. Overall status
+is `passed` only when every checkpoint is `PASS`:
+
+- parent service running tasks move from 1 to at least 2
+- different parent tasks process different job IDs over overlapping log intervals
+- at least one job has distinct 360p and 720p child task ARNs whose Step Functions and ECS intervals overlap
+- every submitted job reaches API `COMPLETED`
+- after that completion, the parent service returns to its configured minimum
+- the completed output plays through the installed video.js player on the frontend origin, including master, 360p, and 720p playlist and segment requests, decoded `readyState`, advancing `currentTime`, and a rendition switch
+
+`workload.json` is written as those observations progress and again when the
+run stops. A timeout, a failed job, or a failed preflight still leaves the
+incomplete jobs, task samples, and execution intervals that were collected.
+Missing observations stay `NOT RUN` or `FAIL`; they are not treated as success.
+A failed or timed-out job is not a partial acceptance. Operators retain cleanup
+ownership and must leave unresolved workload status recorded before environment
+teardown.

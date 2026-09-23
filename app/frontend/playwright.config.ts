@@ -2,6 +2,25 @@ import process from 'node:process'
 import { defineConfig, devices } from '@playwright/test'
 import { e2eConfig, reliabilityDiscoveryConfig } from './e2e/config.js'
 
+function scalabilityProjectSelected(): boolean {
+  return process.env.E2E_INCLUDE_SCALABILITY === 'true'
+    || process.argv.some((argument, index) => argument === '--project=scalability'
+      || (argument === '--project' && process.argv[index + 1] === 'scalability'))
+}
+
+function scalabilityTimeoutMs(): number | undefined {
+  if (!scalabilityProjectSelected()) return undefined
+  const configured = process.env.SCALABILITY_PLAYWRIGHT_TIMEOUT_MS?.trim()
+  if (!configured) return undefined
+  const milliseconds = Number(configured)
+  if (!Number.isInteger(milliseconds) || milliseconds <= 0) {
+    throw new Error('SCALABILITY_PLAYWRIGHT_TIMEOUT_MS must be a positive integer')
+  }
+  return milliseconds
+}
+
+const scalabilityTimeout = scalabilityTimeoutMs()
+
 const browserTestIgnore = ['**/*.test.ts', '**/reliability/**/*.spec.ts',
   '**/scalability/**/*.spec.ts',
   ...(process.env.E2E_INCLUDE_DELIVERY_REPLAY === 'true' || process.env.E2E_DISCOVERY === 'true'
@@ -93,6 +112,7 @@ export default defineConfig({
       testMatch: '**/scalability/**/*.spec.ts',
       retries: 0,
       workers: 1,
+      ...(scalabilityTimeout ? { timeout: scalabilityTimeout } : {}),
       use: {
         ...devices['Desktop Chrome'],
         baseURL: e2eConfig.frontendUrl,

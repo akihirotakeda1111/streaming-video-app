@@ -1,23 +1,37 @@
 #!/usr/bin/env python3
-"""Fail-closed entry point for the single distributed scalability workload.
+"""Fail-closed entry point for one distributed scalability workload.
 
-This module only validates configuration and dispatches the dedicated Playwright
-project. It never provisions, updates, or tears down AWS resources.
+Offline ``--check`` validates the handoff and the batch plan without calling
+AWS. Live ``--full`` reads the deployed service, autoscaling policy, metric,
+and images before dispatching the dedicated Playwright project. The runner
+never provisions or updates AWS resources.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 CLI = ROOT / "app/frontend/node_modules/@playwright/test/cli.js"
+CHECKPOINTS = (
+    "parentScaleOut",
+    "parentJobConcurrency",
+    "childExecutionOverlap",
+    "allJobsCompleted",
+    "scaleIn",
+    "abrPlayback",
+)
 REQUIRED = {
     "account_id", "region", "environment", "api_url", "frontend_url",
     "playback_base_url", "cluster", "worker_service", "parent_service",
@@ -27,6 +41,12 @@ REQUIRED = {
     "worker_max_capacity", "backlog_per_worker_target", "processing_seconds",
     "scale_out_cooldown_seconds", "scale_in_cooldown_seconds", "runtime_budget_seconds",
 }
+METRIC_PERIOD_SECONDS = 60
+DEFAULT_SCALE_OUT_EVALUATION_PERIODS = 3
+DEFAULT_SCALE_IN_EVALUATION_PERIODS = 15
+PLAYBACK_ALLOWANCE_SECONDS = 120
+EVIDENCE_FLUSH_SECONDS = 120
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 def _config_path() -> Path | None:
@@ -47,6 +67,25 @@ def _read_config() -> dict[str, Any]:
     return value
 
 
+def _is_loopback(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    return hostname.strip("[]").lower().rstrip(".") in LOOPBACK_HOSTS
+
+
+def _validate_endpoint(name: str, value: object) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be an https URL")
+    parsed = urlsplit(value.strip())
+    if parsed.scheme == "https" and parsed.hostname:
+        return
+    if name == "frontend_url" and parsed.scheme == "http" and _is_loopback(parsed.hostname):
+        return
+    if name == "frontend_url":
+        raise ValueError("frontend_url must be https, or http on localhost, 127.0.0.1, or ::1")
+    raise ValueError(f"{name} must be an https URL")
+
+
 def _validate(config: dict[str, Any], live: bool) -> None:
     missing = sorted(REQUIRED - config.keys())
     if missing:
@@ -57,110 +96,461 @@ def _validate(config: dict[str, Any], live: bool) -> None:
         raise ValueError("account_id must contain 12 digits")
     if not isinstance(config["region"], str) or not config["region"].strip():
         raise ValueError("region is required")
-    for name in ("api_url", "frontend_url", "playback_base_url"):
-        if not isinstance(config[name], str) or not config[name].startswith(("http://", "https://")):
-            raise ValueError(f"{name} must be an HTTP(S) URL")
-    for name in ("worker_min_capacity", "worker_max_capacity"):
-        if not isinstance(config[name], int) or config[name] < 1:
+    for name in ("api_url", "playback_base_url", "frontend_url"):
+        _validate_endpoint(name, config[name])
+    for name in ("worker_min_capacity", "worker_max_capacity", "parent_min_capacity"):
+        if not isinstance(config[name], int) or isinstance(config[name], bool) or config[name] < 1:
             raise ValueError(f"{name} must be a positive integer")
     if config["worker_min_capacity"] != 1 or config["worker_max_capacity"] < 2:
         raise ValueError("worker capacity must support minimum 1 and scale-out to at least 2")
     if config["distributed_mode"] is not True or config["parent_min_capacity"] != 1:
-        raise ValueError("live preflight requires distributed mode and parent minimum capacity 1")
+        raise ValueError("distributed mode and parent minimum capacity 1 are required")
     for name in ("backlog_per_worker_target", "processing_seconds", "runtime_budget_seconds",
                  "scale_out_cooldown_seconds", "scale_in_cooldown_seconds", "fixture_duration_seconds"):
-        if not isinstance(config[name], (int, float)) or config[name] <= 0:
+        if isinstance(config[name], bool) or not isinstance(config[name], (int, float)) or config[name] <= 0:
             raise ValueError(f"{name} must be positive")
     fixture = Path(str(config["fixture_path"])).expanduser()
     if live and (not fixture.is_file() or fixture.stat().st_size == 0):
         raise ValueError("fixture_path must identify a non-empty 720p-or-higher fixture")
-    if live and not os.environ.get("SCALABILITY_E2E_ALLOW_LIVE") == "true":
+    if live and os.environ.get("SCALABILITY_E2E_ALLOW_LIVE") != "true":
         raise ValueError("set SCALABILITY_E2E_ALLOW_LIVE=true for the dedicated live environment")
 
 
-def _batch(config: dict[str, Any]) -> tuple[int, str]:
+def _whole(value: float) -> int | float:
+    return int(value) if float(value).is_integer() else value
+
+
+def fixture_record(path: Path, duration_seconds: float) -> dict[str, Any]:
+    """Return a portable fixture identity. The filesystem path is omitted."""
+    record: dict[str, Any] = {"name": path.name, "durationSeconds": duration_seconds}
+    if path.is_file():
+        data = path.read_bytes()
+        record["sizeBytes"] = len(data)
+        record["sha256"] = hashlib.sha256(data).hexdigest()
+    return record
+
+
+def _plan(config: dict[str, Any], scale_out_evaluation: float, scale_in_evaluation: float) -> dict[str, Any]:
     target = float(config["backlog_per_worker_target"])
     capacity = int(config["worker_min_capacity"])
     processing = float(config["processing_seconds"])
     budget = float(config["runtime_budget_seconds"])
-    cooldown = float(config["scale_out_cooldown_seconds"])
-    # The +1 is intentional: it puts visible backlog strictly above the target,
-    # while the budget check prevents an unbounded workload.
-    count = int(target * capacity) + 1
-    if count <= target * capacity or processing + cooldown >= budget:
-        raise ValueError("runtime budget cannot observe the configured scale-out target")
-    return count, (f"ceil(target {target} * initial workers {capacity}) + 1; "
-                   f"{count} jobs makes backlog/worker exceed {target} while "
-                   f"processing ({processing}s) and scale-out cooldown ({cooldown}s) fit "
-                   f"within the {budget}s budget")
+    scale_out_cooldown = float(config["scale_out_cooldown_seconds"])
+    scale_in_cooldown = float(config["scale_in_cooldown_seconds"])
+    count = math.ceil(target * capacity) + 1
+    submission_backlog = count / capacity
+    if count < 2 or submission_backlog <= target:
+        raise ValueError("batch does not raise backlog per worker above the scaling target")
+    if processing < scale_out_evaluation:
+        raise ValueError(
+            "processing time is shorter than the scale-out evaluation window; "
+            f"need at least {scale_out_evaluation:g}s so backlog stays observable"
+        )
+    # Scale-out is sampled for the evaluation window before a second worker joins.
+    # The remaining jobs then drain on at least two workers. Scale-in waits out
+    # its own evaluation period and cooldown after that work finishes.
+    drain = scale_out_evaluation + processing * math.ceil(count / 2)
+    required = drain + scale_out_cooldown + scale_in_evaluation + scale_in_cooldown + PLAYBACK_ALLOWANCE_SECONDS
+    if required > budget:
+        raise ValueError(
+            f"runtime budget {budget:g}s cannot observe scale-out and scale-in; "
+            f"need at least {required:g}s for processing, cooldown, evaluation, and playback"
+        )
+    rationale = (
+        f"ceil(target {target:g} * initial workers {capacity}) + 1 = {count}; "
+        f"submission backlog/worker {submission_backlog:g} exceeds {target:g}; "
+        f"processing {processing:g}s covers scale-out evaluation {scale_out_evaluation:g}s; "
+        f"required budget {required:g}s fits within {budget:g}s"
+    )
+    return {
+        "batchSize": count,
+        "requiredBudgetSeconds": _whole(required),
+        "rationale": rationale,
+        "target": target,
+        "submissionBacklogPerWorker": submission_backlog,
+        "scaleOutEvaluationSeconds": _whole(scale_out_evaluation),
+        "scaleInEvaluationSeconds": _whole(scale_in_evaluation),
+        "scaleOutCooldownSeconds": scale_out_cooldown,
+        "scaleInCooldownSeconds": scale_in_cooldown,
+    }
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _check() -> int:
     try:
         config = _read_config()
-        if config:
-            _validate(config, False)
-            count, rationale = _batch(config)
-            print(json.dumps({"status": "passed", "mode": "offline", "batchSize": count,
-                              "rationale": rationale}, sort_keys=True))
-        else:
+        if not config:
             print("offline check passed (SCALABILITY_E2E_CONFIG is not configured; no AWS calls made)")
+            return 0
+        _validate(config, False)
+        plan = _plan(
+            config,
+            METRIC_PERIOD_SECONDS * DEFAULT_SCALE_OUT_EVALUATION_PERIODS,
+            METRIC_PERIOD_SECONDS * DEFAULT_SCALE_IN_EVALUATION_PERIODS,
+        )
+        print(json.dumps({
+            "status": "passed",
+            "mode": "offline",
+            "batchSize": plan["batchSize"],
+            "requiredBudgetSeconds": plan["requiredBudgetSeconds"],
+            "rationale": plan["rationale"],
+        }, sort_keys=True))
         return 0
     except ValueError as error:
         print(f"offline check failed: {error}", file=sys.stderr)
         return 2
 
 
-def _full(config: dict[str, Any]) -> int:
-    _validate(config, True)
-    _observe_parent_service(config)
-    count, rationale = _batch(config)
-    evidence = Path(os.environ.get("SCALABILITY_E2E_EVIDENCE_DIR", "artifacts/scalability-e2e")).resolve()
-    evidence.mkdir(parents=True, exist_ok=False)
-    (evidence / "planned-workload.json").write_text(json.dumps({
-        "batchSize": count, "rationale": rationale, "target": config["backlog_per_worker_target"],
-        "recordedAt": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
-        "fixture": config["fixture_path"], "region": config["region"],
-        "imageDigests": {"api": config["api_image_digest"], "worker": config["worker_image_digest"]},
-    }, indent=2) + "\n", encoding="utf-8")
-    node = shutil.which("node")
-    if node is None or not CLI.is_file():
-        raise ValueError("Playwright CLI is unavailable; install frontend dependencies")
-    env = os.environ.copy()
-    env.update({"E2E_ENVIRONMENT": "disposable", "E2E_PROJECT": "chromium",
-                "E2E_FRONTEND_URL": config["frontend_url"], "E2E_API_URL": config["api_url"],
-                "E2E_INCLUDE_SCALABILITY": "true", "SCALABILITY_BATCH_SIZE": str(count),
-                "SCALABILITY_FIXTURE_PATH": str(config["fixture_path"]),
-                "SCALABILITY_RUNTIME_BUDGET_SECONDS": str(config["runtime_budget_seconds"]),
-                "SCALABILITY_EVIDENCE_DIR": str(evidence), "PLAYBACK_BASE_URL": config["playback_base_url"]})
-    return subprocess.run([node, str(CLI), "test", "--grep", "@scalability", "--project", "scalability",
-                           "--retries", "0"], cwd=ROOT / "app/frontend", env=env, check=False).returncode
-
-
-def _observe_parent_service(config: dict[str, Any]) -> None:
-    """Read-only live gate: identity, region, and the current parent readiness."""
+def _aws(arguments: list[str]) -> Any:
     aws = shutil.which("aws")
     if aws is None:
         raise ValueError("aws CLI is required for live preflight")
+    result = subprocess.run(
+        [aws, *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=45,
+    )
+    if result.returncode != 0:
+        detail = " ".join(result.stderr.split())[:400]
+        raise ValueError(f"live preflight {arguments[0]} {arguments[1] if len(arguments) > 1 else ''} failed: {detail}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("live preflight returned invalid observation data") from error
 
-    def call(arguments: list[str]) -> Any:
-        result = subprocess.run([aws, *arguments], capture_output=True, text=True, check=False,
-                                timeout=30)
-        if result.returncode != 0:
-            raise ValueError("live preflight observation failed")
-        try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise ValueError("live preflight returned invalid observation data") from error
 
-    identity = call(["sts", "get-caller-identity", "--query", "Account", "--output", "json"])
+def _collect(arguments: list[str], key: str) -> list[Any]:
+    items: list[Any] = []
+    token: str | None = None
+    for _ in range(20):
+        page_args = [*arguments]
+        if token:
+            page_args.extend(["--next-token", token])
+        page = _aws(page_args)
+        if not isinstance(page, dict):
+            raise ValueError("live preflight returned invalid observation data")
+        value = page.get(key, [])
+        if not isinstance(value, list):
+            raise ValueError("live preflight returned invalid observation data")
+        items.extend(value)
+        next_token = page.get("nextToken") or page.get("NextToken")
+        if not isinstance(next_token, str) or not next_token:
+            return items
+        token = next_token
+    raise ValueError("live preflight observation was truncated")
+
+
+def _tail_name(value: str, marker: str) -> str:
+    if marker in value:
+        return value.rsplit("/", 1)[-1]
+    return value
+
+
+def _close(left: object, right: object) -> bool:
+    return isinstance(left, (int, float)) and isinstance(right, (int, float)) and abs(float(left) - float(right)) <= 1e-3
+
+
+def _task_definition(arn: str, region: str) -> dict[str, Any]:
+    body = _aws(["ecs", "describe-task-definition", "--task-definition", arn, "--region", region])
+    definition = body.get("taskDefinition") if isinstance(body, dict) else None
+    if not isinstance(definition, dict):
+        raise ValueError("live preflight could not read a task definition")
+    return definition
+
+
+def _image_digest(image: object) -> str:
+    if not isinstance(image, str) or "@" not in image:
+        return ""
+    return image.rsplit("@", 1)[1]
+
+
+def _container_env(definition: dict[str, Any], name: str) -> str | None:
+    containers = definition.get("containerDefinitions")
+    if not isinstance(containers, list):
+        return None
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        environment = container.get("environment")
+        if not isinstance(environment, list):
+            continue
+        for item in environment:
+            if isinstance(item, dict) and item.get("name") == name and isinstance(item.get("value"), str):
+                return str(item["value"])
+    return None
+
+
+def _definition_has_digest(definition: dict[str, Any], digest: str) -> bool:
+    containers = definition.get("containerDefinitions")
+    if not isinstance(containers, list):
+        return False
+    return any(_image_digest(container.get("image")) == digest for container in containers if isinstance(container, dict))
+
+
+def _named_service_has_digest(cluster: str, region: str, service: str, digest: str) -> bool:
+    described = _aws(["ecs", "describe-services", "--cluster", cluster, "--services", service, "--region", region])
+    services = described.get("services") if isinstance(described, dict) else None
+    current = services[0] if isinstance(services, list) and services and isinstance(services[0], dict) else None
+    if not isinstance(current, dict) or not isinstance(current.get("taskDefinition"), str):
+        return False
+    return _definition_has_digest(_task_definition(str(current["taskDefinition"]), region), digest)
+
+
+def _cluster_has_digest(cluster: str, region: str, digest: str) -> bool:
+    arns = [arn for arn in _collect(
+        ["ecs", "list-services", "--cluster", cluster, "--region", region],
+        "serviceArns",
+    ) if isinstance(arn, str)]
+    for offset in range(0, len(arns), 10):
+        described = _aws([
+            "ecs", "describe-services", "--cluster", cluster, "--services", *arns[offset:offset + 10], "--region", region,
+        ])
+        services = described.get("services") if isinstance(described, dict) else None
+        if not isinstance(services, list):
+            continue
+        for service in services:
+            if not isinstance(service, dict) or not isinstance(service.get("taskDefinition"), str):
+                continue
+            if _definition_has_digest(_task_definition(str(service["taskDefinition"]), region), digest):
+                return True
+    return False
+
+
+def _alarm_window(alarm: dict[str, Any]) -> float:
+    period = alarm.get("Period")
+    periods = alarm.get("EvaluationPeriods")
+    if isinstance(period, bool) or isinstance(periods, bool):
+        raise ValueError("scaling alarm is missing its evaluation window")
+    if not isinstance(period, int) or not isinstance(periods, int) or period <= 0 or periods <= 0:
+        raise ValueError("scaling alarm is missing its evaluation window")
+    return float(period * periods)
+
+
+def _preflight(config: dict[str, Any]) -> dict[str, Any]:
+    region = str(config["region"])
+    cluster = _tail_name(str(config["cluster"]), ":cluster/")
+    service = _tail_name(str(config["parent_service"]), ":service/")
+    worker_service = _tail_name(str(config["worker_service"]), ":service/")
+    identity = _aws(["sts", "get-caller-identity", "--query", "Account", "--output", "json"])
     if identity != config["account_id"]:
         raise ValueError("AWS account does not match the dedicated handoff")
-    services = call(["ecs", "describe-services", "--region", config["region"],
-                     "--cluster", config["cluster"], "--services", config["parent_service"],
-                     "--query", "services[0].{running:runningCount,desired:desiredCount}", "--output", "json"])
-    if not isinstance(services, dict) or services.get("running", 0) < 1 or services.get("desired", 0) < 1:
-        raise ValueError("parent service is not ready at its configured minimum")
+
+    described = _aws(["ecs", "describe-services", "--cluster", cluster, "--services", service, "--region", region])
+    failures = described.get("failures") if isinstance(described, dict) else None
+    if not isinstance(described, dict) or (isinstance(failures, list) and failures):
+        raise ValueError("parent service is not available in the dedicated cluster")
+    services = described.get("services")
+    current = services[0] if isinstance(services, list) and services else None
+    if not isinstance(current, dict) or current.get("status") != "ACTIVE":
+        raise ValueError("parent service is not active")
+    minimum = int(config["parent_min_capacity"])
+    if current.get("runningCount") != minimum or current.get("desiredCount") != minimum or current.get("pendingCount") not in (0, None):
+        raise ValueError("parent service is not steady at its configured minimum")
+    task_definition_arn = current.get("taskDefinition")
+    if not isinstance(task_definition_arn, str):
+        raise ValueError("parent service has no task definition")
+    definition = _task_definition(task_definition_arn, region)
+    if not _definition_has_digest(definition, str(config["worker_image_digest"])):
+        raise ValueError("parent service image does not match the worker image digest")
+    if worker_service != service and not _named_service_has_digest(cluster, region, worker_service, str(config["worker_image_digest"])):
+        raise ValueError("worker service image does not match the worker image digest")
+    state_machine = _container_env(definition, "ORCHESTRATION_STATE_MACHINE_ARN")
+    if state_machine != config["step_functions_arn"]:
+        raise ValueError("parent task definition is not configured for the dedicated state machine")
+    if not _cluster_has_digest(cluster, region, str(config["api_image_digest"])):
+        raise ValueError("no service in the cluster is running the API image digest")
+
+    machine = _aws(["stepfunctions", "describe-state-machine", "--state-machine-arn", str(config["step_functions_arn"]), "--region", region])
+    if not isinstance(machine, dict) or machine.get("status") != "ACTIVE":
+        raise ValueError("orchestration state machine is not active")
+    definition_text = machine.get("definition")
+    if not isinstance(definition_text, str) or any(token not in definition_text for token in ("360p", "720p", "runTask.sync")):
+        raise ValueError("orchestration state machine is not the distributed rendition workflow")
+
+    resource_id = f"service/{cluster}/{service}"
+    targets = _collect([
+        "application-autoscaling", "describe-scalable-targets", "--service-namespace", "ecs",
+        "--resource-ids", resource_id, "--region", region,
+    ], "ScalableTargets")
+    target = next((item for item in targets if isinstance(item, dict) and item.get("ResourceId") == resource_id), None)
+    if not isinstance(target, dict):
+        raise ValueError("parent service has no autoscaling target")
+    if target.get("MinCapacity") != minimum or target.get("MaxCapacity") != config["worker_max_capacity"]:
+        raise ValueError("deployed autoscaling capacity does not match the handoff")
+    if target.get("ScalableDimension") != "ecs:service:DesiredCount":
+        raise ValueError("parent autoscaling target does not control desired count")
+
+    policies = _collect([
+        "application-autoscaling", "describe-scaling-policies", "--service-namespace", "ecs",
+        "--resource-id", resource_id, "--scalable-dimension", "ecs:service:DesiredCount", "--region", region,
+    ], "ScalingPolicies")
+    policy = next((item for item in policies if isinstance(item, dict) and item.get("PolicyType") == "TargetTrackingScaling"), None)
+    if not isinstance(policy, dict):
+        raise ValueError("parent service has no target-tracking scaling policy")
+    policy_config = policy.get("TargetTrackingScalingPolicyConfiguration")
+    if not isinstance(policy_config, dict):
+        raise ValueError("scaling policy has no target-tracking configuration")
+    if not _close(policy_config.get("TargetValue"), config["backlog_per_worker_target"]):
+        raise ValueError("deployed backlog-per-worker target does not match the handoff")
+    if policy_config.get("ScaleOutCooldown") != config["scale_out_cooldown_seconds"]:
+        raise ValueError("deployed scale-out cooldown does not match the handoff")
+    if policy_config.get("ScaleInCooldown") != config["scale_in_cooldown_seconds"]:
+        raise ValueError("deployed scale-in cooldown does not match the handoff")
+    metrics = (policy_config.get("CustomizedMetricSpecification") or {}).get("Metrics")
+    if not isinstance(metrics, list):
+        raise ValueError("scaling policy does not publish the backlog-per-worker metric")
+    expression = next((item.get("Expression") for item in metrics if isinstance(item, dict) and isinstance(item.get("Expression"), str)), None)
+    names = {
+        ((item.get("MetricStat") or {}).get("Metric") or {}).get("MetricName")
+        for item in metrics if isinstance(item, dict)
+    }
+    normalized = "".join(str(expression).split()).lower() if isinstance(expression, str) else ""
+    if normalized != "visible_backlog/running_tasks":
+        raise ValueError("scaling metric is not visible backlog divided by running workers")
+    if "ApproximateNumberOfMessagesVisible" not in names or "RunningTaskCount" not in names:
+        raise ValueError("scaling metric does not use queue depth and running task count")
+
+    alarms = [
+        alarm for alarm in _collect(["cloudwatch", "describe-alarms", "--region", region, "--max-records", "100"], "MetricAlarms")
+        if isinstance(alarm, dict) and resource_id in str(alarm.get("AlarmName", "")) and str(alarm.get("AlarmName", "")).startswith("TargetTracking-")
+    ]
+    high = [alarm for alarm in alarms if "GreaterThan" in str(alarm.get("ComparisonOperator"))]
+    low = [alarm for alarm in alarms if "LessThan" in str(alarm.get("ComparisonOperator"))]
+    if len(high) != 1 or len(low) != 1:
+        raise ValueError("live preflight did not find the scale-out and scale-in alarms")
+    if not _close(high[0].get("Threshold"), config["backlog_per_worker_target"]) or not _close(low[0].get("Threshold"), config["backlog_per_worker_target"]):
+        raise ValueError("scaling alarm threshold does not match the backlog-per-worker target")
+    scale_out_evaluation = _alarm_window(high[0])
+    scale_in_evaluation = _alarm_window(low[0])
+    return {
+        "scaleOutEvaluationSeconds": scale_out_evaluation,
+        "scaleInEvaluationSeconds": scale_in_evaluation,
+        "summary": {
+            "account": config["account_id"],
+            "region": region,
+            "service": {
+                "name": service,
+                "status": current.get("status"),
+                "running": current.get("runningCount"),
+                "desired": current.get("desiredCount"),
+            },
+            "images": {"api": config["api_image_digest"], "worker": config["worker_image_digest"]},
+            "stateMachine": {"status": machine.get("status"), "distributedRenditions": True},
+            "scalableTarget": {
+                "resourceId": resource_id,
+                "min": target.get("MinCapacity"),
+                "max": target.get("MaxCapacity"),
+            },
+            "metric": {
+                "targetValue": policy_config.get("TargetValue"),
+                "expression": expression,
+                "scaleOutCooldown": policy_config.get("ScaleOutCooldown"),
+                "scaleInCooldown": policy_config.get("ScaleInCooldown"),
+            },
+            "evaluation": {"scaleOutSeconds": scale_out_evaluation, "scaleInSeconds": scale_in_evaluation},
+        },
+    }
+
+
+def _workload_fallback(batch_size: int, error: str) -> dict[str, Any]:
+    checkpoints = {name: {"id": name, "status": "NOT RUN", "reason": error} for name in CHECKPOINTS}
+    return {
+        "scenario": "scalability",
+        "status": "failed",
+        "observedAt": _now(),
+        "batchSize": batch_size,
+        "jobs": [],
+        "incompleteJobIds": [],
+        "checkpoints": checkpoints,
+        "summary": ", ".join(f"{name}=NOT RUN" for name in CHECKPOINTS),
+        "samples": [],
+        "parentActivities": [],
+        "childIntervals": [],
+        "observationErrors": [error],
+        "error": error,
+    }
+
+
+def _ensure_workload(evidence: Path, batch_size: int, error: str) -> None:
+    target = evidence / "workload.json"
+    if target.is_file():
+        return
+    target.write_text(json.dumps(_workload_fallback(batch_size, error), indent=2) + "\n", encoding="utf-8")
+
+
+def _playwright(config: dict[str, Any], evidence: Path, plan: dict[str, Any], fixture: dict[str, Any]) -> int:
+    node = shutil.which("node")
+    if node is None or not CLI.is_file():
+        raise ValueError("Playwright CLI is unavailable; install frontend dependencies")
+    budget = float(config["runtime_budget_seconds"])
+    env = os.environ.copy()
+    env.update({
+        "E2E_ENVIRONMENT": "disposable",
+        "E2E_PROJECT": "chromium",
+        "E2E_FRONTEND_URL": str(config["frontend_url"]),
+        "E2E_API_URL": str(config["api_url"]),
+        "E2E_INCLUDE_SCALABILITY": "true",
+        "AWS_REGION": str(config["region"]),
+        "AWS_DEFAULT_REGION": str(config["region"]),
+        "SCALABILITY_BATCH_SIZE": str(plan["batchSize"]),
+        "SCALABILITY_FIXTURE_PATH": str(Path(str(config["fixture_path"])).expanduser()),
+        "SCALABILITY_FIXTURE_NAME": str(fixture["name"]),
+        "SCALABILITY_FIXTURE_DURATION_SECONDS": str(config["fixture_duration_seconds"]),
+        "SCALABILITY_RUNTIME_BUDGET_SECONDS": str(config["runtime_budget_seconds"]),
+        "SCALABILITY_PLAYWRIGHT_TIMEOUT_MS": str(int((budget + EVIDENCE_FLUSH_SECONDS) * 1000)),
+        "SCALABILITY_EVIDENCE_DIR": str(evidence),
+        "SCALABILITY_REGION": str(config["region"]),
+        "SCALABILITY_ACCOUNT_ID": str(config["account_id"]),
+        "SCALABILITY_CLUSTER": _tail_name(str(config["cluster"]), ":cluster/"),
+        "SCALABILITY_PARENT_SERVICE": _tail_name(str(config["parent_service"]), ":service/"),
+        "SCALABILITY_STATE_MACHINE_ARN": str(config["step_functions_arn"]),
+        "SCALABILITY_MIN_CAPACITY": str(config["parent_min_capacity"]),
+        "PLAYBACK_BASE_URL": str(config["playback_base_url"]),
+    })
+    if "sizeBytes" in fixture:
+        env["SCALABILITY_FIXTURE_BYTES"] = str(fixture["sizeBytes"])
+    if "sha256" in fixture:
+        env["SCALABILITY_FIXTURE_SHA256"] = str(fixture["sha256"])
+    return subprocess.run(
+        [node, str(CLI), "test", "--grep", "@scalability", "--project", "scalability", "--retries", "0"],
+        cwd=ROOT / "app/frontend",
+        env=env,
+        check=False,
+    ).returncode
+
+
+def _full(config: dict[str, Any]) -> int:
+    _validate(config, True)
+    evidence = Path(os.environ.get("SCALABILITY_E2E_EVIDENCE_DIR", "artifacts/scalability-e2e")).resolve()
+    evidence.mkdir(parents=True, exist_ok=False)
+    batch_size = 0
+    try:
+        observed = _preflight(config)
+        plan = _plan(config, float(observed["scaleOutEvaluationSeconds"]), float(observed["scaleInEvaluationSeconds"]))
+        batch_size = int(plan["batchSize"])
+        fixture = fixture_record(Path(str(config["fixture_path"])).expanduser(), float(config["fixture_duration_seconds"]))
+        recorded = {
+            **plan,
+            "recordedAt": _now(),
+            "fixture": fixture,
+            "region": config["region"],
+            "imageDigests": {"api": config["api_image_digest"], "worker": config["worker_image_digest"]},
+            "observed": observed["summary"],
+        }
+        (evidence / "planned-workload.json").write_text(json.dumps(recorded, indent=2) + "\n", encoding="utf-8")
+        (evidence / "preflight.json").write_text(json.dumps(observed["summary"], indent=2) + "\n", encoding="utf-8")
+        code = _playwright(config, evidence, plan, fixture)
+        if code != 0:
+            _ensure_workload(evidence, batch_size, f"playwright exited {code}")
+        return code
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        _ensure_workload(evidence, batch_size, str(error))
+        raise
 
 
 def main() -> int:
@@ -176,7 +566,7 @@ def main() -> int:
         if not config:
             raise ValueError("SCALABILITY_E2E_CONFIG is required for --full")
         return _full(config)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"scalability E2E blocked: {error}", file=sys.stderr)
         return 2
 
