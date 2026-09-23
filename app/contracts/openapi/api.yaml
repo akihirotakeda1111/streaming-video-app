@@ -84,9 +84,11 @@ paths:
       summary: Get HLS playback information
       description: |
         Returns playback information only after the encoding job reaches
-        `COMPLETED`. In Phase 1 the manifest URL may point directly to the S3
-        output endpoint. Private delivery through CloudFront is outside this
-        contract's scope.
+        `COMPLETED`. `manifestUrl` is an HTTPS URL formed from the configured
+        `PLAYBACK_BASE_URL` delivery origin and the published relative manifest
+        key. It is not an S3 SDK endpoint, and the bucket name is not inserted
+        into a CloudFront path. The output bucket remains private behind OAC;
+        viewer authentication and signed cookies are outside this contract.
       responses:
         '200':
           description: HLS playback information
@@ -324,6 +326,7 @@ components:
         manifestUrl:
           type: string
           format: uri
+          pattern: '^https://[^?#]+$'
         contentType:
           type: string
           const: application/vnd.apple.mpegurl

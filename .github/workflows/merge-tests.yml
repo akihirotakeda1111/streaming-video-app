@@ -93,8 +93,8 @@ jobs:
       - name: Validate API and storage contracts
         run: python app/scripts/validate_contracts.py
 
-      - name: Validate infrastructure reliability contracts
-        run: python app/scripts/validate_terraform_contracts.py --stage reliability
+      - name: Validate compute and shared delivery/reliability contracts
+        run: python app/scripts/validate_terraform_contracts.py --stage orchestration
 
   frontend:
     name: Frontend tests
@@ -174,6 +174,7 @@ jobs:
     if: ${{ needs.changes.outputs.worker == 'true' }}
     runs-on: ubuntu-latest
     env:
+      WORKER_RUNTIME_MODE: local
       TEST_DATABASE_URL: postgres://streaming_video:ci_test_password@localhost:5432/streaming_video_test?sslmode=disable
     services:
       postgres:
@@ -211,6 +212,9 @@ jobs:
 
   e2e:
     name: E2E tests
+    permissions:
+      contents: read
+      id-token: write
     needs: changes
     if: ${{ needs.changes.outputs.e2e == 'true' }}
     runs-on: ubuntu-latest
@@ -263,6 +267,7 @@ jobs:
           VIDEO_ENCODING_QUEUE_URL: ${{ vars.VIDEO_ENCODING_QUEUE_URL }}
           VIDEO_INPUT_BUCKET: ${{ vars.VIDEO_INPUT_BUCKET }}
           VIDEO_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
+          PLAYBACK_BASE_URL: ${{ vars.PLAYBACK_BASE_URL }}
           FRONTEND_ORIGIN: http://localhost:5173
           API_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_E2E_API_ACCESS_KEY_ID }}
           API_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_API_SECRET_ACCESS_KEY }}
@@ -270,12 +275,27 @@ jobs:
           WORKER_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_E2E_WORKER_SECRET_ACCESS_KEY }}
         run: bash app/scripts/start-e2e-compose.sh
 
+      - name: Authenticate E2E runner with AWS OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_E2E_RUNNER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.E2E_AWS_ACCOUNT_ID }}
+          role-session-name: e2e-${{ github.job }}-${{ github.run_id }}
+          role-duration-seconds: 3600
+          unset-current-credentials: true
+
       - name: Run E2E tests
         working-directory: app/frontend
         env:
           E2E_ENVIRONMENT: disposable
           E2E_FRONTEND_URL: http://localhost:5173
           E2E_API_URL: http://127.0.0.1:8000
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          E2E_OUTPUT_BUCKET: ${{ vars.VIDEO_OUTPUT_BUCKET }}
+          OUTPUT_S3_ENDPOINT: https://${{ vars.VIDEO_OUTPUT_BUCKET }}.s3.${{ vars.AWS_REGION }}.amazonaws.com
+          E2E_AWS_ACCOUNT_ID: ${{ vars.E2E_AWS_ACCOUNT_ID }}
+          PLAYBACK_BASE_URL: ${{ vars.PLAYBACK_BASE_URL }}
           E2E_PROJECT: chromium
           FFMPEG_PATH: /usr/bin/ffmpeg
         run: npm run test:e2e

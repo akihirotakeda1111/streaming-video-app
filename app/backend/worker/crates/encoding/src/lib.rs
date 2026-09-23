@@ -10,6 +10,7 @@ use std::{
 pub struct Command {
     pub executable: PathBuf,
     pub argv: Vec<String>,
+    pub maximum_file_bytes: Option<u64>,
 }
 
 impl Command {
@@ -17,6 +18,7 @@ impl Command {
         Self {
             executable: executable.into(),
             argv,
+            maximum_file_bytes: None,
         }
     }
 }
@@ -222,6 +224,7 @@ fn tag_has_uri_attribute(tag: &str) -> bool {
     tag.to_ascii_uppercase().contains("URI=")
 }
 
+pub mod limits;
 pub mod runtime;
 
 #[cfg(test)]

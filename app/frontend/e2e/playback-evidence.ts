@@ -7,6 +7,7 @@ export async function persistPlaybackEvidence(
   diagnostics: Record<string, SafeDiagnostic>,
   passed: boolean,
   env: NodeJS.ProcessEnv = process.env,
+  scenario = 'phase1-pipeline',
 ): Promise<void> {
   const runId = env.E2E_RUN_ID
   const directory = env.E2E_EVIDENCE_DIR
@@ -15,14 +16,17 @@ export async function persistPlaybackEvidence(
     || !directory || !isAbsolute(directory) || basename(directory) !== runId) {
     throw new Error('Playback evidence requires a run-scoped destination')
   }
+  if (!['phase1-pipeline', 'delivery-regression', 'delivery-preflight'].includes(scenario)) {
+    throw new Error('Unsupported playback evidence scenario')
+  }
   const report: Record<string, unknown> = {
-    scenario: 'phase1-pipeline', runId, status: passed ? 'passed' : 'failed',
+    scenario, runId, status: passed ? 'passed' : 'failed',
     observedAt: new Date().toISOString(),
     videoId: diagnostics['pipeline-status']?.videoId,
     jobId: diagnostics['pipeline-status']?.jobId,
     diagnostics,
   }
   const evidence = safeDiagnostic(report)
-  await writeFile(join(directory, 'phase1-pipeline-evidence.json'),
+  await writeFile(join(directory, `${scenario}-evidence.json`),
     JSON.stringify(evidence, null, 2) + '\n', { flag: 'wx' })
 }

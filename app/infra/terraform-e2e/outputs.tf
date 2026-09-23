@@ -26,3 +26,8 @@ output "runner_policy_arn" {
   description = "Attach manually to the existing host E2E runner principal. Does not grant provisioning access."
   value       = aws_iam_policy.runner.arn
 }
+
+output "playback_base_url" {
+  description = "CloudFront HTTPS base URL for browser playback."
+  value       = module.foundation.playback_base_url
+}

@@ -6,6 +6,7 @@ required=(
   VIDEO_ENCODING_QUEUE_URL
   VIDEO_INPUT_BUCKET
   VIDEO_OUTPUT_BUCKET
+  PLAYBACK_BASE_URL
   API_AWS_ACCESS_KEY_ID
   API_AWS_SECRET_ACCESS_KEY
   WORKER_AWS_ACCESS_KEY_ID
@@ -18,6 +19,19 @@ for name in "${required[@]}"; do
     exit 1
   fi
 done
+
+# Use the same deployed-origin validation as the environment generator.
+# Validate before installing the cleanup trap or touching any containers.
+PLAYBACK_BASE_URL="$(node --input-type=module -e '
+  import { normalizePlaybackBaseURL } from "./app/scripts/generate_reliability_env.mjs";
+  try {
+    process.stdout.write(normalizePlaybackBaseURL(process.env.PLAYBACK_BASE_URL ?? ""));
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
+')"
+export PLAYBACK_BASE_URL
 
 export API_PORT="${API_PORT:-8000}"
 export FRONTEND_PORT="${FRONTEND_PORT:-5173}"

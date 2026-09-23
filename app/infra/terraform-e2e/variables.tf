@@ -30,3 +30,9 @@ variable "frontend_origin" {
   type    = string
   default = "http://localhost:5173"
 }
+
+variable "frontend_origins" {
+  type    = list(string)
+  description = "Explicit CORS allowlist; null preserves frontend_origin through the foundation module."
+  default = null
+}

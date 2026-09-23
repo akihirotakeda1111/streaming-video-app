@@ -15,11 +15,17 @@ ENV FFMPEG_PATH=/usr/local/bin/ffmpeg \
     TMPDIR=/tmp/video-worker
 RUN mkdir -p "$TMPDIR" \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && /usr/local/bin/ffmpeg -version \
     && /usr/local/bin/ffprobe -version \
     && useradd --create-home --uid 10001 worker \
     && chown worker:worker "$TMPDIR"
+RUN mkdir -p /app/certs \
+    && curl --fail --silent --show-error --location --retry 3 \
+       https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+       -o /app/certs/rds-global-bundle.pem \
+    && test -s /app/certs/rds-global-bundle.pem \
+    && chmod 0644 /app/certs/rds-global-bundle.pem
 USER worker
 ENTRYPOINT ["/usr/local/bin/video-worker"]

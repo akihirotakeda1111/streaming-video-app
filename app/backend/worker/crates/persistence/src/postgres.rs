@@ -1,17 +1,20 @@
 //! PostgreSQL implementation of the job-state port.
 
-use std::{future::Future, time::SystemTime};
+use std::{env, future::Future, time::SystemTime};
 
+use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::{Client, NoTls, types::ToSql};
 
 use crate::{
-    JobClaimOutcome, JobOperationOutcome, JobState, LeaseAcquisitionOutcome, PersistenceError,
+    JobClaimOutcome, JobMode, JobOperationOutcome, JobState, LeaseAcquisitionOutcome,
+    PersistenceError,
 };
 
 struct LeaseAcquisitionRecord {
     disposition: String,
     attempt: Option<i32>,
     lease_expires_at: Option<SystemTime>,
+    mode: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +79,7 @@ impl Database for Client {
             disposition: row.get(0),
             attempt: row.get(1),
             lease_expires_at: row.get(2),
+            mode: row.get(3),
         })
     }
 }
@@ -87,16 +91,42 @@ pub struct PostgresJobState<D = Client> {
 
 impl PostgresJobState<Client> {
     pub async fn connect(database_url: &str) -> Result<Self, PersistenceError> {
-        let (database, connection) = tokio_postgres::connect(database_url, NoTls)
-            .await
-            .map_err(map_error)?;
+        let local = env::var("WORKER_RUNTIME_MODE").as_deref() == Ok("local");
+        let ca = env::var("DATABASE_CA_CERT_PATH").ok();
+        Self::connect_with_tls(database_url, local, ca.as_deref()).await
+    }
+
+    pub async fn connect_with_tls(
+        database_url: &str,
+        local: bool,
+        ca: Option<&str>,
+    ) -> Result<Self, PersistenceError> {
+        let (config, url_ca) = crate::tls::configuration(database_url, local)?;
+        let ca = ca
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .or(url_ca.as_deref());
         let (stopped, connection_stopped) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::error!(%error, "postgres connection stopped");
-            }
-            let _ = stopped.send(true);
-        });
+        let database = if config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable {
+            let (database, connection) = config.connect(NoTls).await.map_err(map_error)?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::error!(%error, "postgres connection stopped");
+                }
+                let _ = stopped.send(true);
+            });
+            database
+        } else {
+            let tls = MakeTlsConnector::new(crate::tls::connector(ca)?);
+            let (database, connection) = config.connect(tls).await.map_err(map_error)?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::error!(%error, "postgres connection stopped");
+                }
+                let _ = stopped.send(true);
+            });
+            database
+        };
         Ok(Self {
             database,
             connection_stopped,
@@ -197,10 +227,43 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
         lease_seconds: u64,
         max_attempts: u32,
     ) -> Result<LeaseAcquisitionOutcome, PersistenceError> {
+        match self
+            .acquire_lease_with_mode(
+                job_id,
+                video_id,
+                worker_id,
+                lease_seconds,
+                max_attempts,
+                JobMode::Cli,
+            )
+            .await?
+        {
+            LeaseAcquisitionOutcome::AcquiredWithMode {
+                attempt,
+                lease_expires_at,
+                ..
+            } => Ok(LeaseAcquisitionOutcome::Acquired {
+                attempt,
+                lease_expires_at,
+            }),
+            outcome => Ok(outcome),
+        }
+    }
+
+    async fn acquire_lease_with_mode(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_attempts: u32,
+        mode: JobMode,
+    ) -> Result<LeaseAcquisitionOutcome, PersistenceError> {
         let record = self.database.query_lease_acquisition(
             "WITH acquired AS (
                 UPDATE jobs
                 SET status = 'PROCESSING',
+                    mode = COALESCE(mode, $6),
                     worker_id = $3,
                     lease_expires_at = CURRENT_TIMESTAMP + ($4::text || ' seconds')::interval,
                     attempt = attempt + 1,
@@ -208,11 +271,12 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
                 WHERE id = $1::text::uuid
                   AND video_id = $2::text::uuid
                   AND status IN ('QUEUED', 'PROCESSING')
+                  AND (mode IS NULL OR mode = $6)
                   AND attempt < $5::text::int
                   AND ((worker_id IS NULL AND lease_expires_at IS NULL) OR lease_expires_at <= CURRENT_TIMESTAMP)
-                RETURNING attempt, lease_expires_at
+                RETURNING attempt, lease_expires_at, mode
             ), target AS MATERIALIZED (
-                SELECT status, attempt, lease_expires_at
+                SELECT status, attempt, lease_expires_at, mode
                 FROM jobs
                 WHERE id = $1::text::uuid AND video_id = $2::text::uuid
             )
@@ -226,8 +290,9 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
                      ELSE 'BUSY'
                    END,
                    (SELECT attempt FROM acquired),
-                   (SELECT lease_expires_at FROM acquired)",
-            &[job_id, video_id, worker_id, &lease_seconds.to_string(), &max_attempts.to_string()],
+                   (SELECT lease_expires_at FROM acquired),
+                   COALESCE((SELECT mode FROM acquired), (SELECT mode FROM target))",
+            &[job_id, video_id, worker_id, &lease_seconds.to_string(), &max_attempts.to_string(), mode.as_str()],
         ).await.map_err(map_error)?;
         map_lease_acquisition(record)
     }
@@ -267,8 +332,33 @@ impl<D: Database + Send> JobState for PostgresJobState<D> {
         worker_id: &str,
     ) -> Result<JobOperationOutcome, PersistenceError> {
         let changed = self.database.execute(
-            "UPDATE jobs SET status = 'COMPLETED', worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND worker_id = $3 AND status = 'PROCESSING' AND lease_expires_at > NOW()",
+            "UPDATE jobs SET status = 'COMPLETED', worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND worker_id = $3 AND status = 'PROCESSING' AND lease_expires_at > NOW() AND mode = 'cli' AND published_manifest_key IS NULL",
             &[job_id, video_id, worker_id],
+        ).await.map_err(map_error)?;
+        atomic_outcome(changed)
+    }
+
+    async fn complete_distributed(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        published_manifest_key: &str,
+    ) -> Result<JobOperationOutcome, PersistenceError> {
+        if attempt == 0 {
+            return Err(PersistenceError("invalid distributed attempt".into()));
+        }
+        let execution_id = format!("job-{job_id}-a{attempt}");
+        let expected = format!(
+            "videos/{video_id}/jobs/{job_id}/hls/attempts/{attempt}/{execution_id}/index.m3u8"
+        );
+        if published_manifest_key != expected {
+            return Err(PersistenceError("invalid distributed manifest key".into()));
+        }
+        let changed = self.database.execute(
+            "UPDATE jobs SET status = 'COMPLETED', published_manifest_key = $5, worker_id = NULL, lease_expires_at = NULL, failure_code = NULL, failure_message = NULL, updated_at = NOW() WHERE id = $1::text::uuid AND video_id = $2::text::uuid AND worker_id = $3 AND attempt = $4::text::int AND status = 'PROCESSING' AND lease_expires_at > NOW() AND mode = 'distributed' AND published_manifest_key IS NULL AND $5 <> ''",
+            &[job_id, video_id, worker_id, &attempt.to_string(), published_manifest_key],
         ).await.map_err(map_error)?;
         atomic_outcome(changed)
     }
@@ -302,9 +392,14 @@ fn map_lease_acquisition(
             let lease_expires_at = record.lease_expires_at.ok_or_else(|| {
                 PersistenceError("acquired lease has no expiration timestamp".into())
             })?;
-            Ok(LeaseAcquisitionOutcome::Acquired {
+            Ok(LeaseAcquisitionOutcome::AcquiredWithMode {
                 attempt,
                 lease_expires_at,
+                mode: match record.mode.as_deref() {
+                    Some("distributed") => JobMode::Distributed,
+                    Some("cli") => JobMode::Cli,
+                    _ => return Err(PersistenceError("acquired lease has no valid mode".into())),
+                },
             })
         }
         "BUSY" => Ok(LeaseAcquisitionOutcome::Busy),
@@ -367,6 +462,7 @@ mod tests {
                     disposition: "ACQUIRED".into(),
                     attempt: Some(1),
                     lease_expires_at: Some(SystemTime::UNIX_EPOCH),
+                    mode: Some("cli".into()),
                 },
             }
         }
@@ -400,6 +496,7 @@ mod tests {
                 disposition: self.lease_acquisition.disposition.clone(),
                 attempt: self.lease_acquisition.attempt,
                 lease_expires_at: self.lease_acquisition.lease_expires_at,
+                mode: self.lease_acquisition.mode.clone(),
             }))
         }
     }
@@ -513,7 +610,7 @@ mod tests {
 
         assert_eq!(
             jobs.database.parameters[0],
-            ["job-id", "video-id", "worker-a", "30", "3"]
+            ["job-id", "video-id", "worker-a", "30", "3", "cli"]
         );
         assert_eq!(
             jobs.database.parameters[1],
@@ -537,14 +634,118 @@ mod tests {
         assert!(acquire.contains("attempt < $5::text::int"));
         assert!(acquire.contains("worker_id IS NULL AND lease_expires_at IS NULL"));
         assert!(acquire.contains("status IN ('QUEUED', 'PROCESSING')"));
-        assert!(acquire.contains("RETURNING attempt, lease_expires_at"));
+        assert!(acquire.contains("mode = COALESCE(mode, $6)"));
+        assert!(acquire.contains("(mode IS NULL OR mode = $6)"));
+        assert!(acquire.contains("RETURNING attempt, lease_expires_at, mode"));
+        assert!(
+            acquire.contains("COALESCE((SELECT mode FROM acquired), (SELECT mode FROM target))")
+        );
 
         assert!(jobs.database.statements[1].contains("lease_expires_at > NOW()"));
         assert!(jobs.database.statements[2].contains("lease_expires_at > NOW()"));
         assert!(jobs.database.statements[2].contains("attempt < $4::text::int"));
         assert!(jobs.database.statements[3].contains("lease_expires_at > NOW()"));
+        assert!(jobs.database.statements[3].contains("mode = 'cli'"));
+        assert!(jobs.database.statements[3].contains("published_manifest_key IS NULL"));
         assert!(jobs.database.statements[4].contains("lease_expires_at > NOW()"));
         assert!(jobs.database.statements[4].contains("attempt >= $5::text::int"));
+    }
+
+    #[tokio::test]
+    async fn acquired_mode_is_taken_from_the_acquired_row() {
+        let mut jobs = PostgresJobState::new(FakeDatabase {
+            lease_acquisition: LeaseAcquisitionRecord {
+                disposition: "ACQUIRED".into(),
+                attempt: Some(1),
+                lease_expires_at: Some(SystemTime::UNIX_EPOCH),
+                mode: Some("distributed".into()),
+            },
+            ..FakeDatabase::default()
+        });
+        assert_eq!(
+            jobs.acquire_lease_with_mode(
+                "job-id",
+                "video-id",
+                "worker-a",
+                30,
+                3,
+                JobMode::Distributed,
+            )
+            .await
+            .unwrap(),
+            LeaseAcquisitionOutcome::AcquiredWithMode {
+                attempt: 1,
+                lease_expires_at: SystemTime::UNIX_EPOCH,
+                mode: JobMode::Distributed,
+            }
+        );
+    }
+
+    fn distributed_parent_master_key(job_id: &str, video_id: &str, attempt: u32) -> String {
+        let execution_id = format!("job-{job_id}-a{attempt}");
+        format!("videos/{video_id}/jobs/{job_id}/hls/attempts/{attempt}/{execution_id}/index.m3u8")
+    }
+
+    #[tokio::test]
+    async fn distributed_completion_binds_attempt_and_mode_predicates() {
+        let mut jobs = jobs();
+        let key = distributed_parent_master_key("job-id", "video-id", 1);
+        assert_eq!(
+            jobs.complete_distributed("job-id", "video-id", "worker-a", 1, &key)
+                .await
+                .unwrap(),
+            JobOperationOutcome::Applied
+        );
+        assert_eq!(
+            jobs.database.parameters[0],
+            ["job-id", "video-id", "worker-a", "1", key.as_str()]
+        );
+        let sql = &jobs.database.statements[0];
+        assert!(sql.contains("published_manifest_key = $5"));
+        assert!(sql.contains("attempt = $4::text::int"));
+        assert!(sql.contains("lease_expires_at > NOW()"));
+        assert!(sql.contains("status = 'PROCESSING'"));
+        assert!(sql.contains("mode = 'distributed'"));
+        assert!(sql.contains("published_manifest_key IS NULL"));
+    }
+
+    #[tokio::test]
+    async fn distributed_completion_rejects_zero_attempt_and_invalid_keys_before_update() {
+        let mut jobs = jobs();
+        let valid = distributed_parent_master_key("job-id", "video-id", 1);
+        assert!(
+            jobs.complete_distributed("job-id", "video-id", "worker-a", 0, &valid)
+                .await
+                .is_err()
+        );
+        assert!(
+            jobs.complete_distributed(
+                "job-id",
+                "video-id",
+                "worker-a",
+                1,
+                "videos/video-id/jobs/job-id/hls/index.m3u8"
+            )
+            .await
+            .is_err()
+        );
+        assert!(jobs.database.statements.is_empty());
+        assert!(jobs.database.parameters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn distributed_completion_zero_rows_is_not_owner() {
+        let mut jobs = PostgresJobState::new(FakeDatabase {
+            changed: 0,
+            ..FakeDatabase::default()
+        });
+        let key = distributed_parent_master_key("job-id", "video-id", 2);
+        assert_eq!(
+            jobs.complete_distributed("job-id", "video-id", "worker-a", 2, &key)
+                .await
+                .unwrap(),
+            JobOperationOutcome::NotOwner
+        );
     }
 
     #[tokio::test]
@@ -555,6 +756,7 @@ mod tests {
                 disposition: "BUSY".into(),
                 attempt: None,
                 lease_expires_at: None,
+                mode: None,
             },
             ..FakeDatabase::default()
         });

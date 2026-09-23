@@ -2,7 +2,7 @@
 
 use std::{fmt, sync::Arc, time::SystemTime};
 
-use persistence::{JobState, LeaseAcquisitionOutcome, PersistenceError};
+use persistence::{JobMode, JobState, LeaseAcquisitionOutcome, PersistenceError};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -88,6 +88,10 @@ pub enum NoWorkReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordAcquisitionDisposition {
     Acquired(AcquiredJob),
+    AcquiredWithMode {
+        job: AcquiredJob,
+        mode: JobMode,
+    },
     NotAcquired {
         item: WorkItem,
         reason: NoWorkReason,
@@ -102,6 +106,7 @@ pub struct LeaseAcquisitionProcessor<J> {
     input_bucket: String,
     lease_seconds: u64,
     max_attempts: u32,
+    mode: JobMode,
 }
 
 impl<J> Clone for LeaseAcquisitionProcessor<J> {
@@ -112,6 +117,7 @@ impl<J> Clone for LeaseAcquisitionProcessor<J> {
             input_bucket: self.input_bucket.clone(),
             lease_seconds: self.lease_seconds,
             max_attempts: self.max_attempts,
+            mode: self.mode,
         }
     }
 }
@@ -130,6 +136,7 @@ impl<J> LeaseAcquisitionProcessor<J> {
             input_bucket: input_bucket.into(),
             lease_seconds,
             max_attempts,
+            mode: JobMode::Cli,
         }
     }
 
@@ -146,7 +153,13 @@ impl<J> LeaseAcquisitionProcessor<J> {
             input_bucket: input_bucket.into(),
             lease_seconds,
             max_attempts,
+            mode: JobMode::Cli,
         }
+    }
+
+    pub fn with_mode(mut self, mode: JobMode) -> Self {
+        self.mode = mode;
+        self
     }
 }
 
@@ -170,12 +183,13 @@ impl<J: JobState> LeaseAcquisitionProcessor<J> {
                     dispositions.push(not_acquired(item, NoWorkReason::PersistenceError(error)));
                     continue;
                 }
-                jobs.acquire_lease(
+                jobs.acquire_lease_with_mode(
                     &item.job_id,
                     &item.video_id,
                     self.worker_id.as_str(),
                     self.lease_seconds,
                     self.max_attempts,
+                    self.mode,
                 )
                 .await
             };
@@ -190,6 +204,19 @@ impl<J: JobState> LeaseAcquisitionProcessor<J> {
                     attempt,
                     lease_expires_at,
                 }),
+                Ok(LeaseAcquisitionOutcome::AcquiredWithMode {
+                    attempt,
+                    lease_expires_at,
+                    mode,
+                }) => RecordAcquisitionDisposition::AcquiredWithMode {
+                    job: AcquiredJob {
+                        item,
+                        worker_id: self.worker_id.clone(),
+                        attempt,
+                        lease_expires_at,
+                    },
+                    mode,
+                },
                 Ok(LeaseAcquisitionOutcome::Busy) => not_acquired(item, NoWorkReason::Busy),
                 Ok(LeaseAcquisitionOutcome::Completed) => {
                     not_acquired(item, NoWorkReason::Completed)
@@ -518,7 +545,13 @@ mod tests {
         let acquired = first
             .iter()
             .chain(second.iter())
-            .filter(|result| matches!(result, RecordAcquisitionDisposition::Acquired(_)))
+            .filter(|result| {
+                matches!(
+                    result,
+                    RecordAcquisitionDisposition::Acquired(_)
+                        | RecordAcquisitionDisposition::AcquiredWithMode { .. }
+                )
+            })
             .count();
         assert_eq!(acquired, 1);
     }

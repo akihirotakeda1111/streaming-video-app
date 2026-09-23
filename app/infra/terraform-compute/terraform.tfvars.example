@@ -1,0 +1,15 @@
+aws_region              = "ap-northeast-1"
+shared_state_path       = "../terraform/terraform.tfstate"
+frontend_origin         = "https://frontend.example.invalid"
+acm_certificate_arn     = "arn:aws:acm:ap-northeast-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+database_url_secret_arn  = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:streaming-video/app-database-url"
+# Leave unset only for the initial -target=aws_ecr_repository.api apply.
+# After pushing, set api_image_digest to the real sha256 digest returned by ECR.
+api_desired_count       = 0 # Raise only after successful migration.
+# Leave unset for the initial -target=aws_ecr_repository.worker apply.
+# Push the Worker image, then set its real ECR digest before full apply.
+# worker_image_digest = "sha256:..."
+worker_desired_count    = 0 # Initial service creation only; autoscaling owns subsequent capacity.
+worker_autoscaling_enabled = false # Enable only after secret setup and successful migration.
+worker_autoscaling_min_capacity = 1
+worker_autoscaling_max_capacity = 4

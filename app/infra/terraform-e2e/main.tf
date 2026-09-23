@@ -44,6 +44,7 @@ module "foundation" {
   video_input_bucket  = "${local.prefix}-${var.aws_account_id}-${var.aws_region}-input"
   video_output_bucket = "${local.prefix}-${var.aws_account_id}-${var.aws_region}-output"
   frontend_origin     = var.frontend_origin
+  frontend_origins    = var.frontend_origins
 
   source_visibility_timeout_seconds   = local.timing.visibility
   worker_heartbeat_interval_seconds   = local.timing.heartbeat

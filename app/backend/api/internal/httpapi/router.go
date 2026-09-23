@@ -59,8 +59,8 @@ func NewRouterWithVideoStatus(repo persistence.Repository) http.Handler {
 }
 
 // NewRouterWithVideoPlayback builds the route needed to resolve HLS playback.
-func NewRouterWithVideoPlayback(repo persistence.Repository, outputBucket, outputEndpoint string) http.Handler {
-	return NewRouterWithServices(nil, nil, NewVideoPlaybackService(repo, outputBucket, outputEndpoint))
+func NewRouterWithVideoPlayback(repo persistence.Repository, playbackBaseURL string) http.Handler {
+	return NewRouterWithServices(nil, nil, NewVideoPlaybackService(repo, playbackBaseURL))
 }
 
 func withRequestSizeLimit(next http.Handler) http.Handler {

@@ -1,0 +1,4 @@
+# This config is for the unchanged app/infra/terraform-compute root.
+# Pass its absolute path explicitly during every scalability compute init.
+# Also pass -lockfile=readonly so init cannot rewrite the committed lockfile.
+path = "/var/lib/streaming-video-e2e/scalability/compute/terraform.tfstate"

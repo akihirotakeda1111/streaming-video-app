@@ -2,7 +2,7 @@
 //! record a shared call order, and allow each operation to fail once.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     path::Path,
     sync::{Arc, Mutex},
@@ -10,9 +10,18 @@ use std::{
 };
 
 use encoding::{Command, Execute, Output, ProcessError};
-use persistence::{JobState, LeaseAcquisitionOutcome, PersistenceError};
+use persistence::{JobOperationOutcome, JobState, LeaseAcquisitionOutcome, PersistenceError};
 use queue::{ChangeVisibility, Delete, Message, QueueError, Receive};
-use storage::{ObjectError, Read, Write};
+use storage::{ObjectError, ObjectRead, Read, Write};
+
+use crate::acquisition::AcquiredJob;
+use crate::orchestration::{
+    ExecutionClient, ExecutionInput, ExecutionInspection, ExecutionStatus, Finalizer,
+    OrchestrationError,
+};
+use std::future::Future;
+use std::pin::Pin;
+use tokio::sync::watch;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Call {
@@ -44,6 +53,13 @@ pub enum Call {
         max_attempts: u32,
     },
     MarkProcessing(String),
+    CompleteDistributed {
+        job_id: String,
+        video_id: String,
+        worker_id: String,
+        attempt: u32,
+        published_manifest_key: String,
+    },
     Execute(Command),
     ReadSource {
         path: String,
@@ -141,6 +157,8 @@ pub struct FakeStorage {
     pub log: CallLog,
     pub reads: Vec<(String, String, Vec<u8>)>,
     pub writes: Vec<(String, String, Vec<u8>)>,
+    content_types: HashMap<(String, String), String>,
+    content_lengths: HashMap<(String, String), u64>,
     read_failures: VecDeque<String>,
     write_failures: VecDeque<String>,
     read_skip: usize,
@@ -153,6 +171,8 @@ impl FakeStorage {
             log,
             reads: Vec::new(),
             writes: Vec::new(),
+            content_types: HashMap::new(),
+            content_lengths: HashMap::new(),
             read_failures: VecDeque::new(),
             write_failures: VecDeque::new(),
             read_skip: 0,
@@ -160,6 +180,24 @@ impl FakeStorage {
         }
     }
     pub fn add_read(&mut self, bucket: &str, key: &str, contents: Vec<u8>) {
+        self.add_read_with_metadata(bucket, key, "", None, contents);
+    }
+    pub fn add_read_with_metadata(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        content_length: Option<u64>,
+        contents: Vec<u8>,
+    ) {
+        let identity = (bucket.to_owned(), key.to_owned());
+        if !content_type.is_empty() {
+            self.content_types
+                .insert(identity.clone(), content_type.into());
+        }
+        if let Some(length) = content_length {
+            self.content_lengths.insert(identity, length);
+        }
         self.reads.push((bucket.into(), key.into(), contents));
     }
     pub fn fail_read(&mut self, message: impl Into<String>) {
@@ -188,6 +226,20 @@ impl Read for FakeStorage {
             .find(|(b, k, _)| b == bucket && k == key)
             .map(|(_, _, bytes)| bytes.clone())
             .ok_or_else(|| ObjectError("object not found".into()))
+    }
+
+    async fn read_object(&mut self, bucket: &str, key: &str) -> Result<ObjectRead, ObjectError> {
+        let contents = self.read(bucket, key).await?;
+        let identity = (bucket.to_owned(), key.to_owned());
+        Ok(ObjectRead {
+            content_type: self.content_types.get(&identity).cloned(),
+            content_length: self
+                .content_lengths
+                .get(&identity)
+                .copied()
+                .or(Some(contents.len() as u64)),
+            contents,
+        })
     }
 }
 
@@ -221,6 +273,7 @@ pub struct FakeJobState {
     claim_failures: VecDeque<String>,
     processing_failures: VecDeque<String>,
     lease_acquisitions: VecDeque<Result<LeaseAcquisitionOutcome, PersistenceError>>,
+    complete_distributed_results: VecDeque<Result<JobOperationOutcome, PersistenceError>>,
     claim_skip: usize,
 }
 
@@ -232,6 +285,7 @@ impl FakeJobState {
             claim_failures: VecDeque::new(),
             processing_failures: VecDeque::new(),
             lease_acquisitions: VecDeque::new(),
+            complete_distributed_results: VecDeque::new(),
             claim_skip: 0,
         }
     }
@@ -246,6 +300,13 @@ impl FakeJobState {
     }
     pub fn fail_lease_acquisition(&mut self, message: impl Into<String>) {
         self.lease_acquisitions
+            .push_back(Err(PersistenceError(message.into())));
+    }
+    pub fn complete_distributed_outcome(&mut self, outcome: JobOperationOutcome) {
+        self.complete_distributed_results.push_back(Ok(outcome));
+    }
+    pub fn fail_complete_distributed(&mut self, message: impl Into<String>) {
+        self.complete_distributed_results
             .push_back(Err(PersistenceError(message.into())));
     }
 }
@@ -316,6 +377,39 @@ impl JobState for FakeJobState {
             .pop_front()
             .unwrap_or(Ok(LeaseAcquisitionOutcome::UnknownOrMismatched))
     }
+
+    async fn acquire_lease_with_mode(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_attempts: u32,
+        _mode: persistence::JobMode,
+    ) -> Result<LeaseAcquisitionOutcome, PersistenceError> {
+        self.acquire_lease(job_id, video_id, worker_id, lease_seconds, max_attempts)
+            .await
+    }
+
+    async fn complete_distributed(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        published_manifest_key: &str,
+    ) -> Result<JobOperationOutcome, PersistenceError> {
+        self.log.push(Call::CompleteDistributed {
+            job_id: job_id.into(),
+            video_id: video_id.into(),
+            worker_id: worker_id.into(),
+            attempt,
+            published_manifest_key: published_manifest_key.into(),
+        });
+        self.complete_distributed_results
+            .pop_front()
+            .unwrap_or(Ok(JobOperationOutcome::Applied))
+    }
 }
 
 #[derive(Debug)]
@@ -324,6 +418,217 @@ pub struct FakeProcessExecutor {
     pub output: Output,
     failures: VecDeque<String>,
     write_hls: bool,
+}
+
+/// Controllable orchestration fake: start input and execution identity are
+/// observable, while status and finalization outcomes are explicit.
+#[derive(Clone)]
+pub struct FakeExecutionClient {
+    pub starts: Arc<Mutex<Vec<(String, ExecutionInput)>>>,
+    pub start_results: Arc<Mutex<VecDeque<Result<(), OrchestrationError>>>>,
+    pub statuses: Arc<Mutex<VecDeque<Result<ExecutionStatus, OrchestrationError>>>>,
+    pub inspections: Arc<Mutex<VecDeque<Result<ExecutionInspection, OrchestrationError>>>>,
+    pub executions: Arc<Mutex<HashMap<String, (ExecutionInput, ExecutionStatus)>>>,
+    pub cancellations: Arc<Mutex<Vec<String>>>,
+    cancel_stops: Arc<Mutex<bool>>,
+    status_fallback: Arc<Mutex<Option<Result<ExecutionStatus, OrchestrationError>>>>,
+    residual_running: Arc<Mutex<HashMap<String, usize>>>,
+    residual_errors: Arc<Mutex<HashMap<String, OrchestrationError>>>,
+}
+
+impl FakeExecutionClient {
+    pub fn new(statuses: Vec<Result<ExecutionStatus, OrchestrationError>>) -> Self {
+        Self {
+            starts: Arc::new(Mutex::new(Vec::new())),
+            start_results: Arc::new(Mutex::new(VecDeque::new())),
+            statuses: Arc::new(Mutex::new(statuses.into_iter().collect())),
+            inspections: Arc::new(Mutex::new(VecDeque::new())),
+            executions: Arc::new(Mutex::new(HashMap::new())),
+            cancellations: Arc::new(Mutex::new(Vec::new())),
+            cancel_stops: Arc::new(Mutex::new(true)),
+            status_fallback: Arc::new(Mutex::new(None)),
+            residual_running: Arc::new(Mutex::new(HashMap::new())),
+            residual_errors: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn hold_running_after_cancel(&self) {
+        *self.cancel_stops.lock().unwrap() = false;
+    }
+
+    pub fn keep_failing_status(&self, error: OrchestrationError) {
+        *self.status_fallback.lock().unwrap() = Some(Err(error));
+    }
+
+    pub fn set_residual_running(&self, name: &str, count: usize) {
+        self.residual_running
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), count);
+    }
+
+    pub fn fail_residual_inspection(&self, name: &str, error: OrchestrationError) {
+        self.residual_errors
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), error);
+    }
+
+    pub fn queue_inspection(&self, result: Result<ExecutionInspection, OrchestrationError>) {
+        self.inspections.lock().unwrap().push_back(result);
+    }
+
+    pub fn fail_start(&self, error: OrchestrationError) {
+        self.start_results.lock().unwrap().push_back(Err(error));
+    }
+
+    pub fn seed_execution(&self, name: &str, input: ExecutionInput) {
+        self.seed_execution_with_status(name, input, ExecutionStatus::Running);
+    }
+
+    pub fn seed_execution_with_status(
+        &self,
+        name: &str,
+        input: ExecutionInput,
+        status: ExecutionStatus,
+    ) {
+        self.executions
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), (input, status));
+    }
+}
+
+impl ExecutionClient for FakeExecutionClient {
+    fn start(
+        &self,
+        name: &str,
+        input: &ExecutionInput,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrationError>> + Send + '_>> {
+        let name = name.to_owned();
+        let input = input.clone();
+        Box::pin(async move {
+            self.starts
+                .lock()
+                .unwrap()
+                .push((name.clone(), input.clone()));
+            if let Some(result) = self.start_results.lock().unwrap().pop_front() {
+                return result;
+            }
+            self.executions
+                .lock()
+                .unwrap()
+                .entry(name)
+                .or_insert((input, ExecutionStatus::Running));
+            Ok(())
+        })
+    }
+    fn status(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecutionStatus, OrchestrationError>> + Send + '_>>
+    {
+        let name = name.to_owned();
+        Box::pin(async move {
+            if let Some(result) = self.statuses.lock().unwrap().pop_front() {
+                return result;
+            }
+            if let Some(result) = self.status_fallback.lock().unwrap().clone() {
+                return result;
+            }
+            Ok(self
+                .executions
+                .lock()
+                .unwrap()
+                .get(&name)
+                .map(|(_, status)| *status)
+                .unwrap_or(ExecutionStatus::Running))
+        })
+    }
+    fn inspect(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecutionInspection, OrchestrationError>> + Send + '_>>
+    {
+        let name = name.to_owned();
+        Box::pin(async move {
+            if let Some(result) = self.inspections.lock().unwrap().pop_front() {
+                return result;
+            }
+            Ok(self
+                .executions
+                .lock()
+                .unwrap()
+                .get(&name)
+                .map(|(input, status)| ExecutionInspection::Found {
+                    status: *status,
+                    input_json: input.payload_json().expect("test input"),
+                })
+                .unwrap_or(ExecutionInspection::NotFound))
+        })
+    }
+    fn cancel(&self, name: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let name = name.to_owned();
+        Box::pin(async move {
+            self.cancellations.lock().unwrap().push(name.clone());
+            if *self.cancel_stops.lock().unwrap() {
+                if let Some((_, status)) = self.executions.lock().unwrap().get_mut(&name) {
+                    *status = ExecutionStatus::Failed;
+                }
+            }
+        })
+    }
+
+    fn residual_running_children(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, OrchestrationError>> + Send + '_>> {
+        let name = name.to_owned();
+        Box::pin(async move {
+            if let Some(error) = self.residual_errors.lock().unwrap().get(&name).cloned() {
+                return Err(error);
+            }
+            Ok(self
+                .residual_running
+                .lock()
+                .unwrap()
+                .get(&name)
+                .copied()
+                .unwrap_or(0))
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct FakeFinalizer {
+    pub result: Arc<Mutex<Result<(), OrchestrationError>>>,
+    pub calls: Arc<Mutex<usize>>,
+}
+
+impl FakeFinalizer {
+    pub fn new(result: Result<(), OrchestrationError>) -> Self {
+        Self {
+            result: Arc::new(Mutex::new(result)),
+            calls: Arc::new(Mutex::new(0)),
+        }
+    }
+}
+
+impl Finalizer for FakeFinalizer {
+    fn finalize(
+        &self,
+        _: &AcquiredJob,
+        _: &ExecutionInput,
+        ownership: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrationError>> + Send + '_>> {
+        Box::pin(async move {
+            *self.calls.lock().unwrap() += 1;
+            if *ownership.borrow() {
+                return Err(OrchestrationError::OwnershipLost);
+            }
+            self.result.lock().unwrap().clone()
+        })
+    }
 }
 impl FakeProcessExecutor {
     /// Records `Execute` and writes a minimal valid HLS layout next to the

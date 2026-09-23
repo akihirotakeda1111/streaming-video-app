@@ -58,6 +58,35 @@ func testRepositoryRoundTrip(t *testing.T, migrations []testutil.Migration) {
 	if got.Job.Status != JobStatusUploading || got.Job.Failure != nil {
 		t.Fatalf("GetVideoByID() job = %#v", got.Job)
 	}
+	if got.Job.Mode != "" || got.Job.Attempt != 0 || got.Job.PublishedManifestKey != nil {
+		t.Fatalf("GetVideoByID() unresolved publication state = %#v", got.Job)
+	}
+
+	columns := tableColumns(t, db, "jobs")
+	if _, ok := columns["attempt"]; ok {
+		if _, err := db.ExecContext(ctx, `UPDATE jobs SET attempt = 2 WHERE id = $1`, input.JobID); err != nil {
+			t.Fatalf("set attempt: %v", err)
+		}
+		withAttempt, err := repo.GetVideoByID(ctx, input.VideoID)
+		if err != nil {
+			t.Fatalf("GetVideoByID() after attempt update: %v", err)
+		}
+		if withAttempt.Job.Attempt != 2 {
+			t.Fatalf("attempt = %d, want 2", withAttempt.Job.Attempt)
+		}
+	}
+	if _, ok := columns["mode"]; ok {
+		if _, err := db.ExecContext(ctx, `UPDATE jobs SET mode = $1, published_manifest_key = NULL WHERE id = $2`, JobModeCLI, input.JobID); err != nil {
+			t.Fatalf("set mode: %v", err)
+		}
+		withMode, err := repo.GetVideoByID(ctx, input.VideoID)
+		if err != nil {
+			t.Fatalf("GetVideoByID() after mode update: %v", err)
+		}
+		if withMode.Job.Mode != JobModeCLI || withMode.Job.PublishedManifestKey != nil {
+			t.Fatalf("publication state = %#v", withMode.Job)
+		}
+	}
 
 	_, err = db.ExecContext(ctx, `
 UPDATE jobs

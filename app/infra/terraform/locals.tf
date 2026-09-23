@@ -1,4 +1,5 @@
 locals {
+  frontend_origins = var.frontend_origins == null ? [var.frontend_origin] : var.frontend_origins
   name_prefix      = "${var.project_name}-${var.environment}"
   s3_path_wildcard = "*"
 

@@ -16,14 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# Mirrors the Phase 1 infra spec: application compute and PostgreSQL stay local,
-# while CloudFront, orchestration, retry infrastructure, and production hardening
-# are deferred. Change this boundary only when the task spec changes.
+# Mirrors the current infrastructure boundary. Application compute and PostgreSQL
+# stay local; delivery is now owned by CloudFront and OAC.
 FORBIDDEN_RESOURCE_PREFIXES = (
     "aws_alb",
     "aws_appautoscaling_",
     "aws_autoscaling_",
-    "aws_cloudfront_",
     "aws_db_",
     "aws_dynamodb_",
     "aws_ec2_",
@@ -61,7 +59,7 @@ WRITE_ACTIONS = {
 }
 
 BLOCK_RE = re.compile(
-    r'(?m)^\s*(resource|data|variable|output|provider)\s+"([^"\r\n]+)"'
+    r'(?m)^\s*(resource|data|variable|output|provider|module)\s+"([^"\r\n]+)"'
     r'(?:\s+"([^"\r\n]+)")?\s*\{'
 )
 STRING_RE = re.compile(r'"((?:\\.|[^"\\])*)"', re.DOTALL)
@@ -254,6 +252,10 @@ def _attribute_is_false(text: str, name: str) -> bool:
     return value is not None and re.match(r"false\b", value, re.IGNORECASE) is not None
 
 
+def _assignment_is(text: str, name: str, value: str) -> bool:
+    return re.search(rf"\b{re.escape(name)}\s*=\s*{re.escape(value)}(?![A-Za-z0-9_])", text) is not None
+
+
 def _normalized_expression(value: str | None) -> str:
     return re.sub(r"\s+", "", value or "").lower()
 
@@ -284,6 +286,94 @@ def _policy_text(config: Configuration, block: Block) -> str:
         if document is not None:
             parts.append(document.body)
     return "\n".join(parts)
+
+
+def _linked_policy(config: Configuration, behavior: str, type_name: str, attribute: str) -> Block | None:
+    expression = _normalized_expression(_attribute(behavior, attribute))
+    for policy in config.resources(type_name):
+        if expression == f"{type_name}.{policy.name}.id":
+            return policy
+    return None
+
+
+def _ttl_seconds(body: str, name: str) -> int | None:
+    value = _attribute(body, name)
+    if value is None:
+        return None
+    token = value.split()[0]
+    if not token.isdigit():
+        return None
+    return int(token)
+
+
+def _cache_policy_ttls_are_zero(body: str) -> bool:
+    return all(_ttl_seconds(body, name) == 0 for name in ("min_ttl", "default_ttl", "max_ttl"))
+
+
+def _cache_policy_is_cacheable(body: str) -> bool:
+    default_ttl = _ttl_seconds(body, "default_ttl")
+    max_ttl = _ttl_seconds(body, "max_ttl")
+    min_ttl = _ttl_seconds(body, "min_ttl")
+    return (
+        min_ttl is not None
+        and default_ttl is not None
+        and max_ttl is not None
+        and default_ttl > 0
+        and max_ttl >= default_ttl
+    )
+
+
+def _nested_bodies(text: str, name: str) -> list[str]:
+    # Preserve quoted strings while removing comments from structural checks.
+    text = re.sub(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*|\#[^\n]*',
+                  lambda match: match.group() if match.group().startswith('"') else " ",
+                  text, flags=re.DOTALL)
+    return [text[match.end():_matching_brace(text, match.end() - 1, Path("policy"))]
+            for match in re.finditer(rf'\b{re.escape(name)}\s*\{{', text)]
+
+
+def _has_delivery_source_arn(config: Configuration, policy: str, output_name: str) -> bool:
+    distributions = {
+        block.name for block in config.resources("aws_cloudfront_distribution")
+        if any(_normalized_expression(_attribute(origin, "domain_name")) ==
+               f"aws_s3_bucket.{output_name}.bucket_regional_domain_name"
+               for origin in _nested_bodies(block.body, "origin"))
+    }
+    expected = {f"[aws_cloudfront_distribution.{name}.arn]" for name in distributions}
+    statements = [body for body in _nested_bodies(policy, "statement")
+                  if _assignment_is(body, "effect", '"Allow"')
+                  and "s3:getobject" in _policy_actions(body)]
+    return bool(statements) and all(
+        any(_assignment_is(principal, "type", '"Service"') and
+            _normalized_expression(_collection_attribute(principal, "identifiers")) ==
+            '["cloudfront.amazonaws.com"]'
+            for principal in _nested_bodies(statement, "principals")) and
+        any(_assignment_is(condition, "test", '"StringEquals"') and
+            _assignment_is(condition, "variable", '"AWS:SourceArn"') and
+            _normalized_expression(_collection_attribute(condition, "values")) in expected
+            for condition in _nested_bodies(statement, "condition"))
+        for statement in statements
+    )
+
+
+def _denies_cloudfront_result_json(policy: str) -> bool:
+    """Require an explicit CloudFront Deny of attempt-scoped result.json objects."""
+    for statement in _nested_bodies(policy, "statement"):
+        if not _assignment_is(statement, "effect", '"Deny"'):
+            continue
+        if "s3:getobject" not in _policy_actions(statement):
+            continue
+        if "cloudfront.amazonaws.com" not in statement.lower():
+            continue
+        if "hls/attempts" not in statement or "result.json" not in statement:
+            continue
+        if any(
+            _assignment_is(principal, "type", '"Service"')
+            and "cloudfront.amazonaws.com" in principal
+            for principal in _nested_bodies(statement, "principals")
+        ):
+            return True
+    return False
 
 
 def _find_linked_block(
@@ -329,7 +419,9 @@ def check_foundation(config: Configuration, checks: Checks) -> None:
         )
 
 
-def check_forbidden_resources(config: Configuration, checks: Checks) -> None:
+def check_forbidden_resources(config: Configuration, checks: Checks, stage: str = "complete") -> None:
+    if stage in {"compute", "workers", "scaling", "orchestration"}:
+        return
     for block in config.resources():
         forbidden = block.type_name in FORBIDDEN_RESOURCE_TYPES or block.type_name.startswith(
             FORBIDDEN_RESOURCE_PREFIXES
@@ -418,12 +510,12 @@ def check_storage_queue(config: Configuration, checks: Checks) -> tuple[str | No
         if (
             "s3:getobject" in actions
             and _has(policy, "videos/*/jobs/*/hls/*")
-            and _has_public_principal(policy)
+            and not _has_public_principal(policy)
         ):
             output_policy_candidates.append((block, policy, _bucket_reference(block)))
     checks.require(
         bool(output_policy_candidates),
-        "a public s3:GetObject policy restricted to Phase 1 HLS keys is required",
+        "a private s3:GetObject policy restricted to HLS keys is required",
     )
     if output_policy_candidates:
         policy_block, _, bucket_refs = output_policy_candidates[0]
@@ -502,9 +594,8 @@ def check_storage_queue(config: Configuration, checks: Checks) -> tuple[str | No
                 )
             for setting in ("block_public_policy", "restrict_public_buckets"):
                 checks.require(
-                    _attribute_is_false(block.body, setting),
-                    f"{block.location}: output bucket must set {setting} = false "
-                    "for direct HLS reads",
+                    _attribute_is_true(block.body, setting),
+                    f"{block.location}: output bucket must set {setting} = true",
                 )
 
         output_cors = _find_linked_block(cors_blocks, "aws_s3_bucket", output_name)
@@ -528,7 +619,7 @@ def check_storage_queue(config: Configuration, checks: Checks) -> tuple[str | No
         linked_policies = _find_linked_block(bucket_policies, "aws_s3_bucket", output_name)
         checks.require(
             bool(linked_policies),
-            "the public-read policy must be attached only to the output bucket",
+            "the private HLS policy must be attached only to the output bucket",
         )
         for linked_policy in linked_policies:
             policy = _policy_text(config, linked_policy)
@@ -536,19 +627,27 @@ def check_storage_queue(config: Configuration, checks: Checks) -> tuple[str | No
             actions = _policy_actions(policy)
             checks.require(
                 "s3:getobject" in actions,
-                f"{linked_policy.location}: output public policy must grant s3:GetObject",
+                f"{linked_policy.location}: output policy must grant s3:GetObject",
             )
             checks.require(
-                "*" in values,
-                f"{linked_policy.location}: output policy must grant unauthenticated reads",
+                "cloudfront.amazonaws.com" in values,
+                f"{linked_policy.location}: output policy must grant CloudFront only",
             )
             checks.require(
                 _has(policy, "videos/*/jobs/*/hls/*"),
-                f"{linked_policy.location}: public read must be limited to Phase 1 HLS keys",
+                f"{linked_policy.location}: CloudFront read must be limited to HLS keys",
+            )
+            checks.require(
+                _denies_cloudfront_result_json(policy),
+                f"{linked_policy.location}: CloudFront must be denied s3:GetObject for attempt result.json objects",
+            )
+            checks.require(
+                _has_delivery_source_arn(config, policy, output_name),
+                f"{linked_policy.location}: each HLS Allow must restrict the CloudFront service to the linked distribution ARN using StringEquals AWS:SourceArn",
             )
             checks.reject(
                 bool(actions & WRITE_ACTIONS) or "s3:listbucket" in actions,
-                f"{linked_policy.location}: output public policy must not grant list or write",
+                f"{linked_policy.location}: output policy must not grant list or write",
             )
 
     if input_name is not None and encoding_queue_name is not None:
@@ -589,6 +688,77 @@ def _policy_actions(policy: str) -> set[str]:
     ):
         actions.update(value for value in _lower_strings(match.group(1)) if ":" in value)
     return actions
+
+
+def check_delivery(config: Configuration, checks: Checks, output_name: str | None) -> None:
+    """Check the private CloudFront/OAC delivery contract without evaluating HCL."""
+    distributions = config.resources("aws_cloudfront_distribution")
+    oacs = config.resources("aws_cloudfront_origin_access_control")
+    cache_policies = config.resources("aws_cloudfront_cache_policy")
+    response_policies = config.resources("aws_cloudfront_response_headers_policy")
+
+    checks.require(bool(distributions), "a CloudFront distribution is required for delivery")
+    checks.require(bool(oacs), "a CloudFront origin access control is required")
+    checks.require(bool(cache_policies), "a CloudFront cache policy is required")
+    checks.require(bool(response_policies), "a CloudFront response headers policy is required")
+
+    for block in oacs:
+        checks.require(_assignment_is(block.body, "origin_access_control_origin_type", '"s3"'), f"{block.location}: OAC must target an S3 REST origin")
+        checks.require(_assignment_is(block.body, "signing_protocol", '"sigv4"'), f"{block.location}: OAC must use SigV4")
+        checks.require(_assignment_is(block.body, "signing_behavior", '"always"'), f"{block.location}: OAC signing behavior must always sign")
+
+    for block in distributions:
+        checks.require(_has(block.body, "bucket_regional_domain_name"), f"{block.location}: CloudFront must use the S3 REST regional origin")
+        checks.require(_has(block.body, "origin_access_control_id"), f"{block.location}: distribution must attach an OAC")
+        checks.require(_has(block.body, "redirect-to-https"), f"{block.location}: viewer protocol must redirect to HTTPS")
+        checks.require(all(method in _strings(block.body) for method in ("GET", "HEAD", "OPTIONS")), f"{block.location}: delivery must support GET, HEAD, and OPTIONS")
+        checks.require(_has(block.body, "cache_policy_id") and _has(block.body, "response_headers_policy_id"), f"{block.location}: cache and response-header policies are required")
+        for behavior in _nested_bodies(block.body, "default_cache_behavior") + _nested_bodies(block.body, "ordered_cache_behavior"):
+            if "OPTIONS" not in _strings(_collection_attribute(behavior, "allowed_methods") or ""):
+                continue
+            policies = [policy for policy in config.resources()
+                        if policy.type_name in {"aws_cloudfront_origin_request_policy", "aws_cloudfront_cache_policy"}
+                        and _normalized_expression(_attribute(behavior, "origin_request_policy_id" if policy.type_name == "aws_cloudfront_origin_request_policy" else "cache_policy_id")) == f"{policy.type_name}.{policy.name}.id"]
+            forwarded = set()
+            for policy in policies:
+                for headers in _nested_bodies(policy.body, "headers_config"):
+                    if _assignment_is(headers, "header_behavior", '"whitelist"'):
+                        forwarded.update(_strings(headers))
+            checks.require({"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"} <= forwarded,
+                           f"{block.location}: OPTIONS requires the three CORS preflight headers in linked request/cache policies")
+        checks.require(_assignment_is(block.body, "error_code", "403") and _assignment_is(block.body, "error_code", "404") and len(re.findall(r"\berror_caching_min_ttl\s*=\s*0\b", block.body)) >= 2, f"{block.location}: 403/404 error caching must use the service minimum")
+
+        for behavior in _nested_bodies(block.body, "default_cache_behavior"):
+            policy = _linked_policy(config, behavior, "aws_cloudfront_cache_policy", "cache_policy_id")
+            checks.require(
+                policy is not None and _cache_policy_ttls_are_zero(policy.body),
+                f"{block.location}: legacy HLS cache TTLs must start at zero",
+            )
+
+        attempt_behaviors = [
+            behavior
+            for behavior in _nested_bodies(block.body, "ordered_cache_behavior")
+            if "hls/attempts" in behavior
+        ]
+        checks.require(
+            bool(attempt_behaviors),
+            f"{block.location}: attempt-specific HLS paths must have a cacheable behavior",
+        )
+        for behavior in attempt_behaviors:
+            policy = _linked_policy(config, behavior, "aws_cloudfront_cache_policy", "cache_policy_id")
+            checks.require(
+                policy is not None and _cache_policy_is_cacheable(policy.body),
+                f"{block.location}: attempt-specific HLS cache TTLs must be cacheable",
+            )
+
+    for block in response_policies:
+        checks.require(_has(block.body, "access_control_allow_origins") and _has(block.body, "local.frontend_origins"), f"{block.location}: CloudFront CORS must use approved frontend origins")
+        checks.require(_has(block.body, "origin_override") and _attribute_is_true(block.body, "origin_override"), f"{block.location}: CORS must apply on cache hits")
+
+    outputs = [block for block in config.blocks if block.kind == "output"]
+    checks.require(any((block.name or block.type_name).lower() == "playback_base_url" for block in outputs), "PLAYBACK_BASE_URL output is required")
+    checks.require(any("cloudfront_distribution" in block.body and ".domain_name" in block.body for block in outputs), "CloudFront domain output is required")
+    checks.require(any("cloudfront_distribution" in block.body and ".id" in block.body for block in outputs), "CloudFront ID output is required")
 
 
 def check_iam_separation(
@@ -718,6 +888,33 @@ def _has_wildcard_resource(policy: str) -> bool:
     return False
 
 
+def _mask_nested_objects(body: str) -> str:
+    """Blank nested `{...}` objects so only direct statement attributes remain."""
+    direct = STRING_RE.sub(lambda match: " " * len(match.group()), body)
+    cursor = 0
+    while cursor < len(direct):
+        if direct[cursor] == "{":
+            end = _matching_brace(body, cursor, Path("IAM statement"))
+            body = body[:cursor] + " " * (end + 1 - cursor) + body[end + 1:]
+            cursor = end
+        cursor += 1
+    return body
+
+
+def _iam_statement_bodies(policy: str) -> list[str]:
+    """Return IAM statement object bodies, ignoring nested Condition objects."""
+    statements: list[str] = []
+    masked = STRING_RE.sub(lambda match: " " * len(match.group()), policy)
+    for opening, char in enumerate(masked):
+        if char != "{":
+            continue
+        closing = _matching_brace(policy, opening, Path("IAM policy"))
+        raw = policy[opening + 1:closing]
+        if _policy_actions(_mask_nested_objects(raw)):
+            statements.append(raw)
+    return statements
+
+
 def _has_public_principal(policy: str) -> bool:
     return re.search(
         r'(?is)["\']?(?:principal|identifiers)["\']?\s*[:=]\s*'
@@ -726,7 +923,74 @@ def _has_public_principal(policy: str) -> bool:
     ) is not None
 
 
-def check_dangerous_configuration(config: Configuration, checks: Checks) -> None:
+def _without_ecr_token_statements(policy: str) -> str:
+    """Remove only literal, token-only statement objects, never a whole policy."""
+    masked = STRING_RE.sub(lambda match: " " * len(match.group()), policy)
+    spans: list[tuple[int, int]] = []
+    for opening, char in enumerate(masked):
+        if char != "{":
+            continue
+        closing = _matching_brace(policy, opening, Path("IAM policy"))
+        # A statement can contain a Condition object; inspect only its direct
+        # attributes so a nested token statement cannot exempt its parent.
+        body = policy[opening + 1:closing]
+        direct = STRING_RE.sub(lambda match: " " * len(match.group()), body)
+        cursor = 0
+        while cursor < len(direct):
+            if direct[cursor] == "{":
+                end = _matching_brace(body, cursor, Path("IAM statement"))
+                body = body[:cursor] + " " * (end + 1 - cursor) + body[end + 1:]
+                cursor = end
+            cursor += 1
+        if re.search(
+            r'(?i)(?:"Action"|"actions"|\bAction\b|\bactions\b)\s*[:=]\s*'
+            r'(?:\[\s*"ecr:GetAuthorizationToken"\s*,?\s*\]|"ecr:GetAuthorizationToken")'
+            r'\s*(?=,|\n|$)', body
+        ) and _policy_actions(body) == {"ecr:getauthorizationtoken"} and not re.search(
+            r'(?i)\bnot_?action', body
+        ):
+            spans.append((opening, closing + 1))
+    for start, end in reversed(spans):
+        policy = policy[:start] + " " * (end - start) + policy[end:]
+    return policy
+
+
+def check_task_protection_scope(config: Configuration, policy: str, checks: Checks, location: str) -> None:
+    """Require protection statements to target tasks in a deployed service's cluster."""
+    clusters = {
+        name for service in config.resources("aws_ecs_service")
+        for name in _resource_references(_attribute(service.body, "cluster") or "", "aws_ecs_cluster")
+    } & {block.name for block in config.resources("aws_ecs_cluster")}
+    expected = {
+        '"arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/'
+        '${aws_ecs_cluster.' + name + '.name}/*"'
+        for name in clusters
+    }
+    masked = STRING_RE.sub(lambda match: " " * len(match.group()), policy)
+    for opening, char in enumerate(masked):
+        if char != "{":
+            continue
+        closing = _matching_brace(policy, opening, Path("IAM policy"))
+        body = policy[opening + 1:closing]
+        # Mask nested objects so policy wrappers are ignored while statements
+        # with Condition objects still have their direct Resource checked.
+        direct = STRING_RE.sub(lambda match: " " * len(match.group()), body)
+        cursor = 0
+        while cursor < len(direct):
+            if direct[cursor] == "{":
+                end = _matching_brace(body, cursor, Path("IAM statement"))
+                body = body[:cursor] + " " * (end + 1 - cursor) + body[end + 1:]
+                cursor = end
+            cursor += 1
+        if _policy_actions(body) & {"ecs:updatetaskprotection", "ecs:gettaskprotection"}:
+            resource = _collection_attribute(body, "Resource") or _collection_attribute(body, "resources")
+            normalized = _normalized_expression(resource)
+            allowed = {_normalized_expression(arn) for arn in expected}
+            checks.require(normalized in allowed or normalized in {f"[{arn}]" for arn in allowed},
+                           f"{location}: task protection must target cluster-scoped task ARNs")
+
+
+def check_dangerous_configuration(config: Configuration, checks: Checks, stage: str = "complete") -> None:
     for block in config.resources():
         if block.type_name == "aws_s3_bucket_acl":
             values = _lower_strings(block.body)
@@ -738,7 +1002,30 @@ def check_dangerous_configuration(config: Configuration, checks: Checks) -> None
         if block.type_name in POLICY_RESOURCE_TYPES:
             policy = _policy_text(config, block)
             checks.reject(_has_wildcard_action(policy), f"{block.location}: wildcard IAM actions are forbidden")
-            checks.reject(_has_wildcard_resource(policy), f"{block.location}: wildcard IAM resources are forbidden")
+            # ECR's authorization-token API is the AWS-defined exception: it
+            # requires Resource "*" even when all image actions are scoped.
+            scoped_policy = _without_ecr_token_statements(policy) if stage in {"compute", "workers", "scaling", "orchestration"} else policy
+            if stage in {"compute", "workers", "scaling", "orchestration"}:
+                check_task_protection_scope(config, policy, checks, block.location)
+                ecs_wildcard_actions = {"ecs:describetasks", "ecs:stoptask"}
+                for statement in _iam_statement_bodies(scoped_policy):
+                    if not _has_wildcard_resource(statement):
+                        continue
+                    actions = _policy_actions(statement)
+                    checks.require(
+                        bool(actions) and actions <= ecs_wildcard_actions,
+                        f"{block.location}: wildcard IAM resources are forbidden",
+                    )
+                    if actions <= ecs_wildcard_actions:
+                        checks.require(
+                            "ecs:cluster" in statement and "aws_ecs_cluster.main.arn" in statement,
+                            f"{block.location}: ECS wildcard actions must be conditioned on the worker cluster",
+                        )
+            else:
+                checks.reject(
+                    _has_wildcard_resource(scoped_policy),
+                    f"{block.location}: wildcard IAM resources are forbidden",
+                )
             if _has_public_principal(policy):
                 checks.reject(
                     bool(_policy_actions(policy) & WRITE_ACTIONS),
@@ -840,6 +1127,7 @@ def check_reliability(
             _attribute(source.body, "visibility_timeout_seconds") is not None,
             f"{source.location}: source visibility timeout must be explicit",
         )
+
         checks.require(
             _has(source.body, "redrive_policy")
             and dlq_name is not None
@@ -988,23 +1276,493 @@ def check_reliability(
             f"{block.location}: worker policy must not send to the DLQ or purge queues",
         )
 
-def validate(config: Configuration, stage: str) -> list[str]:
+
+def _api_up_migrations() -> list[str]:
+    directory = (
+        Path(__file__).resolve().parents[1]
+        / "backend"
+        / "api"
+        / "internal"
+        / "persistence"
+        / "migrations"
+    )
+    return sorted(path.name for path in directory.glob("*.up.sql"))
+
+
+def _migration_task_definitions(config: Configuration) -> list[Block]:
+    return [
+        block
+        for block in config.resources("aws_ecs_task_definition")
+        if "migration" in (block.name or "").lower()
+    ]
+
+
+def _check_migration_task(config: Configuration, checks: Checks) -> None:
+    tasks = _migration_task_definitions(config)
+    checks.require(bool(tasks), "a one-off migration task definition is required")
+    required = _api_up_migrations()
+    checks.require(bool(required), "API persistence migrations (*.up.sql) must exist")
+    for block in tasks:
+        missing = [name for name in required if name not in block.body]
+        checks.require(
+            not missing,
+            f"{block.location}: migration task must apply every bundled up migration "
+            f"({', '.join(required)}); missing {', '.join(missing)}",
+        )
+
+
+def check_compute(config: Configuration, checks: Checks) -> None:
+    """Check the Phase 3 compute root without evaluating Terraform or AWS."""
+    resources = {block.type_name for block in config.resources()}
+    required = {
+        "aws_vpc", "aws_subnet", "aws_security_group", "aws_db_subnet_group",
+        "aws_db_instance", "aws_ecs_cluster", "aws_ecs_task_definition",
+        "aws_ecs_service", "aws_lb", "aws_lb_listener", "aws_ecr_repository",
+        "aws_cloudwatch_log_group", "aws_iam_role", "aws_iam_role_policy",
+    }
+    for resource_type in sorted(required):
+        checks.require(resource_type in resources, f"compute root requires {resource_type}")
+
+    checks.require("terraform_remote_state" in {b.type_name for b in config.data()},
+                   "compute root must consume the shared S3/SQS root through remote state")
+    checks.require(any("source.mp4" in block.body and "s3" in block.body.lower()
+                       for block in config.resources("aws_iam_role_policy")),
+                   "API role must retain only presigned source upload access")
+    checks.require(any("manage_master_user_password" in block.body
+                       for block in config.resources("aws_db_instance")),
+                   "RDS administration must use the service-managed password")
+    for block in config.resources("aws_db_instance"):
+        checks.require("publicly_accessible" in block.body and "false" in block.body,
+                       f"{block.location}: RDS must be private")
+        checks.require("storage_encrypted" in block.body and "true" in block.body,
+                       f"{block.location}: RDS storage encryption is required")
+    checks.require(any("5432" in block.body and "aws_security_group" in block.body
+                       for block in config.resources("aws_security_group_rule")),
+                   "database ingress must be restricted to application security groups")
+    checks.require(any("acm_certificate" in block.body for block in config.resources("aws_lb_listener")),
+                   "ALB HTTPS listener must use an operator-supplied ACM certificate")
+    _check_migration_task(config, checks)
+
+
+def _worst_case_output_bucket_length(prefix_template: str) -> int:
+    """Return the longest output bucket name for the capped instance and region."""
+    prefix = prefix_template.replace("${var.instance}", "a" * 12)
+    return len(f"{prefix}-{'0' * 12}-{'r' * 16}-output")
+
+
+def _read_optional_text(path: Path) -> str:
+    """Read a companion file, or return an empty string when it is missing."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def check_scalability_e2e(config: Configuration, checks: Checks) -> None:
+    """Check the module-only scalability E2E wiring without evaluating Terraform."""
+    modules = [block for block in config.blocks if block.kind == "module"]
+    foundation = [block for block in modules if block.type_name == "foundation"]
+    checks.require(len(foundation) == 1, "scalability E2E must instantiate one foundation module")
+    if foundation:
+        checks.require(
+            _attribute(foundation[0].body, "source") == '"../../terraform"',
+            "scalability E2E foundation must reuse app/infra/terraform",
+        )
+        checks.require(
+            "scalability-e2e" in foundation[0].body,
+            "scalability E2E foundation must use a dedicated environment identity",
+        )
+    checks.require(not config.resources(), "scalability E2E must not duplicate compute resources")
+    checks.require(
+        'path = "/dev/null/streaming-video-scalability-e2e-delivery.tfstate"' in config.text,
+        "scalability E2E delivery backend must use an unusable sentinel path",
+    )
+    checks.reject(
+        "/var/lib/streaming-video-e2e/scalability/delivery/terraform.tfstate" in config.text,
+        "scalability E2E delivery configuration must not fall back to a writable state path",
+    )
+    prefix_match = re.search(r'(?m)^\s*s3_bucket_prefix\s*=\s*"([^"]+)"', config.text)
+    checks.require(prefix_match is not None, "scalability E2E must declare a short S3 bucket prefix")
+    if prefix_match:
+        prefix_template = prefix_match.group(1)
+        checks.require(
+            "${var.instance}" in prefix_template and "streaming-video-scalability-e2e" not in prefix_template,
+            "S3 bucket prefix must keep the instance suffix and stay shorter than the resource prefix",
+        )
+        checks.require(
+            _worst_case_output_bucket_length(prefix_template) <= 63,
+            "scalability S3 bucket names must stay within 63 characters",
+        )
+    checks.require(
+        'can(regex("^[a-z0-9][a-z0-9-]{0,10}[a-z0-9]$", var.instance))' in config.text,
+        "instance length must stay capped so the short S3 prefix fits",
+    )
+    checks.require(
+        "length(var.aws_region) <= 16" in config.text,
+        "aws_region must be bounded so S3 bucket names fit",
+    )
+    for suffix in ("input", "output"):
+        checks.require(
+            re.search(
+                rf'video_{suffix}_bucket\s*=\s*"\$\{{local\.s3_bucket_prefix\}}-\$\{{var\.aws_account_id\}}-\$\{{var\.aws_region\}}-{suffix}"',
+                config.text,
+            ) is not None,
+            f"scalability {suffix} bucket must use the short prefix, account, and region",
+        )
+    backend_example = _read_optional_text(config.root / "backend-delivery.tfbackend.example")
+    checks.require(
+        'path = "/var/lib/streaming-video-e2e/scalability/delivery/terraform.tfstate"' in backend_example,
+        "delivery backend example must keep the operator state path outside the sentinel",
+    )
+    compute_tfvars = _read_optional_text(config.root / "compute.tfvars.example")
+    for name in (
+        "worker_autoscaling_min_capacity",
+        "worker_autoscaling_max_capacity",
+        "worker_acceptable_queue_delay_seconds",
+        "worker_representative_processing_seconds",
+        "worker_scale_out_cooldown_seconds",
+        "worker_scale_in_cooldown_seconds",
+    ):
+        checks.require(name in compute_tfvars, f"compute tfvars example must record {name} for the Task 90 handoff")
+    checks.require(
+        'environment        = "scale-e2e-load"' in compute_tfvars,
+        "compute environment must stay short enough for a 32-character resource prefix",
+    )
+    runbook = _read_optional_text(config.root.parents[2] / "docs" / "runbooks" / "scalability-e2e.md")
+    for snippet in (
+        "-target=aws_ecr_repository.api",
+        "-target=aws_ecr_repository.worker",
+        "-lockfile=readonly",
+        "streaming-video-scale-e2e-<instance>",
+        "worker_acceptable_queue_delay_seconds",
+        "worker_representative_processing_seconds",
+        "worker_scale_out_cooldown_seconds",
+        "worker_scale_in_cooldown_seconds",
+    ):
+        checks.require(snippet in runbook, f"scalability runbook must document {snippet}")
+    lockfile = config.root.parents[1] / "terraform-compute" / ".terraform.lock.hcl"
+    lock_text = _read_optional_text(lockfile)
+    checks.require(
+        "hashicorp/aws" in lock_text,
+        "terraform-compute dependency lockfile must be committed for readonly init",
+    )
+    for output in (
+        "video_input_bucket_name",
+        "video_input_bucket_arn",
+        "video_output_bucket_name",
+        "video_output_bucket_arn",
+        "video_encoding_queue_url",
+        "video_encoding_queue_arn",
+        "cloudfront_distribution_domain_name",
+        "cloudfront_distribution_id",
+        "runtime_configuration",
+    ):
+        checks.require(
+            any(block.type_name == output for block in config.blocks if block.kind == "output"),
+            f"scalability E2E must expose non-secret output {output}",
+        )
+    checks.require(
+        "module.foundation.runtime_configuration" in config.text,
+        "scalability E2E must re-export foundation runtime_configuration for terraform-compute",
+    )
+    checks.require(
+        "compute_shared_state_contract" in config.text,
+        "scalability E2E must expose the unchanged compute shared-state contract",
+    )
+
+def check_workers(config: Configuration, checks: Checks) -> None:
+    """Check the Fargate worker deployment without evaluating Terraform."""
+    resources = {block.type_name for block in config.resources()}
+    for resource_type in ("aws_ecr_repository", "aws_ecs_task_definition", "aws_ecs_service", "aws_iam_role", "aws_iam_role_policy"):
+        checks.require(resource_type in resources, f"worker root requires {resource_type}")
+    worker_tasks = [block for block in config.resources("aws_ecs_task_definition") if "worker" in (block.name or "").lower() or "WORKER_RUNTIME_MODE" in block.body]
+    worker_services = [block for block in config.resources("aws_ecs_service") if "worker" in (block.name or "").lower()]
+    checks.require(bool(worker_tasks), "worker task definition is required")
+    checks.require(bool(worker_services), "worker ECS service is required")
+    for block in worker_tasks:
+        worker_configuration = config.text
+        checks.require("FARGATE" in block.body and "awsvpc" in block.body, f"{block.location}: worker must run on Fargate awsvpc")
+        checks.require("ephemeral_storage" in block.body, f"{block.location}: worker storage must be bounded")
+        checks.reject(_attribute(block.body, "stop_timeout") is not None,
+                      f"{block.location}: stop_timeout is not a task definition attribute; use container stopTimeout")
+        containers = _attribute(block.body, "container_definitions") or ""
+        container_bodies = []
+        for name in re.findall(r"\blocal\.([A-Za-z_][A-Za-z0-9_]*)", containers):
+            for match in re.finditer(rf"(?m)^\s*{re.escape(name)}\s*=\s*\{{", config.text):
+                end = _matching_brace(config.text, match.end() - 1, block.path)
+                container_bodies.append(config.text[match.end():end])
+        checks.require(bool(container_bodies) and all(
+            _attribute(body, "stopTimeout") == "var.worker_stop_timeout_seconds"
+            for body in container_bodies
+        ), f"{block.location}: worker container must set stopTimeout from worker_stop_timeout_seconds")
+        checks.require("WORKER_MAX_CONCURRENCY" in worker_configuration and '"1"' in worker_configuration, f"{block.location}: worker receive concurrency must start at one")
+        checks.require("WORKER_RUNTIME_MODE" in worker_configuration and '"ecs"' in worker_configuration, f"{block.location}: ECS runtime mode is required")
+        checks.require("secretsmanager" in worker_configuration and "DATABASE_URL" in worker_configuration, f"{block.location}: database URL must be injected from Secrets Manager")
+        checks.require("awslogs" in worker_configuration, f"{block.location}: worker logs must use CloudWatch")
+    for block in worker_services:
+        checks.require("desired_count" in block.body and "worker_desired_count" in block.body, f"{block.location}: worker desired count must be configurable")
+        checks.require("load_balancer" not in block.body, f"{block.location}: worker must not have an ALB target")
+    policy_text = "\n".join(_policy_text(config, block) for block in config.resources("aws_iam_role_policy") if "worker" in block.body.lower() or "worker" in (block.name or "").lower())
+    for action in ("sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "s3:GetObject", "s3:PutObject", "ecs:UpdateTaskProtection", "ecs:GetTaskProtection"):
+        checks.require(action.lower() in policy_text.lower(), f"worker task policy must allow {action}")
+    checks.require("aws_security_group.worker" in config.text, "worker service must attach the worker security group")
+
+def check_scaling(config: Configuration, checks: Checks) -> None:
+    """Check backlog-per-running-worker autoscaling without evaluating Terraform."""
+    targets = config.resources("aws_appautoscaling_target")
+    policies = config.resources("aws_appautoscaling_policy")
+    checks.require(bool(targets), "scaling requires an Application Auto Scaling target")
+    checks.require(bool(policies), "scaling requires an Application Auto Scaling policy")
+    scaling_text = "\n".join(block.body for block in targets + policies)
+    checks.require("service_namespace" in scaling_text and '"ecs"' in scaling_text,
+                   "scaling target must use the ECS service namespace")
+    checks.require("ecs:service:DesiredCount" in scaling_text,
+                   "scaling target must control ECS service desired count")
+    variables = {block.type_name: block for block in config.blocks if block.kind == "variable"}
+    enabled = variables.get("worker_autoscaling_enabled")
+    checks.require(enabled is not None and _attribute(enabled.body, "default") == "false",
+                   "worker autoscaling must default to disabled for bootstrap")
+    for block in targets + policies:
+        checks.require(_attribute(block.body, "count") == "var.worker_autoscaling_enabled ? 1 : 0",
+                       f"{block.location}: autoscaling must be gated until bootstrap completes")
+    for capacity, default in (("min", "1"), ("max", "4")):
+        name = f"worker_autoscaling_{capacity}_capacity"
+        variable = variables.get(name)
+        checks.require(variable is not None and _attribute(variable.body, "default") == default,
+                       f"autoscaling {capacity} capacity must default to {default}")
+        for target in targets:
+            checks.require(_attribute(target.body, f"{capacity}_capacity") == f"var.{name}",
+                           f"autoscaling {capacity} capacity must be configurable")
+    checks.require("scale_out_cooldown" in scaling_text and "scale_in_cooldown" in scaling_text,
+                   "scaling must configure bounded scale-out and scale-in cooldowns")
+    expected_metrics = (
+        ("visible_backlog", "AWS/SQS", "ApproximateNumberOfMessagesVisible", "Sum",
+         {"QueueName": "local.worker_queue_name"}),
+        ("running_tasks", "ECS/ContainerInsights", "RunningTaskCount", "Average",
+         {"ClusterName": "aws_ecs_cluster.main.name", "ServiceName": "aws_ecs_service.worker.name"}),
+    )
+    diagnostics = [block for block in config.resources("aws_cloudwatch_metric_alarm")
+                   if block.name == "worker_backlog_per_task_diagnostic"]
+    checks.require(len(diagnostics) == 1, "backlog diagnostic alarm is required")
+    for block in policies + diagnostics:
+        diagnostic = block.type_name == "aws_cloudwatch_metric_alarm"
+        queries = _nested_bodies(block.body, "metric_query" if diagnostic else "metrics")
+        for identifier, namespace, metric_name, statistic, dimensions in expected_metrics:
+            selected = [query for query in queries if _attribute(query, "id") == f'"{identifier}"']
+            checks.require(len(selected) == 1, f"{block.location}: require exactly one {identifier} query")
+            for query in selected:
+                stats = [query] if diagnostic else _nested_bodies(query, "metric_stat")
+                checks.require(len(stats) == 1, f"{identifier}: require one metric_stat")
+                for stat in stats:
+                    metrics = _nested_bodies(stat, "metric")
+                    checks.require(len(metrics) == 1, f"{identifier}: require one metric block")
+                    checks.reject(not diagnostic and _attribute(stat, "period") is not None,
+                                  f"{identifier}: Application Auto Scaling does not support period")
+                    for metric in metrics:
+                        checks.require(_attribute(metric, "namespace") == f'"{namespace}"' and
+                                       _attribute(metric, "metric_name") == f'"{metric_name}"',
+                                       f"{identifier}: incorrect namespace or metric name")
+                        checks.require(_attribute(metric if diagnostic else stat, "stat") == f'"{statistic}"',
+                                       f"{identifier}: statistic must be {statistic}")
+                        if diagnostic:
+                            checks.require(_attribute(metric, "period") == "60",
+                                           f"{identifier}: diagnostic period must be 60 seconds")
+                            match = re.search(r"\bdimensions\s*=\s*\{", metric)
+                            body = metric[match.end():_matching_brace(metric, match.end() - 1, block.path)] if match else ""
+                            pairs = dict(re.findall(r"(\w+)\s*=\s*([\w.]+)", body))
+                        else:
+                            bodies = _nested_bodies(metric, "dimensions")
+                            pairs = {(_attribute(body, "name") or "").strip('"'): _attribute(body, "value")
+                                     for body in bodies}
+                            checks.require(len(bodies) == len(dimensions), f"{identifier}: unexpected dimensions")
+                        checks.require(pairs == dimensions,
+                                       f"{identifier}: dimension names must match their exact metric values")
+        expressions = [query for query in queries if _attribute(query, "id") == '"backlog_per_worker"']
+        checks.require(len(expressions) == 1 and
+                       _attribute(expressions[0], "expression") == '"visible_backlog / running_tasks"',
+                       f"{block.location}: backlog expression must divide visible backlog by running tasks")
+    checks.require('resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.worker.name}"' in scaling_text,
+                   "scaling target must identify the worker service in the worker cluster")
+    checks.require("expression" in scaling_text and re.search(r"visible_backlog\s*/\s*running_tasks", scaling_text) is not None,
+                   "scaling must divide visible backlog by running task count")
+    checks.reject(bool(re.search(r"\b(?:FILL|IF)\s*\(", scaling_text, re.IGNORECASE)),
+                   "scaling must not convert missing data or a zero divisor into zero load")
+    checks.require('treat_missing_data  = "missing"' in config.text,
+                   "scaling diagnostics must preserve missing metric data")
+    checks.require("worker_acceptable_queue_delay_seconds" in scaling_text and
+                   "worker_representative_processing_seconds" in scaling_text,
+                   "scaling target must start from queue delay divided by representative processing time")
+    checks.require("ignore_changes = [desired_count]" in config.text,
+                   "ECS worker desired_count must not reset autoscaler-controlled capacity")
+    checks.require("containerInsights" in config.text and 'value = "enabled"' in config.text,
+                   "ECS Container Insights must be enabled for RunningTaskCount")
+    checks.require("ecs:UpdateTaskProtection" in config.text and "ecs:GetTaskProtection" in config.text,
+                   "scaling must retain worker task-protection integration")
+
+
+def check_orchestration(config: Configuration, checks: Checks) -> None:
+    """Check the fixed, inline-Map Fargate orchestration contract."""
+    resources = {block.type_name for block in config.resources()}
+    for resource_type in ("aws_sfn_state_machine", "aws_ecs_task_definition", "aws_iam_role", "aws_iam_role_policy"):
+        checks.require(resource_type in resources, f"orchestration requires {resource_type}")
+
+    text = config.text
+    lower = text.lower()
+    for required in (
+        'Resource = "arn:aws:states:::ecs:runTask.sync"',
+        "MaxConcurrency = 2",
+        "ItemSelector",
+        '"rendition.$" = "$$.Map.Item.Value"',
+        'Name = "CHILD_PAYLOAD_JSON"',
+        "States.JsonToString",
+        'TimeoutSeconds = var.orchestration_timeout_seconds',
+        "TimeoutSecondsPath",
+        'QueryLanguage = "JSONata"',
+        "$toMillis($states.input.deadline_at)",
+        "$millis()",
+        "${var.encoder_timeout_seconds}",
+        "remaining_seconds",
+        "NumericGreaterThanEquals = 1",
+        'entryPoint = ["/bin/sh", "-ec"]',
+        "video-worker encode-child -",
+        'States.Format(\'{}/{}\'',
+        'ProcessorConfig = { Mode = "INLINE" }',
+        "TimestampLessThanPath",
+        "$$.State.EnteredTime",
+        "ResultSelector",
+        "$.Containers[0].ExitCode",
+        "NumericEquals = 0",
+        "StepFunctionsGetEventsForECSTaskRule",
+    ):
+        checks.require(required in text, f"orchestration must contain {required}")
+    checks.reject(
+        "StepFunctionsGetEventsForStepFunctionsExecutionRule" in text,
+        "EventBridge sync must use StepFunctionsGetEventsForECSTaskRule",
+    )
+    checks.require('Mode = "INLINE"' in text, 'Map ProcessorConfig Mode = "INLINE" is required')
+    checks.reject('Mode = "DISTRIBUTED"' in text, "Distributed Map is not allowed")
+    checks.reject("distributedmap" in lower, "Distributed Map is not allowed")
+    checks.reject("states:::lambda:invoke" in lower, "orchestration must use ECS rather than Lambda")
+    checks.reject("states:::batch:submitjob" in lower or "batch:submitjob" in lower,
+                  "orchestration must use ECS rather than Batch")
+
+    child_payload = ""
+    for match in re.finditer(r'"child_payload"\s*=\s*\{', text):
+        closing = _matching_brace(text, match.end() - 1, Path("orchestration"))
+        child_payload += text[match.end():closing]
+    checks.require(bool(child_payload), "orchestration must project a child_payload object")
+    checks.reject("deadline_at" in child_payload, "deadline_at must not be projected to child payload")
+    checks.require("deadline_at" in text, "deadline_at must bound Map/Task execution")
+    checks.require(
+        "TimeoutSecondsPath" in text and "$toMillis($states.input.deadline_at)" in text
+        and "NumericGreaterThanEquals = 1" in text,
+        "RunEncoder timeout must be remaining seconds until deadline_at and require at least one second",
+    )
+    checks.reject("$max([1," in text, "do not raise a sub-second remainder to a 1-second encoder timeout")
+
+    encoder_tasks = [block for block in config.resources("aws_ecs_task_definition") if "encoder" in (block.name or "").lower()]
+    checks.require(bool(encoder_tasks), "a dedicated encoder task definition is required")
+    for task in encoder_tasks:
+        checks.require("FARGATE" in task.body and "awsvpc" in task.body, f"{task.location}: encoder must run on Fargate awsvpc")
+        checks.require("aws_iam_role.encoder.arn" in task.body, f"{task.location}: encoder must use the restricted encoder task role")
+        checks.reject("DATABASE_URL" in task.body or "VIDEO_ENCODING_QUEUE_URL" in task.body, f"{task.location}: child must not receive database or SQS configuration")
+
+    encoder_policies = [
+        _policy_text(config, block) for block in config.resources("aws_iam_role_policy")
+        if "encoder" in (block.name or "").lower() or "encoder" in block.body.lower()
+    ]
+    child_policy = "\n".join(encoder_policies)
+    checks.require("s3:GetObject".lower() in child_policy.lower(), "encoder task must read the canonical source")
+    checks.require("s3:PutObject".lower() in child_policy.lower(), "encoder task must write rendition objects")
+    checks.require("hls/attempts/*/*/360p/*" in child_policy and "hls/attempts/*/*/720p/*" in child_policy,
+                   "encoder writes must be restricted to the two rendition prefixes")
+    checks.reject("sqs:" in child_policy.lower() or "database_url" in child_policy.lower(), "encoder task must have no SQS or database access")
+
+    state_policy = "\n".join(
+        _policy_text(config, block) for block in config.resources("aws_iam_role_policy")
+        if "orchestration" in (block.name or "").lower() or "orchestration" in block.body.lower()
+    )
+    for action in ("ecs:RunTask", "ecs:DescribeTasks", "ecs:StopTask", "events:PutRule", "events:PutTargets", "events:DescribeRule", "iam:PassRole"):
+        checks.require(action.lower() in state_policy.lower(), f"state-machine role must allow {action}")
+    checks.require("iam:PassedToService" in state_policy and "ecs-tasks.amazonaws.com" in state_policy,
+                   "state-machine PassRole must be restricted to ECS tasks")
+    checks.reject(
+        re.search(r'events:(?:PutRule|PutTargets|DescribeRule)[\s\S]*Resource\s*=\s*"\*"', state_policy) is not None,
+        "EventBridge permissions must target the Step Functions ECS sync rule",
+    )
+    checks.require('Action = ["states:StartExecution"]' in text, "parent StartExecution must target the state machine")
+    checks.require("states:DescribeExecution" in text and "states:StopExecution" in text,
+                   "parent role must have only relevant execution lifecycle permissions")
+    checks.require(
+        ":execution:${aws_sfn_state_machine.orchestration.name}:" in text,
+        "DescribeExecution and StopExecution must target execution ARNs",
+    )
+
+    checks.require(
+        any("0003_publication_state.up.sql" in block.body for block in _migration_task_definitions(config)),
+        "orchestration deployment must apply 0003_publication_state.up.sql through the migration task",
+    )
+
+    worker_residual = [
+        block
+        for block in config.resources("aws_iam_role_policy")
+        if block.name == "worker_orchestration"
+    ]
+    checks.require(bool(worker_residual), "worker orchestration policy must grant residual ECS recovery")
+    for block in worker_residual:
+        policy = _policy_text(config, block)
+        for action in ("ecs:DescribeTasks", "ecs:StopTask"):
+            checks.require(action.lower() in policy.lower(), f"worker residual recovery must allow {action}")
+        for statement in _iam_statement_bodies(policy):
+            actions = _policy_actions(statement)
+            if not actions & {"ecs:describetasks", "ecs:stoptask"}:
+                continue
+            checks.reject(
+                _has_wildcard_resource(statement),
+                f"{block.location}: worker residual ECS actions must not use Resource *",
+            )
+            checks.require(
+                "task/${aws_ecs_cluster.main.name}/*" in statement,
+                f"{block.location}: worker residual ECS actions must target cluster-scoped task ARNs",
+            )
+            checks.require(
+                "ecs:cluster" in statement and "aws_ecs_cluster.main.arn" in statement,
+                f"{block.location}: worker residual ECS actions must keep the worker cluster condition",
+            )
+
+def validate(config: Configuration, stage: str, shared_config: Configuration | None = None) -> list[str]:
     checks = Checks()
     check_foundation(config, checks)
-    check_forbidden_resources(config, checks)
-    check_dangerous_configuration(config, checks)
+    if stage == "orchestration" and config.root.name == "scalability":
+        check_scalability_e2e(config, checks)
+        return checks.errors
+    check_forbidden_resources(config, checks, stage)
+    check_dangerous_configuration(config, checks, stage)
+
+    if stage in {"compute", "workers", "scaling", "orchestration"}:
+        check_compute(config, checks)
+        if stage in {"workers", "scaling"}:
+            check_workers(config, checks)
+        if stage == "scaling":
+            check_scaling(config, checks)
+        if stage == "orchestration":
+            check_workers(config, checks)
+            check_scaling(config, checks)
+            check_orchestration(config, checks)
+        shared = shared_config or load_configuration(config.root.parent / "terraform")
+        checks.errors.extend(f"shared root: {error}" for error in validate(shared, "complete"))
+        return checks.errors
 
     input_name: str | None = None
     output_name: str | None = None
-    if stage in {"storage-queue", "reliability", "complete"}:
+    if stage in {"storage-queue", "reliability", "delivery", "complete"}:
         input_name, output_name = check_storage_queue(config, checks)
-    if stage == "reliability":
+    if stage in {"reliability", "delivery", "complete"}:
         check_iam_separation(config, checks, input_name, output_name)
         check_outputs(config, checks, input_name, output_name)
         check_reliability(config, checks, input_name, output_name)
-    if stage == "complete":
-        check_iam_separation(config, checks, input_name, output_name)
-        check_outputs(config, checks, input_name, output_name)
+    if stage in {"delivery", "complete"}:
+        check_delivery(config, checks, output_name)
     return checks.errors
 
 
@@ -1018,8 +1776,13 @@ def parse_args() -> argparse.Namespace:
         help="Terraform root to inspect (default: app/infra/terraform)",
     )
     parser.add_argument(
+        "--shared-terraform-dir",
+        type=Path,
+        help="Shared delivery/reliability root for compute/workers (default: sibling terraform directory)",
+    )
+    parser.add_argument(
         "--stage",
-        choices=("foundation", "storage-queue", "reliability", "complete"),
+        choices=("foundation", "storage-queue", "reliability", "delivery", "complete", "compute", "workers", "scaling", "orchestration"),
         default="complete",
         help="Task completion stage to validate (default: complete)",
     )
@@ -1027,10 +1790,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Validate one Terraform stage and, for orchestration, the scalability root too."""
     args = parse_args()
+    include_scalability = False
     try:
-        config = load_configuration(args.terraform_dir.resolve())
-        errors = validate(config, args.stage)
+        repo_root = Path(__file__).resolve().parents[2]
+        terraform_dir = args.terraform_dir.resolve()
+        if terraform_dir == repo_root / "app" / "infra" / "terraform" and args.stage in {"compute", "workers", "scaling", "orchestration"}:
+            terraform_dir = repo_root / "app" / "infra" / "terraform-compute"
+        config = load_configuration(terraform_dir)
+        shared_config = load_configuration(args.shared_terraform_dir.resolve()) if args.shared_terraform_dir else None
+        errors = validate(config, args.stage, shared_config)
+        include_scalability = args.stage == "orchestration" and config.root.name == "terraform-compute"
+        if include_scalability:
+            scalability = load_configuration(repo_root / "app" / "infra" / "terraform-e2e" / "scalability")
+            errors.extend(
+                f"scalability root: {error}" for error in validate(scalability, "orchestration")
+            )
     except TerraformContractError as exc:
         print(f"Terraform contract validation failed: {exc}", file=sys.stderr)
         return 1
@@ -1041,9 +1817,10 @@ def main() -> int:
             print(f"- {error}", file=sys.stderr)
         return 1
 
+    scalability_note = ", scalability=checked" if include_scalability else ""
     print(
         f"Terraform contracts valid: stage={args.stage}, "
-        f"files={len(config.files)}, resources={len(config.resources())}"
+        f"files={len(config.files)}, resources={len(config.resources())}{scalability_note}"
     )
     return 0
 

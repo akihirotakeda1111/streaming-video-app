@@ -28,12 +28,33 @@ pub enum JobClaimOutcome {
     NotClaimed,
 }
 
+/// The immutable execution path selected for a job at first acquisition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobMode {
+    Cli,
+    Distributed,
+}
+
+impl JobMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Distributed => "distributed",
+        }
+    }
+}
+
 /// The complete result of one atomic lease-acquisition attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseAcquisitionOutcome {
     Acquired {
         attempt: u32,
         lease_expires_at: SystemTime,
+    },
+    AcquiredWithMode {
+        attempt: u32,
+        lease_expires_at: SystemTime,
+        mode: JobMode,
     },
     Busy,
     Completed,
@@ -82,6 +103,31 @@ pub trait JobState: Send {
         }
     }
 
+    /// Acquire using the deployment-selected mode. Implementations that do not
+    /// support distributed selection fail closed instead of running the CLI
+    /// acquire path.
+    fn acquire_lease_with_mode(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+        max_attempts: u32,
+        mode: JobMode,
+    ) -> impl Future<Output = Result<LeaseAcquisitionOutcome, PersistenceError>> + Send {
+        async move {
+            match mode {
+                JobMode::Cli => {
+                    self.acquire_lease(job_id, video_id, worker_id, lease_seconds, max_attempts)
+                        .await
+                }
+                JobMode::Distributed => Err(PersistenceError(
+                    "distributed lease acquisition is not implemented".into(),
+                )),
+            }
+        }
+    }
+
     fn renew_lease(
         &mut self,
         job_id: &str,
@@ -114,6 +160,22 @@ pub trait JobState: Send {
         async { Err(PersistenceError("completion is not implemented".into())) }
     }
 
+    fn complete_distributed(
+        &mut self,
+        job_id: &str,
+        video_id: &str,
+        worker_id: &str,
+        attempt: u32,
+        published_manifest_key: &str,
+    ) -> impl Future<Output = Result<JobOperationOutcome, PersistenceError>> + Send {
+        let _ = (job_id, video_id, worker_id, attempt, published_manifest_key);
+        async {
+            Err(PersistenceError(
+                "distributed completion is not implemented".into(),
+            ))
+        }
+    }
+
     fn fail(
         &mut self,
         job_id: &str,
@@ -128,3 +190,60 @@ pub trait JobState: Send {
 }
 
 pub mod postgres;
+pub mod tls;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    struct UnsupportedJobs;
+
+    impl JobState for UnsupportedJobs {
+        fn claim(
+            &mut self,
+            _job_id: &str,
+            _video_id: &str,
+        ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
+            std::future::ready(Ok(false))
+        }
+
+        fn mark_processing(
+            &mut self,
+            _job_id: &str,
+        ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn acquire_lease(
+            &mut self,
+            _job_id: &str,
+            _video_id: &str,
+            _worker_id: &str,
+            _lease_seconds: u64,
+            _max_attempts: u32,
+        ) -> impl Future<Output = Result<LeaseAcquisitionOutcome, PersistenceError>> + Send
+        {
+            std::future::ready(Ok(LeaseAcquisitionOutcome::Acquired {
+                attempt: 1,
+                lease_expires_at: SystemTime::UNIX_EPOCH,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn default_distributed_acquisition_fails_closed() {
+        let mut jobs = UnsupportedJobs;
+        let error = jobs
+            .acquire_lease_with_mode("job", "video", "worker", 30, 3, JobMode::Distributed)
+            .await
+            .unwrap_err();
+        assert!(error.0.contains("distributed"));
+        assert!(matches!(
+            jobs.acquire_lease_with_mode("job", "video", "worker", 30, 3, JobMode::Cli)
+                .await
+                .unwrap(),
+            LeaseAcquisitionOutcome::Acquired { attempt: 1, .. }
+        ));
+    }
+}

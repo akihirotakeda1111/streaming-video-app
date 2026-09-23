@@ -8,6 +8,8 @@ internal_fields:
   - worker_id
   - attempt
   - lease_expires_at
+  - published_manifest_key
+  - mode
 public_api_exposes_internal_fields: false
 publication:
   manifest_name: index.m3u8
@@ -25,6 +27,13 @@ The authoritative public statuses remain `UPLOADING`, `QUEUED`, `PROCESSING`,
 `COMPLETED`, and `FAILED`. The reliability fields below are database and worker
 implementation details. They MUST NOT be added to OpenAPI responses, examples,
 custom queue events, or playback data.
+
+Phase 3 adds the nullable internal `published_manifest_key`. It is NULL for a
+legacy completed job and resolves to the original `hls/index.m3u8`; a
+distributed completed job must store its attempt-isolated parent manifest key.
+Phase 3 also adds internal `mode`, with values `cli` or `distributed`, persisted
+at first processing acquisition and unchanged on retry. Its rules and the S3
+child-result contract are defined in `scalability-conventions.md`.
 
 ## Lease fields and ownership
 
@@ -256,10 +265,14 @@ objects, and performs no release, completion, or terminal failure update.
 - A crash after durable `COMPLETED` but before message deletion is handled as an
   already-completed redelivery and never repeats media work.
 
-All attempts use the unchanged HLS prefix and deterministic segment names in
-`storage-conventions.md`. Partial segments and manifests do not make a job
-playable through the API. A valid owner may overwrite partial deterministic
-objects left by an older attempt. It uploads all segments first and
-`index.m3u8` last, then conditionally persists `COMPLETED`. Loss of either
-heartbeat signal stops further publication and terminal state changes. The
-playback API exposes the manifest only from durable `COMPLETED` state.
+Legacy attempts use the HLS prefix and deterministic segment names in
+`storage-conventions.md`. Distributed attempts use the isolated prefixes in
+`scalability-conventions.md`; partial segments and manifests do not make a job
+playable through the API. A valid owner may overwrite only objects in its own
+attempt prefix in distributed mode; legacy CLI retries retain their shared
+deterministic HLS prefix. It uploads all segments before the media playlist,
+then distributed children write internal `result.json` last; the
+distributed parent validates children, publishes its master last, and then
+conditionally persists the pointer and `COMPLETED`. Loss of either heartbeat
+signal stops further publication and terminal state changes. The playback API
+exposes the selected manifest only from durable `COMPLETED` state.

@@ -22,10 +22,17 @@ function fixture() {
     WORKER_LEASE_DURATION_SECONDS: '30', WORKER_RETRY_DELAY_SECONDS: '10',
     WORKER_MAXIMUM_ATTEMPTS: '3', FRONTEND_ORIGIN: 'http://localhost:5173',
   }
-  const state = { fail: '', stale: false, unhealthy: false }
+  vi.stubEnv('PLAYBACK_BASE_URL', undefined)
+  const state = { fail: '', stale: false, unhealthy: false, playback: 'https://test.cloudfront.net/', playbackFailure: false }
   const execute = vi.fn((tool, args, options) => {
     if (state.fail === tool) throw new Error('private-value')
-    if (tool === 'terraform') return JSON.stringify(runtime)
+    if (tool === 'terraform') {
+      if (args.at(-1) === 'playback_base_url') {
+        if (state.playbackFailure) throw Error('private state error')
+        return JSON.stringify(state.playback)
+      }
+      return JSON.stringify(runtime)
+    }
     expect(options.env.VIDEO_INPUT_BUCKET).toBe('input')
     if (args.includes('--wait') && state.unhealthy) throw new Error('private health diagnostics')
     if (args.includes('ps')) return args.at(-1) === 'worker' ? 'a'.repeat(64) : 'b'.repeat(64)
@@ -36,6 +43,7 @@ function fixture() {
   const discover = vi.fn((options, command) => {
     command('aws', ['sts'], { env: { AWS_PROFILE: 'runner' } })
     return {
+      PLAYBACK_BASE_URL: options.playbackUrl,
       E2E_VALID_FIXTURE: options.fixture, E2E_INVALID_FIXTURE: options.invalidFixture,
       API_PORT: new URL(options.apiUrl).port, FRONTEND_PORT: new URL(options.frontendUrl).port,
       FRONTEND_ORIGIN: new URL(options.frontendUrl).origin,
@@ -63,7 +71,7 @@ describe('Linux reliability setup orchestration', () => {
     expect(starts).toHaveLength(2)
     expect(starts[0]![1].at(-1)).toBe('worker')
     expect(starts[1]![1].slice(-6)).toEqual(['--no-deps', '--wait', '--wait-timeout', '120', 'api', 'frontend'])
-    expect(starts[1]![2].env).toMatchObject({ API_PORT: '9080', FRONTEND_PORT: '6173',
+    expect(starts[1]![2].env).toMatchObject({ PLAYBACK_BASE_URL: 'https://test.cloudfront.net', API_PORT: '9080', FRONTEND_PORT: '6173',
       FRONTEND_ORIGIN: 'http://localhost:6173', VITE_API_BASE_URL: 'http://localhost:9080/api/v1',
       OUTPUT_S3_ENDPOINT: 'https://output.s3.us-east-1.amazonaws.com', API_AWS_ACCESS_KEY_ID: 'test-key' })
     expect(f.execute.mock.calls.findIndex(([, args]) => args.includes('--wait')))
@@ -91,6 +99,32 @@ describe('Linux reliability setup orchestration', () => {
       'frontend-url': 'http://localhost:6173' }, f.execute, f.discover)).toThrow('frontend origin')
     expect(f.execute).toHaveBeenCalledTimes(1)
   })
+  it.each(['option', 'environment'])('uses %s ahead of Terraform', (source) => {
+    const f = fixture()
+    vi.stubEnv('PLAYBACK_BASE_URL', 'https://environment.cloudfront.net/')
+    setupEnvironment({ ...f.options, ...(source === 'option' ? { 'playback-url': 'https://option.cloudfront.net/' } : {}) }, f.execute, f.discover)
+    expect(f.discover.mock.calls[0][0].playbackUrl).toBe('https://' + source + '.cloudfront.net')
+    expect(f.execute.mock.calls.some(([, args]) => args.at(-1) === 'playback_base_url')).toBe(false)
+  })
+  it.each(['', 'http://remote.example', 'https://test.cloudfront.net/path', 'https://test.cloudfront.net?token=private'])('rejects invalid Terraform playback before starting containers: %s', (url) => {
+    serviceCredentials()
+    const f = fixture()
+    f.state.playback = url
+    expect(() => setupEnvironment({ ...f.options, 'start-services': true }, f.execute, f.discover)).toThrow('playback URL')
+    expect(f.execute.mock.calls.some(([tool]) => tool === 'docker')).toBe(false)
+    expect(f.discover).not.toHaveBeenCalled()
+  })
+  it('stops before Docker when playback output is unavailable', () => {
+    const f = fixture()
+    f.state.playbackFailure = true
+    expect(() => setupEnvironment(f.options, f.execute, f.discover)).toThrow('playback URL')
+    expect(f.execute.mock.calls.some(([tool]) => tool === 'docker')).toBe(false)
+  })
+  it('rejects an empty explicit override without falling back', () => {
+    const f = fixture()
+    expect(() => setupEnvironment({ ...f.options, 'playback-url': '' }, f.execute, f.discover)).toThrow('playback URL')
+    expect(f.execute).toHaveBeenCalledTimes(1)
+  })
   it('defaults the clock skew bound to 1000 ms when omitted', () => {
     const f = fixture()
     setupEnvironment({ ...f.options, 'clock-skew-ms': undefined }, f.execute, f.discover)
@@ -110,6 +144,7 @@ describe('Linux reliability setup orchestration', () => {
     }
     const f = fixture(), before = { ...process.env }
     const result = setupEnvironment(f.options, f.execute, f.discover)
+    expect(result.PLAYBACK_BASE_URL).toBe('https://test.cloudfront.net')
     expect(result.E2E_VALID_FIXTURE).toBe(f.valid)
     expect(result.VIDEO_ENCODING_QUEUE_URL).toBe(f.runtime.VIDEO_ENCODING_QUEUE_URL)
     expect(f.execute.mock.calls[0][0]).toBe('terraform')
@@ -146,7 +181,7 @@ describe('Linux reliability setup orchestration', () => {
   })
   it('rejects generated multiline values before returning any settings', () => {
     const f = fixture()
-    f.discover.mockReturnValue({ E2E_VALID_FIXTURE: 'bad\nvalue', E2E_INVALID_FIXTURE: '',
+    f.discover.mockReturnValue({ PLAYBACK_BASE_URL: 'https://test.cloudfront.net', E2E_VALID_FIXTURE: 'bad\nvalue', E2E_INVALID_FIXTURE: '',
       API_PORT: '8080', FRONTEND_PORT: '5173', FRONTEND_ORIGIN: 'http://localhost:5173',
       VITE_API_BASE_URL: 'http://localhost:8080/api/v1', OUTPUT_S3_ENDPOINT: 'https://output.s3.us-east-1.amazonaws.com' })
     expect(() => setupEnvironment(f.options, f.execute, f.discover)).toThrow('E2E generation')

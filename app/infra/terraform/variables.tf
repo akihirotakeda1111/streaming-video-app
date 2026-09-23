@@ -52,6 +52,16 @@ variable "frontend_origin" {
   default     = "http://localhost:5173"
 }
 
+variable "frontend_origins" {
+  type        = list(string)
+  description = "Approved browser origins for S3 and CloudFront CORS. Null preserves frontend_origin."
+  default     = null
+  validation {
+    condition     = var.frontend_origins == null ? true : length(var.frontend_origins) > 0 && alltrue([for origin in var.frontend_origins : can(regex("^https?://[^/*?#@[:space:]]+$", origin))])
+    error_message = "frontend_origins must contain one or more explicit HTTP(S) origins."
+  }
+}
+
 variable "api_base_url" {
   type        = string
   description = "Base URL for the local Go API."

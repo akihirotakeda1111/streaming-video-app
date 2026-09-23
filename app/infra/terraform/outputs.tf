@@ -52,6 +52,26 @@ output "video_encoding_queue_url" {
   value       = aws_sqs_queue.video_encoding.url
 }
 
+output "cloudfront_distribution_id" {
+  description = "Non-secret CloudFront distribution identifier for private HLS delivery."
+  value       = aws_cloudfront_distribution.video_output.id
+}
+
+output "cloudfront_distribution_domain_name" {
+  description = "CloudFront domain used for private HLS playback."
+  value       = aws_cloudfront_distribution.video_output.domain_name
+}
+
+output "PLAYBACK_BASE_URL" {
+  description = "HTTPS base URL for API playback manifest URLs."
+  value       = "https://${aws_cloudfront_distribution.video_output.domain_name}"
+}
+
+output "playback_base_url" {
+  description = "HTTPS base URL for API playback manifest URLs."
+  value       = "https://${aws_cloudfront_distribution.video_output.domain_name}"
+}
+
 output "api_local_execution" {
   description = "Non-secret IAM configuration for the local Go API."
   value = {

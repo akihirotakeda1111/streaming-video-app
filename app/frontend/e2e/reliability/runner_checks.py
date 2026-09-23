@@ -21,6 +21,88 @@ RUN = subprocess.run
 
 
 class RunnerChecks(unittest.TestCase):
+    def test_historical_acceptance_validates_target_scope_and_both_phases(self):
+        run_id = "e2e-11111111-1111-4111-8111-111111111111"
+        target = {"outputBucket": "output", "account": "123456789012", "region": "us-east-1",
+                  "playbackOrigin": "https://example.cloudfront.net"}
+        jobs = []
+        for phase, digit in (("phase1", "1"), ("phase2", "2")):
+            video = digit * 8 + "-1111-4111-8111-111111111111"
+            job_id = "33333333-3333-4333-8333-333333333333"
+            jobs.append({"videoId": video, "jobId": job_id, "phase": phase,
+                         "path": f"/videos/{video}/jobs/{job_id}/hls/index.m3u8",
+                         "manifestETag": '"abcd"', "advancement": 0.2})
+        replay = {**target, "evidenceVersion": 1, "verificationScope": "pre-cutover-compatibility",
+                  "capturedAt": "2025-01-01T00:00:00Z", "cutoverAt": "2025-02-01T00:00:00Z", "checked": jobs}
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {
+            "E2E_OUTPUT_BUCKET": "output", "E2E_AWS_ACCOUNT_ID": "123456789012",
+            "AWS_REGION": "us-east-1", "PLAYBACK_BASE_URL": target["playbackOrigin"]
+        }):
+            parent = Path(root).resolve()
+            folder = parent / run_id
+            folder.mkdir()
+            file = folder / "delivery-regression-evidence.json"
+            evidence = {"runId": run_id, "scenario": "delivery-regression", "status": "passed",
+                        "observedAt": "2025-03-01T00:00:00Z", "diagnostics": {"cloudfront-completed-replay": replay}}
+            file.write_text(json.dumps(evidence))
+            self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "passed")
+            # Evidence redaction adds a root slash; compare normalized origins on both sides.
+            for configured in (target["playbackOrigin"], target["playbackOrigin"] + "/"):
+                for recorded in (target["playbackOrigin"], target["playbackOrigin"] + "/",
+                                 "https://EXAMPLE.cloudfront.net:443/"):
+                    with self.subTest(configured=configured, recorded=recorded), \
+                            patch.dict(os.environ, {"PLAYBACK_BASE_URL": configured}):
+                        file.write_text(json.dumps({**evidence, "diagnostics": {
+                            "cloudfront-completed-replay": {**replay, "playbackOrigin": recorded}}}))
+                        self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "passed")
+            for invalid in ("https://other.cloudfront.net/", "http://example.cloudfront.net/",
+                            "https://example.cloudfront.net/hls", "https://example.cloudfront.net//",
+                            "https://example.cloudfront.net/?x=1", "https://example.cloudfront.net/#fragment",
+                            "https://user@example.cloudfront.net/", "https://example.cloudfront.net:444/",
+                            "https://example.cloudfront.net:invalid/", "https://example.cloudfront.net:99999/",
+                            "https://example.cloudfront.net/\n", "", None):
+                with self.subTest(invalid=invalid):
+                    file.write_text(json.dumps({**evidence, "diagnostics": {
+                        "cloudfront-completed-replay": {**replay, "playbackOrigin": invalid}}}))
+                    self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "blocked")
+                    file.write_text(json.dumps(evidence))
+                    with patch.dict(os.environ, {"PLAYBACK_BASE_URL": invalid or ""}):
+                        self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "blocked")
+            for changes in ({"checked": jobs[:1]}, {"verificationScope": "completed-job-replay"},
+                            {"outputBucket": "other"}, {"playbackOrigin": "https://other.cloudfront.net"},
+                            {"cutoverAt": "2025-04-01T00:00:00Z"}, {"evidenceVersion": 0},
+                            {"checked": [{**job, "advancement": 0} for job in jobs]}):
+                bad = {**evidence, "diagnostics": {"cloudfront-completed-replay": {**replay, **changes}}}
+                file.write_text(json.dumps(bad))
+                self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "blocked")
+            for changes in ({"status": "failed"}, {"runId": "another-run"}, {"diagnostics": None}):
+                file.write_text(json.dumps({**evidence, **changes}))
+                self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "blocked")
+            file.unlink()
+            self.assertEqual(MODULE["_historical_acceptance"](parent, run_id)["status"], "blocked")
+            self.assertEqual(MODULE["_historical_acceptance"](parent, None)["status"], "unexecuted")
+
+    def test_historical_option_requires_full_suite(self):
+        output = io.StringIO()
+        run_id = "e2e-11111111-1111-4111-8111-111111111111"
+        with patch.dict(GLOBALS, {"_full": lambda selected: 0 if selected == run_id else 1}), \
+                contextlib.redirect_stderr(output):
+            self.assertEqual(MODULE["main"](["--full-suite", "--historical-evidence-run", run_id]), 0)
+            with self.assertRaises(SystemExit):
+                MODULE["main"](["--historical-evidence-run", run_id])
+
+    def test_full_suite_acceptance_is_separate_from_execution(self):
+        for state, expected_code in (("passed", 0), ("blocked", 2)):
+            with patch.dict(GLOBALS, {"_historical_acceptance": lambda parent, run, state=state:
+                                     {"name": "historical-compatibility", "status": state}}):
+                code, report, calls = self.full_suite()
+            self.assertEqual(code, expected_code)
+            self.assertEqual(report["executionStatus"], "passed")
+            self.assertEqual(report["acceptanceStatus"], state)
+            self.assertEqual(report["acceptanceChecks"][0]["status"], state)
+            self.assertEqual(report["unexecutedLiveChecks"], [])
+            self.assertEqual(len(calls), 9)
+
     def full_suite(self, fault=None):
         """Exercise real dispatch and reporting with only external operations replaced."""
         with tempfile.TemporaryDirectory() as root:
@@ -37,7 +119,14 @@ class RunnerChecks(unittest.TestCase):
             def dispatch(command, **kwargs):
                 env = kwargs["env"]
                 name = command[command.index("--grep") + 1][1:]
+                self.assertNotIn("E2E_LEGACY_DELIVERY_FIXTURES", env)
+                if name == "delivery-regression":
+                    self.assertEqual(env["E2E_PLAYBACK_EVIDENCE_RUN"], calls[-1][1]["E2E_RUN_ID"])
+                else:
+                    self.assertNotIn("E2E_PLAYBACK_EVIDENCE_RUN", env)
                 calls.append((name, env))
+                if name == "delivery-preflight" and fault == "preflight-exit":
+                    return subprocess.CompletedProcess(command, 1)
                 if fault == "launch" and len(calls) == 2:
                     raise OSError("private-value")
                 if fault == "exit" and len(calls) == 2:
@@ -53,19 +142,22 @@ class RunnerChecks(unittest.TestCase):
                         evidence["runId"] = "another-run"
                     if fault == "scenario-mismatch":
                         evidence["scenario"] = "another-scenario"
-                if name == "phase1-pipeline":
+                if name in ("phase1-pipeline", "delivery-regression"):
                     self.assertNotIn("E2E_INCLUDE_RELIABILITY", env)
                     self.assertEqual(env["E2E_PROJECT"], "chromium")
                     self.assertEqual(command[-2:], ["--retries", "0"])
                 path = Path(env["E2E_EVIDENCE_DIR"]) / f"{name}-evidence.json"
-                if not ((name == "queue-monitoring" and fault == "missing")
+                if not ((name == "delivery-preflight" and fault == "preflight-missing")
+                        or (name == "queue-monitoring" and fault == "missing")
                         or (name == "phase1-pipeline" and fault == "playback-missing")):
                     path.write_text("invalid" if name == "queue-monitoring" and fault == "invalid"
                                     else json.dumps(evidence), encoding="utf-8")
                 return subprocess.CompletedProcess(command, 0)
 
             with patch.dict(os.environ, {"E2E_EVIDENCE_DIR": root, "E2E_PROJECT": "firefox",
-                                         "E2E_INCLUDE_RELIABILITY": "true"}), \
+                                         "E2E_INCLUDE_RELIABILITY": "true",
+                                         "E2E_PLAYBACK_EVIDENCE_RUN": "stale-run",
+                                         "E2E_LEGACY_DELIVERY_FIXTURES": "stale-inventory"}), \
                     patch.dict(GLOBALS, {"_settings": settings}), \
                     patch("shutil.which", return_value="node-test"), \
                     patch("subprocess.run", side_effect=dispatch), \
@@ -83,12 +175,50 @@ class RunnerChecks(unittest.TestCase):
         code, report, calls = self.full_suite()
         self.assertEqual(code, 0)
         self.assertEqual(report["status"], "passed")
-        self.assertEqual([name for name, _ in calls], [*MODULE["FULL_LIVE_SCENARIOS"], "phase1-pipeline"])
-        self.assertEqual(len({env["E2E_RUN_ID"] for _, env in calls}), 7)
-        monitoring = calls[5][1]
-        self.assertEqual(monitoring["E2E_FFMPEG_EVIDENCE_RUN"], calls[3][1]["E2E_RUN_ID"])
-        self.assertEqual(monitoring["E2E_POISON_EVIDENCE_RUN"], calls[4][1]["E2E_RUN_ID"])
-        self.assertEqual(report["unexecutedLiveChecks"], [])
+        self.assertEqual(report["suite"], MODULE["SUITE_ID"])
+        self.assertEqual([name for name, _ in calls], ["delivery-preflight", *MODULE["FULL_LIVE_SCENARIOS"], "phase1-pipeline", "delivery-regression"])
+        self.assertEqual(len({env["E2E_RUN_ID"] for _, env in calls}), 9)
+        monitoring = calls[6][1]
+        self.assertEqual(monitoring["E2E_FFMPEG_EVIDENCE_RUN"], calls[4][1]["E2E_RUN_ID"])
+        self.assertEqual(monitoring["E2E_POISON_EVIDENCE_RUN"], calls[5][1]["E2E_RUN_ID"])
+        self.assertEqual(report["unexecutedLiveChecks"], ["historical-compatibility"])
+        self.assertEqual(report["executionStatus"], "passed")
+        self.assertEqual(report["acceptanceStatus"], "incomplete")
+        self.assertEqual(report["statusScope"], "current-regression")
+        self.assertEqual(report["liveEvidence"][-1]["playbackEvidenceRun"], calls[-2][1]["E2E_RUN_ID"])
+        self.assertEqual(report["liveEvidence"][-1]["verificationScope"], "completed-job-replay")
+
+    def test_delivery_source_arguments_and_stale_environment(self):
+        run_id = "e2e-11111111-1111-4111-8111-111111111111"
+        for source in (["--playback-evidence-run", run_id], ["--legacy-delivery-fixtures", "legacy.json"]):
+            with tempfile.TemporaryDirectory() as root:
+                with patch.dict(os.environ, {"E2E_EVIDENCE_DIR": root,
+                                             "E2E_PLAYBACK_EVIDENCE_RUN": "stale",
+                                             "E2E_LEGACY_DELIVERY_FIXTURES": "stale"}), \
+                        patch.dict(GLOBALS, {"_settings": lambda mode: {}}), \
+                        patch("shutil.which", return_value="node-test"), \
+                        patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as dispatch, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(MODULE["main"](["--scenario", "delivery-regression", *source]), 0)
+                env = dispatch.call_args.kwargs["env"]
+                self.assertEqual(env.get("E2E_PLAYBACK_EVIDENCE_RUN"), run_id if source[0] == "--playback-evidence-run" else None)
+                self.assertEqual(env.get("E2E_LEGACY_DELIVERY_FIXTURES"),
+                                 str(Path("legacy.json").resolve()) if source[0] == "--legacy-delivery-fixtures" else None)
+                self.assertEqual(dispatch.call_args.args[0][-4:], ["--project", "chromium", "--retries", "0"])
+
+    def test_delivery_references_reject_other_modes_and_paths(self):
+        run_id = "e2e-11111111-1111-4111-8111-111111111111"
+        cases = [["--scenario", "delivery-regression", "--playback-evidence-run", "../outside"],
+                 ["--scenario", "delivery-regression", "--playback-evidence-run", run_id, "--legacy-delivery-fixtures", "legacy.json"],
+                 ["--scenario", "queue-monitoring", "--playback-evidence-run", run_id]]
+        cases += [["--scenario", "delivery-regression", mode, "--playback-evidence-run", run_id]
+                  for mode in ("--full-suite", "--check", "--list", "--live-preflight")]
+        with patch.dict(GLOBALS, {"_settings": lambda mode: self.fail("must not validate or dispatch")}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            for args in cases:
+                with self.assertRaises(SystemExit) as error:
+                    MODULE["main"](args)
+                self.assertEqual(error.exception.code, 2)
 
     def test_full_suite_rejects_incomplete_evidence_before_playback(self):
         for fault in ("outstanding", "contradictory", "missing", "invalid", "run-mismatch", "scenario-mismatch"):
@@ -96,16 +226,17 @@ class RunnerChecks(unittest.TestCase):
                 code, report, calls = self.full_suite(fault)
                 self.assertEqual(code, 1)
                 self.assertEqual(report["status"], "failed")
-                self.assertEqual(report["liveEvidence"][5]["status"], "failed")
-                self.assertEqual(report["unexecutedLiveChecks"], ["phase1-pipeline"])
-                self.assertEqual(len(calls), 6)
+                self.assertEqual(report["liveEvidence"][6]["status"], "failed")
+                self.assertEqual(report["unexecutedLiveChecks"], ["phase1-pipeline", "delivery-regression", "historical-compatibility"])
+                self.assertEqual(len(calls), 7)
 
     def test_full_suite_requires_playback_artifact(self):
         code, report, calls = self.full_suite("playback-missing")
         self.assertEqual(code, 1)
-        self.assertEqual(len(calls), 7)
+        self.assertEqual(len(calls), 8)
         self.assertEqual(report["status"], "failed")
-        self.assertEqual(report["liveEvidence"][-1]["status"], "failed")
+        self.assertEqual(report["liveEvidence"][-2]["status"], "failed")
+        self.assertEqual(report["liveEvidence"][-1]["status"], "unexecuted")
 
     def test_full_suite_preserves_partial_report_on_errors(self):
         for fault in ("config", "authorize", "launch", "exit"):
@@ -117,7 +248,7 @@ class RunnerChecks(unittest.TestCase):
                 self.assertEqual(report["liveEvidence"][0]["status"], "passed")
                 self.assertEqual(report["liveEvidence"][1]["status"], "blocked" if blocked else "failed")
                 self.assertEqual(report["unexecutedLiveChecks"],
-                                 [*MODULE["FULL_LIVE_SCENARIOS"][2:], "phase1-pipeline"])
+                                 [*MODULE["FULL_LIVE_SCENARIOS"][1:], "phase1-pipeline", "delivery-regression", "historical-compatibility"])
 
     def test_preflight_selects_browser_project(self):
         for project in ("", "firefox"):
@@ -231,17 +362,59 @@ class RunnerChecks(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "^local safety validation could not complete$"):
                 MODULE["_settings"]("check")
 
-    def test_preflight_reuses_root_without_overwriting_or_dispatch(self):
+    def test_preflight_reuses_root_and_requires_delivery_evidence(self):
+        def dispatch(config):
+            config.evidence_dir.mkdir(parents=True)
+            (config.evidence_dir / "delivery-preflight-evidence.json").write_text(json.dumps({
+                "scenario": "delivery-preflight", "runId": config.evidence_dir.name, "status": "passed"
+            }))
+            return 0
         with tempfile.TemporaryDirectory() as root, \
                 patch.dict(os.environ, {"E2E_EVIDENCE_DIR": root}), \
                 patch.dict(GLOBALS, {"_settings": lambda mode: {"status": "verified", "verifiedAt": "test"}}), \
-                patch("subprocess.run", side_effect=AssertionError("must not dispatch")), \
+                patch.dict(GLOBALS, {"_run": dispatch}), \
                 contextlib.redirect_stdout(io.StringIO()):
             for _ in range(2):
                 self.assertEqual(MODULE["main"](["--live-preflight"]), 0)
             records = list(Path(root).glob("preflight-*/live-preflight.json"))
             self.assertEqual(len(records), 2)
             self.assertTrue(all(not json.loads(p.read_text())["scenarioStarted"] for p in records))
+            self.assertTrue(all("deliveryEvidenceDirectory" in json.loads(p.read_text()) for p in records))
+
+    def test_delivery_preflight_failure_blocks_all_scenarios(self):
+        for fault in ("preflight-exit", "preflight-missing"):
+            code, report, calls = self.full_suite(fault)
+            self.assertEqual(code, 1)
+            self.assertEqual([name for name, _ in calls], ["delivery-preflight"])
+            self.assertEqual(report["suite"], MODULE["SUITE_ID"])
+            self.assertEqual(report["unexecutedLiveChecks"],
+                             [*MODULE["FULL_LIVE_SCENARIOS"], "phase1-pipeline", "delivery-regression", "historical-compatibility"])
+
+    def test_delivery_single_scenarios_select_chromium(self):
+        for scenario in ("delivery-regression", "delivery-preflight"):
+            config = MODULE["LiveConfig"](Path("unused"), scenario)
+            with patch.dict(GLOBALS, {"_dispatch": lambda c, s, p, r: (s, p, r)}):
+                self.assertEqual(MODULE["_run"](config), ("@" + scenario, "chromium", False))
+
+    def test_delivery_replay_selection_is_explicit_and_not_inherited(self):
+        for scenario in ("delivery-regression", "delivery-preflight", "phase1-pipeline"):
+            with tempfile.TemporaryDirectory() as root, \
+                    patch.dict(os.environ, {"E2E_INCLUDE_DELIVERY_REPLAY": "true"}), \
+                    patch.dict(GLOBALS, {"_settings": lambda mode: {"status": "verified"}}), \
+                    patch("shutil.which", return_value="node"), \
+                    patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                config = MODULE["LiveConfig"](Path(root) / "e2e-new", scenario)
+                MODULE["_dispatch"](config, "@" + scenario, "chromium", False)
+                self.assertEqual(run.call_args.kwargs["env"].get("E2E_INCLUDE_DELIVERY_REPLAY"),
+                                 "true" if scenario == "delivery-regression" else None)
+
+    def test_outer_blocked_report_uses_same_suite(self):
+        output = io.StringIO()
+        with patch.dict(GLOBALS, {"_full": lambda: (_ for _ in ()).throw(ValueError("unavailable"))}), \
+                contextlib.redirect_stderr(output):
+            self.assertEqual(MODULE["main"](["--full-suite"]), 2)
+        self.assertEqual(json.loads(output.getvalue())["suite"], MODULE["SUITE_ID"])
 
     def test_failed_authorization_cannot_write_or_dispatch(self):
         for args in (["--live-preflight"], *(["--scenario", scenario] for scenario in MODULE["SCENARIOS"])):

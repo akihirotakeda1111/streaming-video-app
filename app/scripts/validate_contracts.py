@@ -25,13 +25,22 @@ EXPECTED_API_EXAMPLES = {
     "get-playback-response.json",
     "playback-not-ready-response.json",
 }
-EXPECTED_INTERNAL_FIELDS = ["worker_id", "attempt", "lease_expires_at"]
+EXPECTED_INTERNAL_FIELDS = [
+    "worker_id",
+    "attempt",
+    "lease_expires_at",
+    "published_manifest_key",
+    "mode",
+]
 FORBIDDEN_PUBLIC_FIELDS = {
     "worker_id",
     "workerId",
     "attempt",
     "lease_expires_at",
     "leaseExpiresAt",
+    "published_manifest_key",
+    "publishedManifestKey",
+    "mode",
 }
 CANONICAL_SOURCE_KEY = "videos/{video_id}/jobs/{job_id}/source.mp4"
 
@@ -331,7 +340,7 @@ def validate_reliability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
             raise ContractError(f"reliability contract {field} must reference {expected_path.name}")
 
     if metadata.get("internal_fields") != EXPECTED_INTERNAL_FIELDS:
-        raise ContractError("reliability contract must define the three Phase 2 lease fields")
+        raise ContractError("reliability contract must define lease fields, manifest pointer, and mode")
     if metadata.get("public_api_exposes_internal_fields") is not False:
         raise ContractError("reliability fields must remain internal")
 
@@ -343,7 +352,6 @@ def validate_reliability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
     }:
         raise ContractError("reliability publication metadata contradicts manifest-last ordering")
 
-    component_schemas = api.get("components", {}).get("schemas", {})
     public_property_names: set[str] = set()
 
     def collect_property_names(value: Any) -> None:
@@ -357,7 +365,7 @@ def validate_reliability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
             for item in value:
                 collect_property_names(item)
 
-    collect_property_names(component_schemas)
+    collect_property_names(api)
     exposed_fields = FORBIDDEN_PUBLIC_FIELDS & public_property_names
     if exposed_fields:
         raise ContractError(
@@ -381,6 +389,115 @@ def validate_reliability_contract(contracts_dir: Path, api: dict[str, Any]) -> N
         )
 
 
+def validate_orchestration_payload(
+    kind: str,
+    payload: dict[str, Any],
+    validator: Draft202012Validator,
+    parent: dict[str, Any] | None = None,
+    child: dict[str, Any] | None = None,
+) -> None:
+    """Check schema plus semantic equalities also required of runtime consumers."""
+    errors = sorted(validator.iter_errors(payload), key=lambda error: str(list(error.path)))
+    if errors:
+        raise ContractError(f"{kind} orchestration payload is invalid: {errors[0].message}")
+    identity = ("video_id", "job_id", "attempt", "execution_id", "source_key")
+    source = f"videos/{payload['video_id']}/jobs/{payload['job_id']}/source.mp4"
+    execution = f"job-{payload['job_id']}-a{payload['attempt']}"
+    prefix = (
+        f"videos/{payload['video_id']}/jobs/{payload['job_id']}/hls/attempts/"
+        f"{payload['attempt']}/{payload['execution_id']}"
+    )
+    if payload["source_key"] != source or payload["execution_id"] != execution:
+        raise ContractError(f"{kind} source/execution must match declared identity")
+    if kind != "parent":
+        prefix += f"/{payload['rendition']}"
+        if parent is None or any(payload[field] != parent[field] for field in identity):
+            raise ContractError(f"{kind} identity must match parent")
+        if payload["rendition"] not in parent["renditions"]:
+            raise ContractError(f"{kind} rendition must be requested by parent")
+    if payload["output_prefix"] != prefix:
+        raise ContractError(f"{kind} output prefix must match declared identity")
+    if kind == "result":
+        if child is None or any(payload[field] != child[field] for field in (*identity, "rendition", "output_prefix")):
+            raise ContractError("result must match assigned child")
+        if payload["media_playlist"]["key"] != f"{prefix}/index.m3u8":
+            raise ContractError("result media playlist must be in its assigned prefix")
+        for index, segment in enumerate(payload["segments"]):
+            if segment["key"] != f"{prefix}/segment-{index:05d}.ts":
+                raise ContractError("result segments must be contiguous, ordered, and in their assigned prefix")
+
+
+def validate_scalability_contract(contracts_dir: Path, api: dict[str, Any]) -> None:
+    contract_path = contracts_dir / "domain" / "scalability-conventions.md"
+    metadata, _ = load_markdown_contract(contract_path)
+    if metadata.get("contract_version") != 1 or metadata.get("contract_id") != "phase3-scalability":
+        raise ContractError("scalability contract metadata is invalid")
+
+    expected_paths = {
+        "status_schema": contracts_dir / "domain" / "job-status.schema.json",
+        "storage_contract": contracts_dir / "domain" / "storage-conventions.md",
+        "reliability_contract": contracts_dir / "domain" / "reliability-conventions.md",
+        "parent_input_schema": contracts_dir / "domain" / "orchestration-parent-input.schema.json",
+        "child_input_schema": contracts_dir / "domain" / "orchestration-child-input.schema.json",
+        "child_result_schema": contracts_dir / "domain" / "orchestration-child-result.schema.json",
+        "parent_input_fixture": contracts_dir / "examples" / "internal" / "parent-input.json",
+        "child_input_fixture": contracts_dir / "examples" / "internal" / "child-input.json",
+        "child_result_fixture": contracts_dir / "examples" / "internal" / "child-result.json",
+    }
+    for field, expected in expected_paths.items():
+        reference = metadata.get(field)
+        if not isinstance(reference, str) or (contract_path.parent / reference).resolve() != expected.resolve():
+            raise ContractError(f"scalability contract {field} has an invalid reference")
+        if not expected.is_file():
+            raise ContractError(f"scalability contract reference is missing: {expected}")
+
+    schemas = {}
+    for name in ("parent_input_schema", "child_input_schema", "child_result_schema"):
+        schema_path = expected_paths[name]
+        schema = load_json(schema_path)
+        Draft202012Validator.check_schema(schema)
+        schemas[name] = Draft202012Validator(schema, format_checker=FormatChecker())
+    parent = load_json(expected_paths["parent_input_fixture"])
+    child = load_json(expected_paths["child_input_fixture"])
+    result = load_json(expected_paths["child_result_fixture"])
+    for name, validator, instance in (
+        ("parent", schemas["parent_input_schema"], parent),
+        ("child", schemas["child_input_schema"], child),
+        ("result", schemas["child_result_schema"], result),
+    ):
+        validate_orchestration_payload(name, instance, validator, parent, child)
+
+    if metadata.get("modes") != {
+        "default": "cli", "supported": ["cli", "distributed"],
+        "immutable_after_first_acquisition": True,
+    }:
+        raise ContractError("scalability mode metadata is invalid")
+    if metadata.get("results") != {
+        "transport": "s3", "bucket": "VIDEO_OUTPUT_BUCKET", "filename": "result.json",
+        "content_type": "application/json", "ecs_integration": "ecs:runTask.sync",
+        "cloudfront_readable": False,
+    }:
+        raise ContractError("scalability results must use private S3 JSON and ECS sync")
+    if metadata.get("delivery") != {
+        "playback_base_url": "PLAYBACK_BASE_URL",
+        "scheme": "https",
+        "bucket_private": True,
+        "origin_access_control": True,
+        "path_has_bucket_name": False,
+    }:
+        raise ContractError("scalability delivery metadata contradicts private HTTPS delivery")
+
+    playback_schema = api["components"]["schemas"]["PlaybackResponse"]["properties"]["manifestUrl"]
+    if playback_schema.get("pattern") != r"^https://[^?#]+$":
+        raise ContractError("PlaybackResponse.manifestUrl must require an HTTPS delivery URL")
+    playback_url = load_json(contracts_dir / "examples" / "api" / "get-playback-response.json")["manifestUrl"]
+    parsed = urlparse(playback_url)
+    if parsed.scheme != "https" or not parsed.netloc or ".s3." in parsed.netloc:
+        raise ContractError("playback example must use PLAYBACK_BASE_URL, not an S3 endpoint")
+    if "/streaming-video-output/" in parsed.path:
+        raise ContractError("playback URL must not insert the bucket name into delivery paths")
+
+
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
     contracts_dir = repo_root / "app" / "contracts"
@@ -399,10 +516,11 @@ def main() -> int:
     validate_failure_semantics(validators["Job"])
     validate_storage_example(contracts_dir, api, examples_dir)
     validate_reliability_contract(contracts_dir, api)
+    validate_scalability_contract(contracts_dir, api)
 
     print(
         f"contracts valid: {len(referenced_examples)} API examples, "
-        "1 S3 event example, FAILED/failure semantics, and Phase 2 reliability"
+        "1 S3 event example, FAILED/failure semantics, and Phase 2/3 contracts"
     )
     return 0
 

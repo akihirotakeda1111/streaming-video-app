@@ -8,7 +8,7 @@ const execute = promisify(execFile)
 const frontendDir = fileURLToPath(new URL('..', import.meta.url))
 const playwrightCli = fileURLToPath(new URL('../node_modules/@playwright/test/cli.js', import.meta.url))
 
-async function listTests(project: string, discovery = false): Promise<string> {
+async function listTests(project: string, discovery = false, replay = false): Promise<string> {
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('E2E_')))
   const { stdout } = await execute(
     process.execPath,
@@ -23,6 +23,7 @@ async function listTests(project: string, discovery = false): Promise<string> {
         E2E_API_URL: 'http://127.0.0.1:8000',
         E2E_PROJECT: project === 'reliability' ? 'chromium' : project,
         ...(discovery ? { E2E_DISCOVERY: 'true' } : {}),
+        ...(replay ? { E2E_INCLUDE_DELIVERY_REPLAY: 'true' } : {}),
       },
     },
   )
@@ -39,6 +40,8 @@ describe('Playwright project isolation', () => {
       expect(output).not.toContain('@reliability')
       expect(output).not.toContain('runtime.spec.ts')
       expect(output).not.toContain('.test.ts')
+      expect(output).not.toContain('delivery-regression.spec.ts')
+      expect(output).toContain('delivery-preflight.spec.ts')
     },
     30_000,
   )
@@ -50,4 +53,9 @@ describe('Playwright project isolation', () => {
     expect(output).not.toContain('@phase1-pipeline')
     expect(output).not.toContain('.test.ts')
   }, 30_000)
+
+  it('includes delivery replay for the dedicated runner and complete discovery', async () => {
+    expect(await listTests('chromium', false, true)).toContain('delivery-regression.spec.ts')
+    expect(await listTests('chromium', true)).toContain('delivery-regression.spec.ts')
+  }, 40_000)
 })

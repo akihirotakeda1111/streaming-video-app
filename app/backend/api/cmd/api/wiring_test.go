@@ -111,7 +111,7 @@ func TestBuildRuntimeWiresContractRoutes(t *testing.T) {
 	if playbackBody["protocol"] != "HLS" || playbackBody["contentType"] != "application/vnd.apple.mpegurl" {
 		t.Fatalf("playback = %#v", playbackBody)
 	}
-	wantURL := "https://video-output-test.s3.ap-northeast-1.amazonaws.com/videos/" + string(testContractVideoID) + "/jobs/" + string(testContractJobID) + "/hls/index.m3u8"
+	wantURL := "https://video-output-test.cloudfront.net/videos/" + string(testContractVideoID) + "/jobs/" + string(testContractJobID) + "/hls/index.m3u8"
 	if playbackBody["manifestUrl"] != wantURL {
 		t.Fatalf("manifestUrl = %#v, want %q", playbackBody["manifestUrl"], wantURL)
 	}
@@ -435,6 +435,7 @@ func completedContractVideo() persistence.Video {
 			JobID:     testContractJobID,
 			VideoID:   testContractVideoID,
 			Status:    persistence.JobStatusCompleted,
+			Mode:      persistence.JobModeCLI,
 			UpdatedAt: createdAt.Add(4*time.Minute + 52*time.Second),
 		},
 		CreatedAt: createdAt,
@@ -450,6 +451,7 @@ func testConfig() config.Config {
 		InputBucket:      "video-input-test",
 		OutputBucket:     "video-output-test",
 		OutputS3Endpoint: "https://video-output-test.s3.ap-northeast-1.amazonaws.com",
+		PlaybackBaseURL:  "https://video-output-test.cloudfront.net",
 		FrontendOrigin:   "http://localhost:5173",
 	}
 }
@@ -463,6 +465,7 @@ func testLookupEnv() config.LookupEnvFunc {
 		"VIDEO_INPUT_BUCKET":  cfg.InputBucket,
 		"VIDEO_OUTPUT_BUCKET": cfg.OutputBucket,
 		"OUTPUT_S3_ENDPOINT":  cfg.OutputS3Endpoint,
+		"PLAYBACK_BASE_URL":   cfg.PlaybackBaseURL,
 		"FRONTEND_ORIGIN":     cfg.FrontendOrigin,
 	}
 	return func(name string) (string, bool) {
