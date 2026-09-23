@@ -191,8 +191,11 @@ target, representative processing time, cooldowns, and the total runtime budget.
 `api_service` is the
 ECS API service name from the compute outputs. `input_bucket` is that
 environment's video input bucket name. `worker_max_concurrency` is the deployed
-`WORKER_MAX_CONCURRENCY`. The fixture path is never copied into evidence and
-must be readable only by the operator running the test.
+`WORKER_MAX_CONCURRENCY`. Live `--full` resolves `fixture_path` once to an
+absolute path and passes that same path to ffprobe and Playwright. On WSL or
+Linux that path must be a Linux absolute path, such as `/mnt/c/...`, not a
+Windows drive path. The fixture path is never copied into evidence and must be
+readable only by the operator running the test.
 
 The runner derives and records one fixed batch before submission. The scaling
 metric is visible queue depth divided by running workers, and visible depth

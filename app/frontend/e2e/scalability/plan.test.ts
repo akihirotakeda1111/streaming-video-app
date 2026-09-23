@@ -255,6 +255,53 @@ except ValueError as error:
   })
 })
 
+describe('fixture path normalization', () => {
+  it('uses one absolute path and rejects relative or Windows paths on Linux', () => {
+    const result = spawnSync('python', ['-c', `
+import os, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import run_scalability_e2e as runner
+handle = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+handle.write(b"x")
+handle.close()
+try:
+    resolved = runner._resolve_fixture_path(handle.name)
+    home = runner._resolve_fixture_path("~/scalability-fixture-not-real.mp4")
+    print("resolved-match", resolved == Path(handle.name).resolve() and resolved.is_absolute())
+    print("home-match", home == (Path.home() / "scalability-fixture-not-real.mp4").resolve())
+    print("same-string", str(resolved) == str(Path(handle.name).resolve()))
+finally:
+    os.remove(handle.name)
+try:
+    runner._resolve_fixture_path("clip.mp4")
+except ValueError as error:
+    print("relative", error)
+try:
+    runner._normalize_fixture_path(r"C:\\Users\\video.mp4", posix=True)
+except ValueError as error:
+    print("windows", error)
+try:
+    runner._normalize_fixture_path("C:/Users/video.mp4", posix=True)
+except ValueError as error:
+    print("windows-forward", error)
+from pathlib import PurePosixPath
+mnt = "/mnt/c/Users/video.mp4"
+print("mnt-absolute", PurePosixPath(mnt).is_absolute() and runner.WINDOWS_FIXTURE_PATH.match(mnt) is None)
+`, scriptsDir], { encoding: 'utf8' })
+    expect(result.status, result.stderr ?? '').toBe(0)
+    const lines = result.stdout.trim().split(/\r?\n/)
+    expect(lines[0]).toBe('resolved-match True')
+    expect(lines[1]).toBe('home-match True')
+    expect(lines[2]).toBe('same-string True')
+    expect(lines[3]).toContain('fixture_path must be an absolute path')
+    expect(lines[4]).toContain('Linux absolute path')
+    expect(lines[5]).toContain('Linux absolute path')
+    expect(lines[6]).toBe('mnt-absolute True')
+    expect(result.stdout).not.toContain('secret-scalability-fixture')
+  })
+})
+
 describe('API health URL', () => {
   it('keeps a configured /api/v1 prefix', () => {
     const result = spawnSync('python', ['-c', `

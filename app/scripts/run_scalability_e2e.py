@@ -45,6 +45,7 @@ REQUIRED = {
     "scale_out_cooldown_seconds", "scale_in_cooldown_seconds", "runtime_budget_seconds",
 }
 BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+WINDOWS_FIXTURE_PATH = re.compile(r"^[A-Za-z]:[\\/]|^\\\\")
 METRIC_PERIOD_SECONDS = 60
 DEFAULT_SCALE_OUT_EVALUATION_PERIODS = 3
 DEFAULT_SCALE_IN_EVALUATION_PERIODS = 15
@@ -118,11 +119,26 @@ def _validate(config: dict[str, Any], live: bool) -> None:
                  "submission_window_seconds"):
         if isinstance(config[name], bool) or not isinstance(config[name], (int, float)) or config[name] <= 0:
             raise ValueError(f"{name} must be positive")
-    fixture = Path(str(config["fixture_path"])).expanduser()
-    if live and (not fixture.is_file() or fixture.stat().st_size == 0):
-        raise ValueError("fixture_path must identify a non-empty 720p-or-higher fixture")
     if live and os.environ.get("SCALABILITY_E2E_ALLOW_LIVE") != "true":
         raise ValueError("set SCALABILITY_E2E_ALLOW_LIVE=true for the dedicated live environment")
+
+
+def _normalize_fixture_path(value: object, *, posix: bool) -> Path:
+    """Resolve one absolute fixture path for both ffprobe and Playwright."""
+    raw = str(value).strip()
+    if posix and WINDOWS_FIXTURE_PATH.match(raw):
+        raise ValueError(
+            "fixture_path must be a Linux absolute path such as /mnt/c/... "
+            "when the runner executes on WSL or Linux"
+        )
+    fixture_path = Path(raw).expanduser()
+    if not fixture_path.is_absolute():
+        raise ValueError("fixture_path must be an absolute path")
+    return fixture_path.resolve()
+
+
+def _resolve_fixture_path(value: object) -> Path:
+    return _normalize_fixture_path(value, posix=os.name != "nt")
 
 
 def _whole(value: float) -> int | float:
@@ -785,7 +801,13 @@ def _ensure_workload(evidence: Path, batch_size: int, error: str) -> None:
     target.write_text(json.dumps(_workload_fallback(batch_size, error), indent=2) + "\n", encoding="utf-8")
 
 
-def _playwright(config: dict[str, Any], evidence: Path, plan: dict[str, Any], fixture: dict[str, Any]) -> int:
+def _playwright(
+    config: dict[str, Any],
+    evidence: Path,
+    plan: dict[str, Any],
+    fixture: dict[str, Any],
+    fixture_path: Path,
+) -> int:
     node = shutil.which("node")
     if node is None or not CLI.is_file():
         raise ValueError("Playwright CLI is unavailable; install frontend dependencies")
@@ -800,7 +822,7 @@ def _playwright(config: dict[str, Any], evidence: Path, plan: dict[str, Any], fi
         "AWS_REGION": str(config["region"]),
         "AWS_DEFAULT_REGION": str(config["region"]),
         "SCALABILITY_BATCH_SIZE": str(plan["batchSize"]),
-        "SCALABILITY_FIXTURE_PATH": str(Path(str(config["fixture_path"])).expanduser()),
+        "SCALABILITY_FIXTURE_PATH": str(fixture_path),
         "SCALABILITY_FIXTURE_NAME": str(fixture["name"]),
         "SCALABILITY_FIXTURE_DURATION_SECONDS": str(fixture["durationSeconds"]),
         "SCALABILITY_SUBMISSION_WINDOW_SECONDS": str(plan["submissionWindowSeconds"]),
@@ -832,12 +854,14 @@ def _playwright(config: dict[str, Any], evidence: Path, plan: dict[str, Any], fi
 
 
 def _full(config: dict[str, Any]) -> int:
+    fixture_path = _resolve_fixture_path(config["fixture_path"])
+    if not fixture_path.is_file() or fixture_path.stat().st_size == 0:
+        raise ValueError("fixture_path must identify a non-empty 720p-or-higher fixture")
     _validate(config, True)
     evidence = Path(os.environ.get("SCALABILITY_E2E_EVIDENCE_DIR", "artifacts/scalability-e2e")).resolve()
     evidence.mkdir(parents=True, exist_ok=False)
     batch_size = 0
     try:
-        fixture_path = Path(str(config["fixture_path"])).expanduser()
         media = probe_fixture(fixture_path)
         observed = _preflight(config)
         observed["summary"]["fixture"] = {
@@ -858,7 +882,7 @@ def _full(config: dict[str, Any]) -> int:
         }
         (evidence / "planned-workload.json").write_text(json.dumps(recorded, indent=2) + "\n", encoding="utf-8")
         (evidence / "preflight.json").write_text(json.dumps(observed["summary"], indent=2) + "\n", encoding="utf-8")
-        code = _playwright(config, evidence, plan, fixture)
+        code = _playwright(config, evidence, plan, fixture, fixture_path)
         if code != 0:
             _ensure_workload(evidence, batch_size, f"playwright exited {code}")
         return code
