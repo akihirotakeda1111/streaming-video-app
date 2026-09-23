@@ -66,6 +66,7 @@ export interface WorkloadDocument {
   childIntervals: unknown[]
   playback?: unknown
   observationErrors: string[]
+  finalized: boolean
   error?: string
 }
 
@@ -75,14 +76,18 @@ export function buildWorkloadDocument(
     fixture?: FixtureIdentity
     playbackDetails?: unknown
     error?: string
+    finalized?: boolean
     forbiddenPaths?: readonly string[]
   },
 ): WorkloadDocument {
   const checkpoints = evaluateScalability(input)
   const incompleteJobIds = input.jobs.filter((job) => job.status !== 'COMPLETED').map((job) => job.jobId)
+  const finalized = input.finalized === true
+  const acceptance = overallStatus(checkpoints)
   const document: WorkloadDocument = {
     scenario: 'scalability',
-    status: overallStatus(checkpoints),
+    finalized,
+    status: finalized ? acceptance : 'failed',
     startedAt: input.startedAt,
     observedAt: new Date().toISOString(),
     batchSize: input.batchSize,

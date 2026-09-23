@@ -218,6 +218,33 @@ describe('workload evidence', () => {
     expect(encoded).not.toContain('fixture_path')
     expect(document.fixture).toEqual({ name: 'clip.mp4', durationSeconds: 30, sizeBytes: 5, sha256: 'abc' })
     expect(document.status).toBe('failed')
+    expect(document.finalized).toBe(false)
     expect(document.checkpoints.parentScaleOut.status).toBe('NOT RUN')
+  })
+
+  it('keeps an unfinished observation from being accepted while every checkpoint is PASS', () => {
+    const input = {
+      attempted: true,
+      minimumCapacity: 1,
+      batchSize: 2,
+      jobs: jobs(),
+      samples: samples(),
+      activities: activities(),
+      childIntervals: intervals(),
+      playbackAttempted: true,
+      observationErrors: [],
+      playback: {
+        usedVideoJs: true, master: true, playlist360: true, playlist720: true,
+        segment360: true, segment720: true, decoded: true, advanced: true, switched: true,
+      },
+      startedAt: '2026-09-23T00:00:00.000Z',
+    }
+    const intermediate = buildWorkloadDocument({ ...input, finalized: false })
+    expect(Object.values(intermediate.checkpoints).every((checkpoint) => checkpoint.status === 'PASS')).toBe(true)
+    expect(intermediate.finalized).toBe(false)
+    expect(intermediate.status).toBe('failed')
+    const finalized = buildWorkloadDocument({ ...input, finalized: true })
+    expect(finalized.finalized).toBe(true)
+    expect(finalized.status).toBe('passed')
   })
 })

@@ -414,14 +414,69 @@ def _require_input_bucket(name: str, region: str) -> None:
         raise ValueError("dedicated input bucket is not in the handoff region")
 
 
-def _alarm_window(alarm: dict[str, Any]) -> float:
+def _alarm_period(alarm: dict[str, Any]) -> int:
+    """Read the sampling period from metric math, where top-level Period is absent."""
+    metrics = alarm.get("Metrics")
+    if isinstance(metrics, list):
+        periods: list[int] = []
+        for item in metrics:
+            if not isinstance(item, dict):
+                continue
+            stat = item.get("MetricStat")
+            if not isinstance(stat, dict):
+                continue
+            period = stat.get("Period")
+            if isinstance(period, bool) or not isinstance(period, int) or period <= 0:
+                raise ValueError("scaling alarm is missing its evaluation window")
+            periods.append(period)
+        if not periods:
+            raise ValueError("scaling alarm is missing its evaluation window")
+        if len(set(periods)) != 1:
+            raise ValueError("scaling alarm metric periods disagree")
+        return periods[0]
     period = alarm.get("Period")
+    if isinstance(period, bool) or not isinstance(period, int) or period <= 0:
+        raise ValueError("scaling alarm is missing its evaluation window")
+    return period
+
+
+def _alarm_window(alarm: dict[str, Any]) -> float:
     periods = alarm.get("EvaluationPeriods")
-    if isinstance(period, bool) or isinstance(periods, bool):
+    if isinstance(periods, bool) or not isinstance(periods, int) or periods <= 0:
         raise ValueError("scaling alarm is missing its evaluation window")
-    if not isinstance(period, int) or not isinstance(periods, int) or period <= 0 or periods <= 0:
-        raise ValueError("scaling alarm is missing its evaluation window")
-    return float(period * periods)
+    return float(_alarm_period(alarm) * periods)
+
+
+def _policy_alarm_names(policy: dict[str, Any]) -> list[str]:
+    alarms = policy.get("Alarms")
+    if not isinstance(alarms, list) or len(alarms) < 2:
+        raise ValueError("scaling policy does not reference its scale-out and scale-in alarms")
+    names: list[str] = []
+    for alarm in alarms:
+        if not isinstance(alarm, dict):
+            raise ValueError("scaling policy does not reference its scale-out and scale-in alarms")
+        name = alarm.get("AlarmName")
+        if not isinstance(name, str) or not name.strip():
+            arn = alarm.get("AlarmARN")
+            if isinstance(arn, str) and ":alarm:" in arn:
+                name = arn.split(":alarm:", 1)[1]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("scaling policy does not reference its scale-out and scale-in alarms")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError("scaling policy does not reference its scale-out and scale-in alarms")
+    return names
+
+
+def _scale_alarms(alarms: list[Any], target: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    high = [alarm for alarm in alarms if isinstance(alarm, dict) and "GreaterThan" in str(alarm.get("ComparisonOperator"))]
+    low = [alarm for alarm in alarms if isinstance(alarm, dict) and "LessThan" in str(alarm.get("ComparisonOperator"))]
+    if len(high) != 1 or len(low) != 1:
+        raise ValueError("live preflight did not find the scale-out and scale-in alarms")
+    threshold = low[0].get("Threshold")
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or float(threshold) > target + 1e-3:
+        raise ValueError("scale-in alarm threshold is not at or below the backlog-per-worker target")
+    return high[0], low[0]
 
 
 def _preflight(config: dict[str, Any]) -> dict[str, Any]:
@@ -517,18 +572,21 @@ def _preflight(config: dict[str, Any]) -> dict[str, Any]:
     if "ApproximateNumberOfMessagesVisible" not in names or "RunningTaskCount" not in names:
         raise ValueError("scaling metric does not use queue depth and running task count")
 
-    alarms = [
-        alarm for alarm in _collect(["cloudwatch", "describe-alarms", "--region", region, "--max-records", "100"], "MetricAlarms")
-        if isinstance(alarm, dict) and resource_id in str(alarm.get("AlarmName", "")) and str(alarm.get("AlarmName", "")).startswith("TargetTracking-")
-    ]
-    high = [alarm for alarm in alarms if "GreaterThan" in str(alarm.get("ComparisonOperator"))]
-    low = [alarm for alarm in alarms if "LessThan" in str(alarm.get("ComparisonOperator"))]
-    if len(high) != 1 or len(low) != 1:
+    alarm_names = _policy_alarm_names(policy)
+    described_alarms = _aws(["cloudwatch", "describe-alarms", "--alarm-names", *alarm_names, "--region", region])
+    found = described_alarms.get("MetricAlarms") if isinstance(described_alarms, dict) else None
+    if not isinstance(found, list):
         raise ValueError("live preflight did not find the scale-out and scale-in alarms")
-    if not _close(high[0].get("Threshold"), config["backlog_per_worker_target"]) or not _close(low[0].get("Threshold"), config["backlog_per_worker_target"]):
-        raise ValueError("scaling alarm threshold does not match the backlog-per-worker target")
-    scale_out_evaluation = _alarm_window(high[0])
-    scale_in_evaluation = _alarm_window(low[0])
+    by_name = {alarm.get("AlarmName"): alarm for alarm in found if isinstance(alarm, dict) and isinstance(alarm.get("AlarmName"), str)}
+    selected = []
+    for name in alarm_names:
+        alarm = by_name.get(name)
+        if not isinstance(alarm, dict):
+            raise ValueError("live preflight did not find the scale-out and scale-in alarms")
+        selected.append(alarm)
+    high, low = _scale_alarms(selected, float(config["backlog_per_worker_target"]))
+    scale_out_evaluation = _alarm_window(high)
+    scale_in_evaluation = _alarm_window(low)
     return {
         "scaleOutEvaluationSeconds": scale_out_evaluation,
         "scaleInEvaluationSeconds": scale_in_evaluation,
@@ -563,7 +621,12 @@ def _preflight(config: dict[str, Any]) -> dict[str, Any]:
                 "scaleOutCooldown": policy_config.get("ScaleOutCooldown"),
                 "scaleInCooldown": policy_config.get("ScaleInCooldown"),
             },
-            "evaluation": {"scaleOutSeconds": scale_out_evaluation, "scaleInSeconds": scale_in_evaluation},
+            "evaluation": {
+                "scaleOutSeconds": scale_out_evaluation,
+                "scaleInSeconds": scale_in_evaluation,
+                "scaleOutThreshold": high.get("Threshold"),
+                "scaleInThreshold": low.get("Threshold"),
+            },
         },
     }
 
@@ -583,6 +646,7 @@ def _workload_fallback(batch_size: int, error: str) -> dict[str, Any]:
         "parentActivities": [],
         "childIntervals": [],
         "observationErrors": [error],
+        "finalized": False,
         "error": error,
     }
 
@@ -590,6 +654,15 @@ def _workload_fallback(batch_size: int, error: str) -> dict[str, Any]:
 def _ensure_workload(evidence: Path, batch_size: int, error: str) -> None:
     target = evidence / "workload.json"
     if target.is_file():
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(existing, dict) and existing.get("status") == "passed":
+            existing["status"] = "failed"
+            existing["finalized"] = False
+            existing["error"] = error
+            target.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
         return
     target.write_text(json.dumps(_workload_fallback(batch_size, error), indent=2) + "\n", encoding="utf-8")
 

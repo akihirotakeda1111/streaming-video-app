@@ -162,7 +162,7 @@ test.describe('@scalability', () => {
       let failure: string | undefined
       let finalWriteError: string | undefined
       const forbidden = [active.fixturePath]
-      const snapshot = () => buildWorkloadDocument({
+      const snapshot = (finalized: boolean) => buildWorkloadDocument({
         attempted: true,
         minimumCapacity: active.minimumCapacity,
         batchSize: active.batchSize,
@@ -177,11 +177,12 @@ test.describe('@scalability', () => {
         fixture: active.fixture,
         playbackDetails: playback,
         ...(failure ? { error: failure } : {}),
+        finalized,
         forbiddenPaths: forbidden,
       })
       const publish = async (required: boolean) => {
         try {
-          await writeWorkload(active.evidenceDir, snapshot())
+          await writeWorkload(active.evidenceDir, snapshot(required))
           published = true
         } catch (error) {
           const message = safeMessage(error, forbidden)
@@ -192,7 +193,7 @@ test.describe('@scalability', () => {
           finalWriteError = message
           failure = message
           try {
-            await writeWorkload(active.evidenceDir, { ...snapshot(), status: 'failed', error: message })
+            await writeWorkload(active.evidenceDir, { ...snapshot(true), status: 'failed', finalized: true, error: message })
             published = true
           } catch {
             // The required write stays failed in memory when the evidence directory cannot be updated.
@@ -288,8 +289,8 @@ test.describe('@scalability', () => {
         await publish(true)
       }
       document = finalWriteError
-        ? { ...snapshot(), status: 'failed', error: finalWriteError }
-        : snapshot()
+        ? { ...snapshot(true), status: 'failed', finalized: true, error: finalWriteError }
+        : snapshot(true)
     } catch (error) {
       const forbidden = settings ? [settings.fixturePath] : []
       if (!published) {

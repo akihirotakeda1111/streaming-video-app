@@ -238,9 +238,15 @@ presigned upload whose bucket is not that input bucket is rejected before the
 fixture is sent. It also requires an active state machine whose definition is
 the distributed 360p/720p `runTask.sync` workflow, an autoscaling target and
 target-tracking policy whose metric is visible queue depth divided by running
-workers, and the managed scale-out and scale-in alarms. Observed alarm periods
-replace the offline evaluation defaults, and the batch plan is checked again
-against those periods. `preflight.json` records the non-secret observation.
+workers, and the alarms referenced by that policy. Metric-math alarms carry
+their sampling period on each `MetricStat`; the evaluation window is that
+period multiplied by `EvaluationPeriods`. The scale-out alarm uses a
+`GreaterThan` comparison. The scale-in alarm uses a `LessThan` comparison and
+its threshold is at or below the backlog-per-worker target, because target
+tracking can scale in only after the metric falls below the target. Observed
+alarm periods replace the offline evaluation defaults, and the batch plan is
+checked again against those periods. `preflight.json` records the non-secret
+observation.
 
 The Playwright project timeout is the runtime budget plus two minutes so the
 scenario can wait through scale-in and still write evidence. Other Playwright
@@ -260,11 +266,15 @@ the following from the same jobs. Each checkpoint is `PASS`, `FAIL`, or
 - the completed output plays through the installed video.js player on the frontend origin, including master, 360p, and 720p playlist and segment requests, decoded `readyState`, advancing `currentTime`, and a rendition switch selected by the `360p` or `720p` playlist or representation path
 
 `workload.json` is updated while observations progress. Those intermediate
-writes are best-effort. The write after observation stops is required: if it
-fails, the run is failed even when every checkpoint passed. A timeout, a failed
-job, or a failed preflight still leaves the incomplete jobs, task samples, and
-execution intervals that were collected. Missing observations stay `NOT RUN` or
-`FAIL`; they are not treated as success.
+writes are best-effort, keep `finalized: false`, and never record overall
+status `passed`, even when every checkpoint is already `PASS`. Only the write
+after observation stops can set `finalized: true` and status `passed`. That
+write is required: if it fails, the run is failed even when every checkpoint
+passed. If the process then exits non-zero and a `passed` artifact is still
+present, the runner records that artifact as failed instead of leaving it as
+acceptance. A timeout, a failed job, or a failed preflight still leaves the
+incomplete jobs, task samples, and execution intervals that were collected.
+Missing observations stay `NOT RUN` or `FAIL`; they are not treated as success.
 A failed or timed-out job is not a partial acceptance. Operators retain cleanup
 ownership and must leave unresolved workload status recorded before environment
 teardown.

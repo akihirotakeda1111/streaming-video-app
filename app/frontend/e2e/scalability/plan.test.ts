@@ -137,6 +137,75 @@ describe('scalability offline plan', () => {
   })
 })
 
+describe('scaling alarm observations', () => {
+  function python(source: string): { status: number; stdout: string; stderr: string } {
+    const result = spawnSync('python', ['-c', source, scriptsDir], { encoding: 'utf8' })
+    return { status: result.status ?? 2, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }
+  }
+
+  it('reads metric-math periods from MetricStat and keeps scale-in below the target', () => {
+    const result = python(`
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import run_scalability_e2e as runner
+alarm = {
+  "EvaluationPeriods": 3,
+  "Metrics": [
+    {"Id": "visible_backlog", "MetricStat": {"Period": 60, "Stat": "Sum"}},
+    {"Id": "running_tasks", "MetricStat": {"Period": 60, "Stat": "Average"}},
+    {"Id": "backlog_per_worker", "Expression": "visible_backlog / running_tasks"},
+  ],
+}
+window = runner._alarm_window(alarm)
+policy = {"Alarms": [
+  {"AlarmName": "scale-out", "AlarmARN": "arn:aws:cloudwatch:us-east-1:123456789012:alarm:scale-out"},
+  {"AlarmARN": "arn:aws:cloudwatch:us-east-1:123456789012:alarm:scale-in"},
+]}
+names = runner._policy_alarm_names(policy)
+high, low = runner._scale_alarms([
+  {"AlarmName": "scale-out", "ComparisonOperator": "GreaterThanThreshold", "Threshold": 3},
+  {"AlarmName": "scale-in", "ComparisonOperator": "LessThanThreshold", "Threshold": 2.7},
+], 3)
+equal_high, equal_low = runner._scale_alarms([
+  {"ComparisonOperator": "GreaterThanThreshold", "Threshold": 3},
+  {"ComparisonOperator": "LessThanOrEqualToThreshold", "Threshold": 3},
+], 3)
+print(json.dumps({
+  "window": window,
+  "names": names,
+  "low": low["Threshold"],
+  "equalLow": equal_low["Threshold"],
+  "high": high["ComparisonOperator"],
+}))
+try:
+  runner._alarm_window({"EvaluationPeriods": 3, "Metrics": [
+    {"MetricStat": {"Period": 60}},
+    {"MetricStat": {"Period": 120}},
+  ]})
+except ValueError as error:
+  print(error)
+try:
+  runner._scale_alarms([
+    {"ComparisonOperator": "GreaterThanThreshold", "Threshold": 3},
+    {"ComparisonOperator": "LessThanThreshold", "Threshold": 3.1},
+  ], 3)
+except ValueError as error:
+  print(error)
+`)
+    expect(result.status, result.stderr).toBe(0)
+    const [reportLine, disagree, above] = result.stdout.trim().split(/\r?\n/)
+    expect(JSON.parse(reportLine ?? '{}')).toEqual({
+      window: 180,
+      names: ['scale-out', 'scale-in'],
+      low: 2.7,
+      equalLow: 3,
+      high: 'GreaterThanThreshold',
+    })
+    expect(disagree).toContain('metric periods disagree')
+    expect(above).toContain('scale-in alarm threshold')
+  })
+})
+
 describe('API health URL', () => {
   it('keeps a configured /api/v1 prefix', () => {
     const result = spawnSync('python', ['-c', `
