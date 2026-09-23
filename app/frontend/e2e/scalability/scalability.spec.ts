@@ -5,6 +5,7 @@ import { type JobRecord, type ServiceSample } from './checkpoints.js'
 import { buildWorkloadDocument, notRunDocument, sanitizeEvidence, writeWorkload, type FixtureIdentity, type WorkloadDocument } from './evidence.js'
 import { parentActivities, sampleParentService, startLiveObserver, type LiveObserver } from './observe.js'
 import { proveAbrPlayback, type PlaybackProof } from './playback.js'
+import { apiUrl, presignedUploadBucket } from './urls.js'
 
 function failedPlayback(error: string): PlaybackProof {
   return {
@@ -21,7 +22,6 @@ function failedPlayback(error: string): PlaybackProof {
     error,
   }
 }
-import { apiUrl } from './urls.js'
 
 interface Settings {
   fixturePath: string
@@ -37,6 +37,7 @@ interface Settings {
   service: string
   stateMachineArn: string
   minimumCapacity: number
+  inputBucket: string
 }
 
 function required(name: string): string {
@@ -83,6 +84,7 @@ function readSettings(): Settings {
     service: resourceName(required('SCALABILITY_PARENT_SERVICE')),
     stateMachineArn: required('SCALABILITY_STATE_MACHINE_ARN'),
     minimumCapacity,
+    inputBucket: required('SCALABILITY_INPUT_BUCKET'),
   }
 }
 
@@ -95,7 +97,7 @@ function safeMessage(error: unknown, forbidden: readonly string[]): string {
   return sanitizeEvidence(message, forbidden)
 }
 
-async function submit(request: APIRequestContext, bytes: Buffer, index: number): Promise<JobRecord> {
+async function submit(request: APIRequestContext, bytes: Buffer, index: number, inputBucket: string): Promise<JobRecord> {
   const createdResponse = await request.post(apiUrl(e2eConfig.apiUrl, 'videos'), {
     data: { fileName: `scalability-${index}.mp4`, contentType: 'video/mp4', sizeBytes: bytes.length },
   })
@@ -105,6 +107,10 @@ async function submit(request: APIRequestContext, bytes: Buffer, index: number):
     createdAt: string
     job: { jobId: string }
     upload: { url: string; headers: Record<string, string> }
+  }
+  const bucket = presignedUploadBucket(created.upload.url)
+  if (bucket !== inputBucket) {
+    throw new Error(`presigned upload bucket ${bucket ?? 'unknown'} does not match the dedicated input bucket ${inputBucket}`)
   }
   const upload = await request.put(created.upload.url, { headers: created.upload.headers, data: bytes })
   if (!upload.ok()) throw new Error(`upload failed (${upload.status()})`)
@@ -154,6 +160,7 @@ test.describe('@scalability', () => {
       let playback: PlaybackProof | undefined
       let playbackAttempted = false
       let failure: string | undefined
+      let finalWriteError: string | undefined
       const forbidden = [active.fixturePath]
       const snapshot = () => buildWorkloadDocument({
         attempted: true,
@@ -172,12 +179,24 @@ test.describe('@scalability', () => {
         ...(failure ? { error: failure } : {}),
         forbiddenPaths: forbidden,
       })
-      const publish = async () => {
+      const publish = async (required: boolean) => {
         try {
           await writeWorkload(active.evidenceDir, snapshot())
           published = true
         } catch (error) {
-          observationErrors.push(safeMessage(error, forbidden))
+          const message = safeMessage(error, forbidden)
+          if (!required) {
+            observationErrors.push(message)
+            return
+          }
+          finalWriteError = message
+          failure = message
+          try {
+            await writeWorkload(active.evidenceDir, { ...snapshot(), status: 'failed', error: message })
+            published = true
+          } catch {
+            // The required write stays failed in memory when the evidence directory cannot be updated.
+          }
         }
       }
       try {
@@ -193,16 +212,16 @@ test.describe('@scalability', () => {
           failure = safeMessage(error, forbidden)
         }
         if (bytes) {
-          for (let index = 0; index < active.batchSize; index += 1) {
-            try {
-              jobs.push(await submit(request, bytes, index))
-            } catch (error) {
-              failure = safeMessage(error, forbidden)
-              break
-            }
+          const payload = bytes
+          const results = await Promise.allSettled(Array.from({ length: active.batchSize }, (_, index) => (
+            submit(request, payload, index, active.inputBucket)
+          )))
+          for (const result of results) {
+            if (result.status === 'fulfilled') jobs.push(result.value)
+            else failure = safeMessage(result.reason, forbidden)
           }
         }
-        await publish()
+        await publish(false)
         if (jobs.length > 0) {
           observer = startLiveObserver({
             region: active.region,
@@ -235,7 +254,7 @@ test.describe('@scalability', () => {
                 }
               }
             }
-            await publish()
+            await publish(false)
             const allTerminal = jobs.every((job) => terminal(job.status))
             const allCompleted = jobs.length === active.batchSize && jobs.every((job) => job.status === 'COMPLETED')
             const completedAt = allCompleted ? Math.max(...jobs.map((job) => Date.parse(job.completedAt ?? job.createdAt))) : undefined
@@ -266,9 +285,11 @@ test.describe('@scalability', () => {
             observationErrors.push(safeMessage(error, forbidden))
           }
         }
-        await publish()
+        await publish(true)
       }
-      document = snapshot()
+      document = finalWriteError
+        ? { ...snapshot(), status: 'failed', error: finalWriteError }
+        : snapshot()
     } catch (error) {
       const forbidden = settings ? [settings.fixturePath] : []
       if (!published) {

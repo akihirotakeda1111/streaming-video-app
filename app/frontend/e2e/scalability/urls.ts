@@ -1,3 +1,71 @@
+const VIRTUAL_HOSTED_BUCKET = [
+  /^(.+)\.s3\.dualstack\.[a-z0-9-]+\.amazonaws\.com$/i,
+  /^(.+)\.s3-accelerate\.dualstack\.amazonaws\.com$/i,
+  /^(.+)\.s3-accelerate\.amazonaws\.com$/i,
+  /^(.+)\.s3\.[a-z0-9-]+\.amazonaws\.com$/i,
+  /^(.+)\.s3\.amazonaws\.com$/i,
+]
+
+/**
+ * Return the bucket addressed by an S3 presigned PUT URL.
+ * Virtual-hosted and path-style AWS endpoints are recognized. Any other host
+ * is rejected so the upload is not sent to an unknown environment.
+ */
+export function presignedUploadBucket(uploadUrl: string): string | undefined {
+  let url: URL
+  try {
+    url = new URL(uploadUrl)
+  } catch {
+    return undefined
+  }
+  const host = url.hostname.toLowerCase()
+  for (const pattern of VIRTUAL_HOSTED_BUCKET) {
+    const match = pattern.exec(host)
+    const bucket = match?.[1]?.toLowerCase()
+    if (bucket) return bucket
+  }
+  const pathStyle = host === 's3.amazonaws.com'
+    || /^s3\.[a-z0-9-]+\.amazonaws\.com$/i.test(host)
+    || /^s3\.dualstack\.[a-z0-9-]+\.amazonaws\.com$/i.test(host)
+  if (!pathStyle) return undefined
+  const bucket = url.pathname.split('/').filter(Boolean)[0]
+  if (!bucket) return undefined
+  try {
+    return decodeURIComponent(bucket).toLowerCase()
+  } catch {
+    return undefined
+  }
+}
+
+/** Identify a 360p or 720p rendition from a playlist URI or representation id. */
+export function renditionToken(value: unknown): '360p' | '720p' | undefined {
+  const queue: unknown[] = [value]
+  const seen = new Set<unknown>()
+  while (queue.length > 0) {
+    const current = queue.shift()
+    if (current == null || (typeof current === 'object' && seen.has(current))) continue
+    if (typeof current === 'string') {
+      let pathname = current
+      try {
+        pathname = new URL(current, 'https://playback.invalid').pathname
+      } catch {
+        pathname = current
+      }
+      const segments = pathname.split(/[/?#]/).filter(Boolean)
+      if (segments.includes('360p')) return '360p'
+      if (segments.includes('720p')) return '720p'
+      continue
+    }
+    if (typeof current !== 'object') continue
+    seen.add(current)
+    const record = current as Record<string, unknown>
+    for (const key of ['id', 'uri', 'resolvedUri', 'playlist', 'URI', 'attributes', 'name', 'label', 'NAME']) {
+      if (Object.prototype.hasOwnProperty.call(record, key)) queue.push(record[key])
+    }
+  }
+  return undefined
+}
+
 /** Build an API URL without dropping a configured `/api/v1` base path. */
 export function apiUrl(apiBase: string, path: string): string {
   const base = new URL(apiBase)

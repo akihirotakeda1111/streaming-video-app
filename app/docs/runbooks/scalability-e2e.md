@@ -182,25 +182,37 @@ python app/scripts/run_scalability_e2e.py --check
 ```
 
 The handoff records `account_id`, `region`, the environment identity, API and
-frontend origins, CloudFront playback origin, cluster and service identities,
+frontend origins, CloudFront playback origin, cluster, `api_service`,
+`worker_service`, and `parent_service`, the dedicated `input_bucket` name,
 Step Functions ARN, `distributed_mode: true`, `parent_min_capacity: 1`,
-API/Worker image digests, the 720p-or-higher fixture path
-and duration, worker limits, backlog-per-worker target, representative
-processing time, cooldowns, and the total runtime budget. The fixture path is
-never copied into evidence and must be readable only by the operator running
-the test.
+`worker_max_concurrency`, API/Worker image digests, the 720p-or-higher fixture
+path and duration, worker limits, backlog-per-worker target, representative
+processing time, cooldowns, and the total runtime budget. `api_service` is the
+ECS API service name from the compute outputs. `input_bucket` is that
+environment's video input bucket name. `worker_max_concurrency` is the deployed
+`WORKER_MAX_CONCURRENCY`. The fixture path is never copied into evidence and
+must be readable only by the operator running the test.
 
-The runner derives and records one fixed batch before submission. Its initial
-batch is `math.ceil(backlog_per_worker_target * worker_min_capacity) + 1`.
-The plan also has to leave scale-out observable: representative
-processing time must cover the scale-out evaluation window, and the runtime
-budget must cover that window, drain on at least two workers, both cooldowns,
-the scale-in evaluation window, and playback. Offline `--check` uses the
-target-tracking defaults of 3 one-minute periods to scale out and 15 one-minute
-periods to scale in. A budget that cannot cover that plan is rejected before
-any job is submitted. The rationale and fixture identity are written to
-`planned-workload.json`. The fixture record is the file name, duration, size,
-and SHA-256 only. No later submission is permitted.
+The runner derives and records one fixed batch before submission. The scaling
+metric is visible queue depth divided by running workers, and visible depth
+does not include messages the initial workers have already received. The batch
+is `floor(backlog_per_worker_target * worker_min_capacity) + 1 + worker_min_capacity * worker_max_concurrency`.
+After those workers take `worker_max_concurrency` messages each, the remaining
+visible backlog per running worker stays strictly above the target. For target
+3, minimum 1, and concurrency 1, the batch is 5: one message is in flight and
+four remain visible, so the ratio is 4. A batch of 4 would leave a ratio of 3
+and would not hold the scale-out condition across the evaluation periods.
+
+That predetermined batch is uploaded in parallel. The submission window recorded
+in the plan is one concurrent upload of the fixed batch. Representative
+processing time must cover the scale-out evaluation window after the batch is
+visible, and the runtime budget must cover that window, drain on at least two
+workers, both cooldowns, the scale-in evaluation window, and playback. Offline
+`--check` uses the target-tracking defaults of 3 one-minute periods to scale
+out and 15 one-minute periods to scale in. A budget that cannot cover that plan
+is rejected before any job is submitted. The rationale and fixture identity are
+written to `planned-workload.json`. The fixture record is the file name,
+duration, size, and SHA-256 only. No later submission is permitted.
 
 API and CloudFront URLs in the handoff must be `https`. The frontend URL may be
 `https`, or `http` on `localhost`, `127.0.0.1`, or `::1`. `--check` makes no
@@ -215,15 +227,20 @@ python app/scripts/run_scalability_e2e.py --full
 Live preflight reads AWS before submission. The handoff's own account, target,
 cooldowns, image digests, and `distributed_mode` flag are not sufficient. The
 runner compares the caller account, requires the parent service to be steady at
-one running and desired task, and checks the worker image digest plus
-`ORCHESTRATION_STATE_MACHINE_ARN` on that task definition. It also requires an
-API service using the API image digest, an active state machine whose
-definition is the distributed 360p/720p `runTask.sync` workflow, an autoscaling
-target and target-tracking policy whose metric is visible queue depth divided
-by running workers, and the managed scale-out and scale-in alarms. Observed
-alarm periods replace the offline evaluation defaults, and the batch plan is
-checked again against those periods. `preflight.json` records the non-secret
-observation.
+one running and desired task, and checks the worker image digest,
+`WORKER_MAX_CONCURRENCY`, `VIDEO_INPUT_BUCKET`, and
+`ORCHESTRATION_STATE_MACHINE_ARN` on that task definition. It requires the
+named API service to be active with at least one running and desired task, the
+API image digest on that service's task definition, and the same dedicated
+input bucket. It then requests `GET /api/v1/health` on the API origin and the
+frontend URL, and confirms the input bucket exists in the handoff region. A
+presigned upload whose bucket is not that input bucket is rejected before the
+fixture is sent. It also requires an active state machine whose definition is
+the distributed 360p/720p `runTask.sync` workflow, an autoscaling target and
+target-tracking policy whose metric is visible queue depth divided by running
+workers, and the managed scale-out and scale-in alarms. Observed alarm periods
+replace the offline evaluation defaults, and the batch plan is checked again
+against those periods. `preflight.json` records the non-secret observation.
 
 The Playwright project timeout is the runtime budget plus two minutes so the
 scenario can wait through scale-in and still write evidence. Other Playwright
@@ -231,21 +248,23 @@ projects keep their existing timeout. The live project is explicitly selected
 as `scalability`; ordinary `npm --prefix app/frontend run test:e2e` and the
 Reliability runner do not discover its scenarios.
 
-The scenario submits the fixed batch, then measures all of the following from
-the same jobs. Each checkpoint is `PASS`, `FAIL`, or `NOT RUN`. Overall status
-is `passed` only when every checkpoint is `PASS`:
+The scenario uploads the predetermined batch in parallel, then measures all of
+the following from the same jobs. Each checkpoint is `PASS`, `FAIL`, or
+`NOT RUN`. Overall status is `passed` only when every checkpoint is `PASS`:
 
 - parent service running tasks move from 1 to at least 2
 - different parent tasks process different job IDs over overlapping log intervals
 - at least one job has distinct 360p and 720p child task ARNs whose Step Functions and ECS intervals overlap
 - every submitted job reaches API `COMPLETED`
 - after that completion, the parent service returns to its configured minimum
-- the completed output plays through the installed video.js player on the frontend origin, including master, 360p, and 720p playlist and segment requests, decoded `readyState`, advancing `currentTime`, and a rendition switch
+- the completed output plays through the installed video.js player on the frontend origin, including master, 360p, and 720p playlist and segment requests, decoded `readyState`, advancing `currentTime`, and a rendition switch selected by the `360p` or `720p` playlist or representation path
 
-`workload.json` is written as those observations progress and again when the
-run stops. A timeout, a failed job, or a failed preflight still leaves the
-incomplete jobs, task samples, and execution intervals that were collected.
-Missing observations stay `NOT RUN` or `FAIL`; they are not treated as success.
+`workload.json` is updated while observations progress. Those intermediate
+writes are best-effort. The write after observation stops is required: if it
+fails, the run is failed even when every checkpoint passed. A timeout, a failed
+job, or a failed preflight still leaves the incomplete jobs, task samples, and
+execution intervals that were collected. Missing observations stay `NOT RUN` or
+`FAIL`; they are not treated as success.
 A failed or timed-out job is not a partial acceptance. Operators retain cleanup
 ownership and must leave unresolved workload status recorded before environment
 teardown.

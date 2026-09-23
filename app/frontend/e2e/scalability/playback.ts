@@ -3,6 +3,8 @@ import { expect, type Page, type Request } from '@playwright/test'
 import type { PlaybackSummary } from './checkpoints.js'
 import { isPlaybackMediaRequest, summarizePlayback } from './urls.js'
 
+type RenditionToken = '360p' | '720p'
+
 export interface PlaybackProof extends PlaybackSummary {
   manifestUrl?: string
   readyState?: number
@@ -103,16 +105,12 @@ export async function proveAbrPlayback(
     proof.currentTime = media.currentTime
     proof.decoded = media.readyState >= 2
     proof.advanced = media.currentTime > initialTime + 0.05
-    await expect.poll(() => page.evaluate(() => {
-      const player = (window as unknown as { __scalabilityPlayer?: { qualityLevels?: () => { length: number } } }).__scalabilityPlayer
-      if (!player || typeof player.qualityLevels !== 'function') return 0
-      return player.qualityLevels().length
-    }), {
+    await expect.poll(async () => (await inspectRenditions(page, '')).tokens, {
       timeout: remaining(),
-      message: 'video.js did not expose both renditions',
-    }).toBeGreaterThanOrEqual(2)
-    await selectAndWait(page, requests, 360, remaining)
-    await selectAndWait(page, requests, 720, remaining)
+      message: 'video.js did not expose 360p and 720p playlist renditions',
+    }).toEqual(expect.arrayContaining(['360p', '720p']))
+    await selectAndWait(page, requests, '360p', remaining)
+    await selectAndWait(page, requests, '720p', remaining)
     proof.switched = true
     refresh()
     return proof
@@ -128,47 +126,82 @@ export async function proveAbrPlayback(
 async function selectAndWait(
   page: Page,
   requests: { path: string; at: number }[],
-  height: 360 | 720,
+  token: RenditionToken,
   remaining: () => number,
 ): Promise<void> {
   const from = requests.length
-  const selected = await page.evaluate((target) => {
-    const player = (window as unknown as {
-      __scalabilityPlayer?: {
-        qualityLevels?: () => { length: number; [index: number]: { height: number; enabled: boolean } }
-        tech?: (options: { IWillNotUseThisInPlugins: true }) => {
-          vhs?: { representations?: () => { height: number; enabled: (value: boolean) => void }[] }
-        }
-      }
-    }).__scalabilityPlayer
-    if (!player) return { count: 0, matched: 0 }
-    if (typeof player.qualityLevels === 'function') {
-      const levels = player.qualityLevels()
-      let matched = 0
-      for (let index = 0; index < levels.length; index += 1) {
-        const level = levels[index]
-        if (!level) continue
-        const enable = level.height === target
-        level.enabled = enable
-        if (enable) matched += 1
-      }
-      return { count: levels.length, matched }
-    }
-    const representations = player.tech?.({ IWillNotUseThisInPlugins: true }).vhs?.representations?.() ?? []
-    let matched = 0
-    for (const representation of representations) {
-      const enable = representation.height === target
-      representation.enabled(enable)
-      if (enable) matched += 1
-    }
-    return { count: representations.length, matched }
-  }, height)
-  if (selected.matched < 1) throw new Error(`video.js could not select ${height}p`)
-  const token = height === 360 ? '360p' : '720p'
+  const selected = await inspectRenditions(page, token)
+  if (selected.matched < 1) throw new Error(`video.js could not select the ${token} rendition`)
   await expect.poll(() => requests.slice(from).some((request) => (
     request.path.split('/').includes(token) && /\.(m3u8|ts|m4s|mp4)$/i.test(request.path)
   )), {
     timeout: remaining(),
     message: `video.js did not request the ${token} rendition after the switch`,
   }).toBe(true)
+}
+
+async function inspectRenditions(page: Page, target: RenditionToken | ''): Promise<{ tokens: string[]; matched: number }> {
+  return page.evaluate((selected) => {
+    function tokenFrom(value: unknown): '360p' | '720p' | undefined {
+      const queue: unknown[] = [value]
+      const seen = new Set<unknown>()
+      while (queue.length > 0) {
+        const current = queue.shift()
+        if (current == null || (typeof current === 'object' && seen.has(current))) continue
+        if (typeof current === 'string') {
+          let pathname = current
+          try {
+            pathname = new URL(current, 'https://playback.invalid').pathname
+          } catch {
+            pathname = current
+          }
+          const segments = pathname.split(/[/?#]/).filter(Boolean)
+          if (segments.includes('360p')) return '360p'
+          if (segments.includes('720p')) return '720p'
+          continue
+        }
+        if (typeof current !== 'object') continue
+        seen.add(current)
+        const record = current as Record<string, unknown>
+        for (const key of ['id', 'uri', 'resolvedUri', 'playlist', 'URI', 'attributes', 'name', 'label', 'NAME']) {
+          if (Object.prototype.hasOwnProperty.call(record, key)) queue.push(record[key])
+        }
+      }
+      return undefined
+    }
+    const player = (window as unknown as {
+      __scalabilityPlayer?: {
+        qualityLevels?: () => { length: number; [index: number]: { enabled: boolean } }
+        tech?: (options: { IWillNotUseThisInPlugins: true }) => {
+          vhs?: { representations?: () => { enabled?: (value: boolean) => void }[] }
+        }
+      }
+    }).__scalabilityPlayer
+    const representations = player?.tech?.({ IWillNotUseThisInPlugins: true }).vhs?.representations?.() ?? []
+    const levels = player && typeof player.qualityLevels === 'function' ? player.qualityLevels() : undefined
+    const tokens = new Set<string>()
+    for (const representation of representations) {
+      const token = tokenFrom(representation)
+      if (token) tokens.add(token)
+    }
+    if (levels) {
+      for (let index = 0; index < levels.length; index += 1) {
+        const token = tokenFrom(levels[index])
+        if (token) tokens.add(token)
+      }
+    }
+    if (!selected) return { tokens: [...tokens], matched: 0 }
+    const enableGroup = <T>(items: T[], setEnabled: (item: T, enabled: boolean) => void): number => {
+      const decisions = items.map((item) => tokenFrom(item) === selected)
+      if (!decisions.some(Boolean)) return 0
+      items.forEach((item, index) => setEnabled(item, decisions[index] === true))
+      return decisions.filter(Boolean).length
+    }
+    const matched = enableGroup(representations, (representation, enabled) => {
+      if (typeof representation.enabled === 'function') representation.enabled(enabled)
+    }) + enableGroup(levels ? Array.from({ length: levels.length }, (_, index) => levels[index]).filter((level) => level != null) : [], (level, enabled) => {
+      level.enabled = enabled
+    })
+    return { tokens: [...tokens], matched }
+  }, target)
 }

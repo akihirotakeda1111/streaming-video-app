@@ -15,8 +15,11 @@ import json
 import math
 import os
 import shutil
+import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,13 +37,14 @@ CHECKPOINTS = (
 )
 REQUIRED = {
     "account_id", "region", "environment", "api_url", "frontend_url",
-    "playback_base_url", "cluster", "worker_service", "parent_service",
+    "playback_base_url", "cluster", "api_service", "worker_service", "parent_service",
     "step_functions_arn", "api_image_digest", "worker_image_digest",
-    "distributed_mode", "parent_min_capacity",
+    "distributed_mode", "parent_min_capacity", "input_bucket", "worker_max_concurrency",
     "fixture_path", "fixture_duration_seconds", "worker_min_capacity",
     "worker_max_capacity", "backlog_per_worker_target", "processing_seconds",
     "scale_out_cooldown_seconds", "scale_in_cooldown_seconds", "runtime_budget_seconds",
 }
+BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 METRIC_PERIOD_SECONDS = 60
 DEFAULT_SCALE_OUT_EVALUATION_PERIODS = 3
 DEFAULT_SCALE_IN_EVALUATION_PERIODS = 15
@@ -98,9 +102,13 @@ def _validate(config: dict[str, Any], live: bool) -> None:
         raise ValueError("region is required")
     for name in ("api_url", "playback_base_url", "frontend_url"):
         _validate_endpoint(name, config[name])
-    for name in ("worker_min_capacity", "worker_max_capacity", "parent_min_capacity"):
+    for name in ("worker_min_capacity", "worker_max_capacity", "parent_min_capacity", "worker_max_concurrency"):
         if not isinstance(config[name], int) or isinstance(config[name], bool) or config[name] < 1:
             raise ValueError(f"{name} must be a positive integer")
+    if not isinstance(config["api_service"], str) or not config["api_service"].strip() or any(char.isspace() for char in config["api_service"]):
+        raise ValueError("api_service must identify the dedicated API service")
+    if not isinstance(config["input_bucket"], str) or BUCKET_NAME.fullmatch(config["input_bucket"]) is None:
+        raise ValueError("input_bucket must be the dedicated DNS-compatible input bucket name")
     if config["worker_min_capacity"] != 1 or config["worker_max_capacity"] < 2:
         raise ValueError("worker capacity must support minimum 1 and scale-out to at least 2")
     if config["distributed_mode"] is not True or config["parent_min_capacity"] != 1:
@@ -133,22 +141,31 @@ def fixture_record(path: Path, duration_seconds: float) -> dict[str, Any]:
 def _plan(config: dict[str, Any], scale_out_evaluation: float, scale_in_evaluation: float) -> dict[str, Any]:
     target = float(config["backlog_per_worker_target"])
     capacity = int(config["worker_min_capacity"])
+    concurrency = config["worker_max_concurrency"]
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+        raise ValueError("worker_max_concurrency must be a positive integer")
     processing = float(config["processing_seconds"])
     budget = float(config["runtime_budget_seconds"])
     scale_out_cooldown = float(config["scale_out_cooldown_seconds"])
     scale_in_cooldown = float(config["scale_in_cooldown_seconds"])
-    count = math.ceil(target * capacity) + 1
-    submission_backlog = count / capacity
-    if count < 2 or submission_backlog <= target:
-        raise ValueError("batch does not raise backlog per worker above the scaling target")
+    # ApproximateNumberOfMessagesVisible excludes messages the initial workers
+    # have already received. Each of those workers holds worker_max_concurrency
+    # messages, so the visible remainder must stay strictly above the target.
+    in_flight = capacity * concurrency
+    visible = math.floor(target * capacity) + 1
+    count = visible + in_flight
+    sustained = visible / capacity
+    if count < 2 or sustained <= target:
+        raise ValueError("batch does not keep visible backlog per worker above the scaling target")
     if processing < scale_out_evaluation:
         raise ValueError(
             "processing time is shorter than the scale-out evaluation window; "
             f"need at least {scale_out_evaluation:g}s so backlog stays observable"
         )
-    # Scale-out is sampled for the evaluation window before a second worker joins.
-    # The remaining jobs then drain on at least two workers. Scale-in waits out
-    # its own evaluation period and cooldown after that work finishes.
+    # The fixed batch is uploaded together, so the submission window is one
+    # object upload. Scale-out is then sampled before a second worker joins.
+    # The remaining jobs drain on at least two workers. Scale-in waits out its
+    # own evaluation period and cooldown after that work finishes.
     drain = scale_out_evaluation + processing * math.ceil(count / 2)
     required = drain + scale_out_cooldown + scale_in_evaluation + scale_in_cooldown + PLAYBACK_ALLOWANCE_SECONDS
     if required > budget:
@@ -157,8 +174,11 @@ def _plan(config: dict[str, Any], scale_out_evaluation: float, scale_in_evaluati
             f"need at least {required:g}s for processing, cooldown, evaluation, and playback"
         )
     rationale = (
-        f"ceil(target {target:g} * initial workers {capacity}) + 1 = {count}; "
-        f"submission backlog/worker {submission_backlog:g} exceeds {target:g}; "
+        f"floor(target {target:g} * initial workers {capacity}) + 1 + "
+        f"in-flight {in_flight} (workers {capacity} * concurrency {concurrency}) = {count}; "
+        f"after the initial workers receive {in_flight} messages, visible backlog/worker "
+        f"{sustained:g} exceeds {target:g}; "
+        f"the fixed batch is uploaded in parallel so the submission window is one object upload; "
         f"processing {processing:g}s covers scale-out evaluation {scale_out_evaluation:g}s; "
         f"required budget {required:g}s fits within {budget:g}s"
     )
@@ -167,7 +187,12 @@ def _plan(config: dict[str, Any], scale_out_evaluation: float, scale_in_evaluati
         "requiredBudgetSeconds": _whole(required),
         "rationale": rationale,
         "target": target,
-        "submissionBacklogPerWorker": submission_backlog,
+        "submissionMode": "parallel",
+        "submissionWindow": "one concurrent upload of the predetermined batch",
+        "inFlightMessages": in_flight,
+        "sustainedVisibleBacklog": visible,
+        "sustainedBacklogPerWorker": _whole(sustained),
+        "workerMaxConcurrency": concurrency,
         "scaleOutEvaluationSeconds": _whole(scale_out_evaluation),
         "scaleInEvaluationSeconds": _whole(scale_in_evaluation),
         "scaleOutCooldownSeconds": scale_out_cooldown,
@@ -195,6 +220,9 @@ def _check() -> int:
             "status": "passed",
             "mode": "offline",
             "batchSize": plan["batchSize"],
+            "inFlightMessages": plan["inFlightMessages"],
+            "submissionMode": plan["submissionMode"],
+            "sustainedBacklogPerWorker": plan["sustainedBacklogPerWorker"],
             "requiredBudgetSeconds": plan["requiredBudgetSeconds"],
             "rationale": plan["rationale"],
         }, sort_keys=True))
@@ -292,33 +320,98 @@ def _definition_has_digest(definition: dict[str, Any], digest: str) -> bool:
     return any(_image_digest(container.get("image")) == digest for container in containers if isinstance(container, dict))
 
 
-def _named_service_has_digest(cluster: str, region: str, service: str, digest: str) -> bool:
+def _describe_named_service(cluster: str, region: str, service: str, label: str) -> dict[str, Any]:
     described = _aws(["ecs", "describe-services", "--cluster", cluster, "--services", service, "--region", region])
-    services = described.get("services") if isinstance(described, dict) else None
+    failures = described.get("failures") if isinstance(described, dict) else None
+    if not isinstance(described, dict) or (isinstance(failures, list) and failures):
+        raise ValueError(f"{label} is not available in the dedicated cluster")
+    services = described.get("services")
     current = services[0] if isinstance(services, list) and services and isinstance(services[0], dict) else None
-    if not isinstance(current, dict) or not isinstance(current.get("taskDefinition"), str):
-        return False
-    return _definition_has_digest(_task_definition(str(current["taskDefinition"]), region), digest)
+    if not isinstance(current, dict) or current.get("status") != "ACTIVE":
+        raise ValueError(f"{label} is not active")
+    return current
 
 
-def _cluster_has_digest(cluster: str, region: str, digest: str) -> bool:
-    arns = [arn for arn in _collect(
-        ["ecs", "list-services", "--cluster", cluster, "--region", region],
-        "serviceArns",
-    ) if isinstance(arn, str)]
-    for offset in range(0, len(arns), 10):
-        described = _aws([
-            "ecs", "describe-services", "--cluster", cluster, "--services", *arns[offset:offset + 10], "--region", region,
-        ])
-        services = described.get("services") if isinstance(described, dict) else None
-        if not isinstance(services, list):
-            continue
-        for service in services:
-            if not isinstance(service, dict) or not isinstance(service.get("taskDefinition"), str):
-                continue
-            if _definition_has_digest(_task_definition(str(service["taskDefinition"]), region), digest):
-                return True
-    return False
+def _require_worker_contract(definition: dict[str, Any], config: dict[str, Any], label: str) -> None:
+    if not _definition_has_digest(definition, str(config["worker_image_digest"])):
+        raise ValueError(f"{label} image does not match the worker image digest")
+    if _container_env(definition, "WORKER_MAX_CONCURRENCY") != str(config["worker_max_concurrency"]):
+        raise ValueError(f"{label} concurrency does not match the handoff")
+    if _container_env(definition, "VIDEO_INPUT_BUCKET") != config["input_bucket"]:
+        raise ValueError(f"{label} input bucket does not match the dedicated input bucket")
+
+
+def _require_api_contract(service: dict[str, Any], definition: dict[str, Any], config: dict[str, Any]) -> None:
+    running = service.get("runningCount")
+    desired = service.get("desiredCount")
+    if isinstance(running, bool) or not isinstance(running, int) or running < 1:
+        raise ValueError("API service has no running task")
+    if isinstance(desired, bool) or not isinstance(desired, int) or desired < 1:
+        raise ValueError("API service has no desired task")
+    if not _definition_has_digest(definition, str(config["api_image_digest"])):
+        raise ValueError("API service image does not match the API image digest")
+    if _container_env(definition, "VIDEO_INPUT_BUCKET") != config["input_bucket"]:
+        raise ValueError("API service input bucket does not match the dedicated input bucket")
+
+
+class _RejectRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ARG002
+        return None
+
+
+def _api_health_url(api_base: str) -> str:
+    parsed = urlsplit(api_base.strip())
+    pathname = parsed.path.rstrip("/")
+    prefix = pathname if pathname.endswith("/api/v1") else f"{pathname}/api/v1"
+    full_path = f"{prefix}/health"
+    while "//" in full_path:
+        full_path = full_path.replace("//", "/")
+    if not full_path.startswith("/"):
+        full_path = "/" + full_path
+    return f"{parsed.scheme}://{parsed.netloc}{full_path}"
+
+
+def _reachable(url: str, name: str) -> tuple[int, bytes]:
+    request = urllib.request.Request(url, method="GET", headers={"User-Agent": "scalability-e2e-preflight"})
+    opener = urllib.request.build_opener(_RejectRedirect)
+    try:
+        with opener.open(request, timeout=20) as response:
+            status = getattr(response, "status", 200)
+            return int(status), response.read(1024)
+    except urllib.error.HTTPError as error:
+        return error.code, error.read(1024)
+    except urllib.error.URLError as error:
+        raise ValueError(f"{name} is not reachable") from error
+
+
+def _require_reachability(config: dict[str, Any]) -> None:
+    status, body = _reachable(_api_health_url(str(config["api_url"])), "API")
+    if status != 200:
+        raise ValueError("API health endpoint is not reachable")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("API health endpoint is not reachable") from error
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        raise ValueError("API health endpoint is not reachable")
+    frontend_status, _body = _reachable(str(config["frontend_url"]).strip(), "frontend")
+    if frontend_status < 200 or frontend_status >= 400:
+        raise ValueError("frontend is not reachable")
+
+
+def _require_input_bucket(name: str, region: str) -> None:
+    location = _aws(["s3api", "get-bucket-location", "--bucket", name, "--region", region])
+    if not isinstance(location, dict) or "LocationConstraint" not in location:
+        raise ValueError("dedicated input bucket is not available")
+    constraint = location.get("LocationConstraint")
+    if constraint in (None, ""):
+        actual_region = "us-east-1"
+    elif isinstance(constraint, str):
+        actual_region = constraint
+    else:
+        raise ValueError("dedicated input bucket is not available")
+    if actual_region != region:
+        raise ValueError("dedicated input bucket is not in the handoff region")
 
 
 def _alarm_window(alarm: dict[str, Any]) -> float:
@@ -355,15 +448,24 @@ def _preflight(config: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(task_definition_arn, str):
         raise ValueError("parent service has no task definition")
     definition = _task_definition(task_definition_arn, region)
-    if not _definition_has_digest(definition, str(config["worker_image_digest"])):
-        raise ValueError("parent service image does not match the worker image digest")
-    if worker_service != service and not _named_service_has_digest(cluster, region, worker_service, str(config["worker_image_digest"])):
-        raise ValueError("worker service image does not match the worker image digest")
+    _require_worker_contract(definition, config, "parent service")
     state_machine = _container_env(definition, "ORCHESTRATION_STATE_MACHINE_ARN")
     if state_machine != config["step_functions_arn"]:
         raise ValueError("parent task definition is not configured for the dedicated state machine")
-    if not _cluster_has_digest(cluster, region, str(config["api_image_digest"])):
-        raise ValueError("no service in the cluster is running the API image digest")
+    if worker_service != service:
+        worker_current = _describe_named_service(cluster, region, worker_service, "worker service")
+        worker_definition_arn = worker_current.get("taskDefinition")
+        if not isinstance(worker_definition_arn, str):
+            raise ValueError("worker service has no task definition")
+        _require_worker_contract(_task_definition(worker_definition_arn, region), config, "worker service")
+    api_name = _tail_name(str(config["api_service"]), ":service/")
+    api_current = _describe_named_service(cluster, region, api_name, "API service")
+    api_definition_arn = api_current.get("taskDefinition")
+    if not isinstance(api_definition_arn, str):
+        raise ValueError("API service has no task definition")
+    _require_api_contract(api_current, _task_definition(api_definition_arn, region), config)
+    _require_reachability(config)
+    _require_input_bucket(str(config["input_bucket"]), region)
 
     machine = _aws(["stepfunctions", "describe-state-machine", "--state-machine-arn", str(config["step_functions_arn"]), "--region", region])
     if not isinstance(machine, dict) or machine.get("status") != "ACTIVE":
@@ -439,6 +541,15 @@ def _preflight(config: dict[str, Any]) -> dict[str, Any]:
                 "running": current.get("runningCount"),
                 "desired": current.get("desiredCount"),
             },
+            "apiService": {
+                "name": api_name,
+                "status": api_current.get("status"),
+                "running": api_current.get("runningCount"),
+                "desired": api_current.get("desiredCount"),
+            },
+            "reachability": {"api": "ok", "frontend": "ok"},
+            "inputBucket": {"name": config["input_bucket"], "region": region},
+            "workerMaxConcurrency": config["worker_max_concurrency"],
             "images": {"api": config["api_image_digest"], "worker": config["worker_image_digest"]},
             "stateMachine": {"status": machine.get("status"), "distributedRenditions": True},
             "scalableTarget": {
@@ -510,6 +621,7 @@ def _playwright(config: dict[str, Any], evidence: Path, plan: dict[str, Any], fi
         "SCALABILITY_PARENT_SERVICE": _tail_name(str(config["parent_service"]), ":service/"),
         "SCALABILITY_STATE_MACHINE_ARN": str(config["step_functions_arn"]),
         "SCALABILITY_MIN_CAPACITY": str(config["parent_min_capacity"]),
+        "SCALABILITY_INPUT_BUCKET": str(config["input_bucket"]),
         "PLAYBACK_BASE_URL": str(config["playback_base_url"]),
     })
     if "sizeBytes" in fixture:

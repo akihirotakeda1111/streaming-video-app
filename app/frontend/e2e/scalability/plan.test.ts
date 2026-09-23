@@ -32,6 +32,9 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
     parent_min_capacity: 1,
     fixture_path: '/var/lib/operator/secret-scalability-fixture.mp4',
     fixture_duration_seconds: 30,
+    api_service: 'api',
+    input_bucket: 'sv-scale-e2e-test-input',
+    worker_max_concurrency: 1,
     worker_min_capacity: 1,
     worker_max_capacity: 4,
     backlog_per_worker_target: 3,
@@ -65,13 +68,47 @@ describe('scalability offline plan', () => {
     expect(result.stdout).toContain('no AWS calls')
   })
 
-  it('uses ceil(target * capacity) + 1 and keeps the fixture path out of the result', () => {
-    const result = check(handoff({ backlog_per_worker_target: 1.1 }))
-    expect(result.status, result.stderr).toBe(0)
-    const report = JSON.parse(result.stdout) as { batchSize: number; rationale: string }
-    expect(report.batchSize).toBe(3)
-    expect(report.rationale).toContain('ceil(')
-    expect(`${result.stdout}\n${result.stderr}`).not.toContain('secret-scalability-fixture')
+  it('keeps visible backlog above the target after in-flight messages and omits the fixture path', () => {
+    const fractional = check(handoff({ backlog_per_worker_target: 1.1 }))
+    expect(fractional.status, fractional.stderr).toBe(0)
+    const fractionalReport = JSON.parse(fractional.stdout) as {
+      batchSize: number
+      inFlightMessages: number
+      sustainedBacklogPerWorker: number
+      submissionMode: string
+      rationale: string
+    }
+    expect(fractionalReport.batchSize).toBe(3)
+    expect(fractionalReport.inFlightMessages).toBe(1)
+    expect(fractionalReport.sustainedBacklogPerWorker).toBe(2)
+    expect(fractionalReport.submissionMode).toBe('parallel')
+    expect(fractionalReport.rationale).toContain('in-flight')
+    expect(fractionalReport.rationale).toContain('parallel')
+    expect(`${fractional.stdout}\n${fractional.stderr}`).not.toContain('secret-scalability-fixture')
+
+    const steady = check(handoff())
+    expect(steady.status, steady.stderr).toBe(0)
+    const steadyReport = JSON.parse(steady.stdout) as {
+      batchSize: number
+      inFlightMessages: number
+      sustainedBacklogPerWorker: number
+    }
+    expect(steadyReport).toMatchObject({ batchSize: 5, inFlightMessages: 1, sustainedBacklogPerWorker: 4 })
+
+    const wider = check(handoff({ worker_max_concurrency: 2 }))
+    expect(wider.status, wider.stderr).toBe(0)
+    const widerReport = JSON.parse(wider.stdout) as { batchSize: number; inFlightMessages: number; sustainedBacklogPerWorker: number }
+    expect(widerReport).toMatchObject({ batchSize: 6, inFlightMessages: 2, sustainedBacklogPerWorker: 4 })
+  })
+
+  it('requires the API service, dedicated input bucket, and worker concurrency', () => {
+    const { api_service: _api, ...withoutApi } = handoff()
+    expect(check(withoutApi).stderr).toContain('api_service')
+    const { input_bucket: _bucket, ...withoutBucket } = handoff()
+    expect(check(withoutBucket).stderr).toContain('input_bucket')
+    const { worker_max_concurrency: _concurrency, ...withoutConcurrency } = handoff()
+    expect(check(withoutConcurrency).stderr).toContain('worker_max_concurrency')
+    expect(check(handoff({ input_bucket: 'Wrong_Bucket' })).status).toBe(2)
   })
 
   it('rejects a budget that cannot cover evaluation, cooldown, and playback', () => {
@@ -97,6 +134,25 @@ describe('scalability offline plan', () => {
     expect(check(handoff({ frontend_url: 'http://localhost:5173' })).status).toBe(0)
     expect(check(handoff({ frontend_url: 'http://[::1]:5173' })).status).toBe(0)
     expect(check(handoff({ frontend_url: 'https://app.example.com' })).status).toBe(0)
+  })
+})
+
+describe('API health URL', () => {
+  it('keeps a configured /api/v1 prefix', () => {
+    const result = spawnSync('python', ['-c', `
+import sys
+sys.path.insert(0, sys.argv[1])
+import run_scalability_e2e as runner
+print(runner._api_health_url("https://api.example.com/api/v1"))
+print(runner._api_health_url("https://api.example.com"))
+print(runner._api_health_url("https://api.example.com/api/v1/"))
+`, scriptsDir], { encoding: 'utf8' })
+    expect(result.status, result.stderr ?? '').toBe(0)
+    expect(result.stdout.trim().split(/\r?\n/)).toEqual([
+      'https://api.example.com/api/v1/health',
+      'https://api.example.com/api/v1/health',
+      'https://api.example.com/api/v1/health',
+    ])
   })
 })
 

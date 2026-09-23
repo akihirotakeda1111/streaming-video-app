@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { apiUrl, classifyPlaybackPath, isPlaybackMediaRequest, summarizePlayback } from './urls.js'
+import { apiUrl, classifyPlaybackPath, isPlaybackMediaRequest, presignedUploadBucket, renditionToken, summarizePlayback } from './urls.js'
 
 describe('scalability API URLs', () => {
   it('keeps a configured /api/v1 prefix', () => {
@@ -10,6 +10,25 @@ describe('scalability API URLs', () => {
   it('adds /api/v1 when the base has no API prefix', () => {
     expect(apiUrl('https://api.example.com', 'videos')).toBe('https://api.example.com/api/v1/videos')
     expect(apiUrl('https://api.example.com/', 'videos/abc')).toBe('https://api.example.com/api/v1/videos/abc')
+  })
+})
+
+describe('presigned upload buckets', () => {
+  it('reads virtual-hosted and path-style buckets and rejects other hosts', () => {
+    expect(presignedUploadBucket('https://sv-scale-e2e-test.s3.us-east-1.amazonaws.com/videos/v/jobs/j/source.mp4?X-Amz-Signature=secret')).toBe('sv-scale-e2e-test')
+    expect(presignedUploadBucket('https://s3.us-east-1.amazonaws.com/sv-scale-e2e-test/videos/v/jobs/j/source.mp4?X-Amz-Signature=secret')).toBe('sv-scale-e2e-test')
+    expect(presignedUploadBucket('https://sv-scale-e2e-test.s3.amazonaws.com/key')).toBe('sv-scale-e2e-test')
+    expect(presignedUploadBucket('https://my.bucket.s3.dualstack.us-east-1.amazonaws.com/key')).toBe('my.bucket')
+    expect(presignedUploadBucket('https://evil.example.com/sv-scale-e2e-test/key')).toBeUndefined()
+  })
+})
+
+describe('rendition identity', () => {
+  it('uses playlist and representation paths instead of encoded height', () => {
+    expect(renditionToken({ id: 'https://cdn.example.com/videos/j/hls/360p/index.m3u8', height: 640 })).toBe('360p')
+    expect(renditionToken({ playlist: { uri: '720p/index.m3u8' }, height: 1280 })).toBe('720p')
+    expect(renditionToken({ height: 360, id: '0' })).toBeUndefined()
+    expect(renditionToken({ attributes: { NAME: '360p' }, height: 480 })).toBe('360p')
   })
 })
 
