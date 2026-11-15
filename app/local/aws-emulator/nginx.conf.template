@@ -19,7 +19,7 @@ server {
         if ($request_method = OPTIONS) {
             add_header Access-Control-Allow-Origin $cors_origin always;
             add_header Access-Control-Allow-Methods "GET, HEAD, PUT, OPTIONS" always;
-            add_header Access-Control-Allow-Headers "content-type" always;
+            add_header Access-Control-Allow-Headers "content-type, range" always;
             add_header Access-Control-Max-Age 3000 always;
             add_header Vary "Origin" always;
             return 204;
