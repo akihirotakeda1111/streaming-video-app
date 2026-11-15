@@ -8,9 +8,27 @@ The separate `compose.yaml` base remains suitable for AWS-backed E2E runs.
 ## Local configuration
 
 Use `.env.local` for the local emulator stack. Set the local bucket names,
-queue URL, and frontend origin there; leave AWS access keys empty because the
-emulator supplies local credentials. Do not use the emulator overlay for
-AWS-backed E2E runs.
+queue URL, and frontend origin there. Set both `OUTPUT_S3_ENDPOINT` and
+`PLAYBACK_BASE_URL` to `http://127.0.0.1:9298`; these point to the local
+loopback proxy. The complete example is in the [application README](../../README.md#start-the-complete-local-stack).
+Leave AWS access keys empty because the emulator supplies local credentials.
+Do not use the emulator overlay for AWS-backed E2E runs.
+
+The emulator keeps S3 objects and SQS messages in memory. Stopping it with
+`docker compose down` clears those resources; the `aws_emulator_data` volume
+stores emulator files such as credentials and certificates, not AWS resource
+state. Compose keeps the PostgreSQL volume unless `--volumes` is specified, so
+database rows can remain while their uploaded videos, HLS objects, and pending
+messages are gone. Startup initialization recreates the buckets, queue, and
+distribution configuration, but it cannot restore that media or message data.
+
+For a fully clean local reset, stop the stack and remove its volumes, then start
+it again. This also deletes all local PostgreSQL data:
+
+```sh
+docker compose --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml down --volumes
+docker compose --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml up --build -d
+```
 
 The two database URLs intentionally use different hosts:
 

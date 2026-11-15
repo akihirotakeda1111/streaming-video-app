@@ -331,6 +331,13 @@ Playlist内のsegment参照は `segment-00000.ts` のような相対名です。
 ### Prerequisites
 
 - Docker EngineまたはDocker DesktopとDocker Compose
+
+ローカルAWS Emulatorを使う場合、AWS account、Terraform resources、AWS credentialsは不要です。[Start the complete local stack](#start-the-complete-local-stack)を参照してください。
+
+### AWS-backed local development prerequisites
+
+以下は通常の `compose.yaml` から実AWSへ接続する場合に限った前提条件です。ローカルAWS Emulatorではなく実AWSを使うときに確認してください。
+
 - 実AWS account内に、`infra/terraform/` に対応するS3、SQS/DLQ、CloudFront/OAC、IAM、アラームが存在すること
 - Input bucketとOutput bucketが別名であること
 - Input S3 CORSのorigin、Output S3 CORSのorigin、`FRONTEND_ORIGIN` が実際のFrontend originと一致すること
@@ -340,7 +347,7 @@ Playlist内のsegment参照は `segment-00000.ts` のような相対名です。
 
 `infra/terraform-e2e/` と `compose.e2e.yaml`、`setup_reliability_env.sh --start-services` はReliability E2E専用です。これらの準備・起動手順は後述の [Reliability E2E（Phase 2）](#reliability-e2ephase-2) を参照してください。
 
-### Configuration
+### AWS-backed local configuration
 
 `app/.env.example` を `app/.env` にコピーし、placeholderと認証情報を通常開発用の値へ置き換えます。既存の `.env` がある場合は上書きせず、内容を確認・更新してください。
 
@@ -393,7 +400,7 @@ E2Eセットアップを `source` したシェルでは、AWS接続先・Worker�
 
 heartbeat間隔の2倍がlease期間・visibility延長・sourceキューのvisibility以下になるよう設定します。通常Composeの既定値は順に30 / 120 / 300 / 900秒、5試行です。Reliability E2Eは専用Terraformの5 / 120 / 60 / 10秒、3試行を使い、統合セットアップで反映します。
 
-### Playback CloudFront URL Settings
+### AWS-backed E2E Playback CloudFront URL Settings
 
 GitHub ActionsではRepository variablesの `PLAYBACK_BASE_URL` に、E2EのOutput bucketを配信するCloudFront HTTPS originを設定してください。値はTerraformの `playback_base_url` 出力で確認できます。`merge-tests.yml`、`agent-execute.yml`、`agent-review.yml` はこの値を起動処理とE2Eへ渡します。CIの `start-e2e-compose.sh` はTerraformを参照せず、未設定・不正値ならDocker操作前に停止します。E2Eは返されたmanifestのoriginがこの設定と一致することを検証します。
 
