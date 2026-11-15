@@ -208,6 +208,17 @@ services:
           distribution_id="$$(aws cloudfront create-distribution \
             --distribution-config file:///tmp/output-distribution.json \
             --query Distribution.Id --output text)"
+        else
+          expected_origin_domain="$${VIDEO_OUTPUT_BUCKET}.s3.$${AWS_REGION}.amazonaws.com"
+          existing_origin_domain="$$(aws cloudfront get-distribution \
+            --id "$${distribution_id}" \
+            --query "Distribution.DistributionConfig.Origins.Items[?Id=='video-output-s3'].DomainName | [0]" \
+            --output text)"
+          if [ "$${existing_origin_domain}" != "$${expected_origin_domain}" ]; then
+            echo "Existing local CloudFront distribution $${distribution_id} uses output origin '$${existing_origin_domain}', but the configured origin is '$${expected_origin_domain}'." >&2
+            echo "Stop and restart the emulator to recreate its resources. See the local Compose runbook before resetting PostgreSQL data." >&2
+            exit 1
+          fi
         fi
 
         distribution_status=""
