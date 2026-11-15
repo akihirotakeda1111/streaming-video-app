@@ -405,13 +405,39 @@ Reliability E2Eの統合セットアップは `--playback-url` → 環境変数 
 
 ### Start the complete local stack
 
-repository rootから `app/` へ移動し、通常用の `compose.yaml`、`.env`、プロジェクト名 `app`（このディレクトリの既定名）を明示して起動します。
+起動前に `.env.local` を作成します。repository rootで、未作成の場合に限り `.env.example` をコピーしてください。
+
+```powershell
+Copy-Item app/.env.example app/.env.local
+```
+
+macOS / Linuxの場合:
+
+```sh
+cp app/.env.example app/.env.local
+```
+
+`app/.env.local` を開き、AWS Emulator用の値に設定します。`.env.example` のAWS接続値を次の値に置き換えてください。API / WorkerのAWS access key、secret key、session tokenは空欄のままにします。Emulatorがローカル認証情報を用意します。
+
+```dotenv
+AWS_REGION=us-east-1
+VIDEO_ENCODING_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/000000000000/streaming-video-encoding
+VIDEO_INPUT_BUCKET=streaming-video-input-dev
+VIDEO_OUTPUT_BUCKET=streaming-video-output-dev
+OUTPUT_S3_ENDPOINT=http://127.0.0.1:9298
+PLAYBACK_BASE_URL=http://127.0.0.1:9298
+FRONTEND_ORIGIN=http://localhost:5173
+```
+
+`DATABASE_URL` と `COMPOSE_DATABASE_URL` はテンプレートの値を使えます。
+
+repository rootから `app/` へ移動し、通常用の `compose.yaml` にローカルAWS Emulator用の `compose.local-emulator.yaml` を重ねて起動します。CI/E2Eはこのoverlayを使わず、`compose.yaml`から実AWSへ接続します。
 
 ```sh
 cd app
-docker compose -p app --env-file .env -f compose.yaml config --quiet
-docker compose -p app --env-file .env -f compose.yaml up --build -d
-docker compose -p app --env-file .env -f compose.yaml ps -a
+docker compose -p app --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml config --quiet
+docker compose -p app --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml up --build -d
+docker compose -p app --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml ps -a
 ```
 
 `postgres`、`api`、`worker`、`frontend` が起動し、`migrate` が終了コード0で完了していることを確認します。通常用PostgreSQLのコンテナ名は `streaming-video-postgres`、データvolume名は `streaming-video-postgres-data` です。
@@ -428,8 +454,8 @@ Reliability E2Eの既定プロジェクト名は `streaming-video-e2e` です。
 ログ確認と停止:
 
 ```sh
-docker compose -p app --env-file .env -f compose.yaml logs -f api worker frontend
-docker compose -p app --env-file .env -f compose.yaml down
+docker compose -p app --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml logs -f api worker frontend
+docker compose -p app --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml down
 ```
 
 ローカルPostgreSQL dataを含むvolume削除は破壊的です。必要な場合だけ、[local Compose runbook](./docs/runbooks/local-compose.md) の注意事項を確認してください。

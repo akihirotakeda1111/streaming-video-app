@@ -41,7 +41,7 @@ Browser
 
 API process内で動画を同期変換せず、upload、job管理、queue consumption、encoding、playbackを別の責務として実装しています。
 
-ローカルComposeではFrontend、Go API、Rust Worker、PostgreSQLを起動し、S3、SQS/DLQ、CloudFrontは実AWSを利用します。クラウド用TerraformではAPI・Worker・encoderをECS/Fargate、PostgreSQLをprivate RDSに配置します。Frontendのホスティングは別途用意します。
+ローカルComposeではFrontend、Go API、Rust Worker、PostgreSQLとAWS Emulatorを起動し、S3、SQS、CloudFront相当のHLS配信をローカルで扱います。CI/E2EではComposeのローカルEmulator overlayを使わず、専用の実AWSリソースを利用します。クラウド用TerraformではAPI・Worker・encoderをECS/Fargate、PostgreSQLをprivate RDSに配置します。Frontendのホスティングは別途用意します。
 
 ### Components
 

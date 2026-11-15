@@ -1,0 +1,249 @@
+# Local-only overlay for AWS Emulator, its S3 CORS/CloudFront proxy, and seed resources.
+# Production-style and CI/E2E Compose runs use compose.yaml without this overlay.
+services:
+  api:
+    user: "1000:0"
+    network_mode: "service:aws-emulator"
+    depends_on:
+      aws-emulator:
+        condition: service_healthy
+      aws-emulator-init:
+        condition: service_completed_successfully
+        restart: true
+      s3-cors-proxy:
+        condition: service_healthy
+        restart: true
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ENDPOINT_URL: https://127.0.0.1:9297
+      AWS_ENDPOINT_URL_S3: http://127.0.0.1:9298
+      AWS_SHARED_CREDENTIALS_FILE: /home/emulator/.aws/emulator/9297/emulator_credentials
+      AWS_CONFIG_FILE: /home/emulator/.aws/emulator/9297/config
+      AWS_CA_BUNDLE: /home/emulator/.aws/emulator/9297/ca.pem
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_DISABLE_HOST_PREFIX_INJECTION: "true"
+      AWS_ACCESS_KEY_ID: !reset null
+      AWS_SECRET_ACCESS_KEY: !reset null
+      AWS_SESSION_TOKEN: !reset null
+    ports: !reset []
+    volumes:
+      - aws_emulator_data:/home/emulator/.aws/emulator:ro
+
+  worker:
+    user: "1000:0"
+    network_mode: "service:aws-emulator"
+    depends_on:
+      aws-emulator:
+        condition: service_healthy
+      aws-emulator-init:
+        condition: service_completed_successfully
+        restart: true
+      s3-cors-proxy:
+        condition: service_healthy
+        restart: true
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ENDPOINT_URL: https://127.0.0.1:9297
+      AWS_ENDPOINT_URL_S3: http://127.0.0.1:9298
+      AWS_SHARED_CREDENTIALS_FILE: /home/emulator/.aws/emulator/9297/emulator_credentials
+      AWS_CONFIG_FILE: /home/emulator/.aws/emulator/9297/config
+      SSL_CERT_FILE: /home/emulator/.aws/emulator/9297/ca.pem
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_DISABLE_HOST_PREFIX_INJECTION: "true"
+      AWS_ACCESS_KEY_ID: !reset null
+      AWS_SECRET_ACCESS_KEY: !reset null
+      AWS_SESSION_TOKEN: !reset null
+    volumes:
+      - aws_emulator_data:/home/emulator/.aws/emulator:ro
+    tmpfs:
+      - /tmp/video-worker:uid=1000,gid=0,mode=0700
+
+  aws-emulator:
+    build:
+      context: ./local/aws-emulator
+    ports:
+      - "127.0.0.1:9297:9297"
+      - "127.0.0.1:9298:9298"
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+    volumes:
+      - aws_emulator_data:/home/emulator/.aws/emulator
+    mem_limit: 2g
+    memswap_limit: 2g
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          curl --fail --silent
+          --cacert /home/emulator/.aws/emulator/9297/ca.pem
+          https://127.0.0.1:9297/__admin/health
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    environment:
+      HOME: /home/emulator
+      EMULATOR_TELEMETRY: "off"
+    working_dir: /home/emulator
+
+  s3-cors-proxy:
+    image: nginx:alpine
+    network_mode: "service:aws-emulator"
+    depends_on:
+      aws-emulator:
+        condition: service_healthy
+        restart: true
+      aws-emulator-init:
+        condition: service_completed_successfully
+        restart: true
+    volumes:
+      - cloudfront_config:/etc/nginx/conf.d:ro
+      - aws_emulator_data:/home/emulator/.aws/emulator:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q --spider http://127.0.0.1:9298/__proxy-health
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  aws-emulator-init:
+    image: amazon/aws-cli:latest
+    network_mode: "service:aws-emulator"
+    depends_on:
+      aws-emulator:
+        condition: service_healthy
+        restart: true
+    volumes:
+      - aws_emulator_data:/home/emulator/.aws/emulator:ro
+      - cloudfront_config:/cloudfront-config
+      - ./local/aws-emulator/nginx.conf.template:/tmp/nginx.conf.template:ro
+    environment:
+      AWS_ENDPOINT_URL: https://127.0.0.1:9297
+      AWS_SHARED_CREDENTIALS_FILE: /home/emulator/.aws/emulator/9297/emulator_credentials
+      AWS_CONFIG_FILE: /home/emulator/.aws/emulator/9297/config
+      AWS_CA_BUNDLE: /home/emulator/.aws/emulator/9297/ca.pem
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_DISABLE_HOST_PREFIX_INJECTION: "true"
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      VIDEO_INPUT_BUCKET: ${VIDEO_INPUT_BUCKET:-}
+      VIDEO_OUTPUT_BUCKET: ${VIDEO_OUTPUT_BUCKET:-}
+      VIDEO_ENCODING_QUEUE_URL: ${VIDEO_ENCODING_QUEUE_URL:-}
+      VIDEO_ENCODING_QUEUE_NAME: streaming-video-encoding
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+
+        for bucket in "$${VIDEO_INPUT_BUCKET}" "$${VIDEO_OUTPUT_BUCKET}"; do
+          if ! aws s3api head-bucket --bucket "$${bucket}" >/dev/null 2>&1; then
+            aws s3api create-bucket --bucket "$${bucket}"
+          fi
+        done
+
+        cat > /tmp/input-bucket-cors.json <<EOF
+        {"CORSRules":[{"AllowedOrigins":["$${FRONTEND_ORIGIN}"],"AllowedMethods":["PUT"],"AllowedHeaders":["content-type"],"MaxAgeSeconds":3000}]}
+        EOF
+        aws s3api put-bucket-cors \
+          --bucket "$${VIDEO_INPUT_BUCKET}" \
+          --cors-configuration file:///tmp/input-bucket-cors.json
+
+        if queue_url="$$(aws sqs get-queue-url \
+          --queue-name "$${VIDEO_ENCODING_QUEUE_NAME}" \
+          --query QueueUrl --output text 2>/dev/null)"; then
+          :
+        else
+          queue_url="$$(aws sqs create-queue \
+            --queue-name "$${VIDEO_ENCODING_QUEUE_NAME}" \
+            --query QueueUrl --output text)"
+        fi
+        if [ "$${queue_url}" != "$${VIDEO_ENCODING_QUEUE_URL}" ]; then
+          echo "Configured VIDEO_ENCODING_QUEUE_URL does not match Emulator queue URL: $${queue_url}" >&2
+          exit 1
+        fi
+
+        queue_arn="$$(aws sqs get-queue-attributes \
+          --queue-url "$${queue_url}" \
+          --attribute-names QueueArn \
+          --query Attributes.QueueArn --output text)"
+
+        cat > /tmp/sqs-attributes.json <<EOF
+        {"Policy":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"AllowS3SendMessage\",\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"s3.amazonaws.com\"},\"Action\":\"sqs:SendMessage\",\"Resource\":\"$${queue_arn}\",\"Condition\":{\"ArnLike\":{\"aws:SourceArn\":\"arn:aws:s3:::$${VIDEO_INPUT_BUCKET}\"}}}] }"}
+        EOF
+        aws sqs set-queue-attributes \
+          --queue-url "$${queue_url}" \
+          --attributes file:///tmp/sqs-attributes.json
+
+        cat > /tmp/s3-notification.json <<EOF
+        {"QueueConfigurations":[{"Id":"encoding-upload-created","QueueArn":"$${queue_arn}","Events":["s3:ObjectCreated:*"],"Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"videos/"},{"Name":"suffix","Value":"/source.mp4"}]}}}]}
+        EOF
+        aws s3api put-bucket-notification-configuration \
+          --bucket "$${VIDEO_INPUT_BUCKET}" \
+          --notification-configuration file:///tmp/s3-notification.json
+
+        oac_id="$$(aws cloudfront list-origin-access-controls \
+          --query "OriginAccessControlList.Items[?Name=='streaming-video-output-local'].Id | [0]" \
+          --output text)"
+        if [ "$${oac_id}" = "None" ]; then
+          cat > /tmp/output-oac.json <<EOF
+        {"Name":"streaming-video-output-local","Description":"Local CloudFront access to the private HLS output bucket.","SigningProtocol":"sigv4","SigningBehavior":"always","OriginAccessControlOriginType":"s3"}
+        EOF
+          oac_id="$$(aws cloudfront create-origin-access-control \
+            --origin-access-control-config file:///tmp/output-oac.json \
+            --query OriginAccessControl.Id --output text)"
+        fi
+
+        distribution_id="$$(aws cloudfront list-distributions \
+          --query "DistributionList.Items[?Comment=='streaming-video-app-local'].Id | [0]" \
+          --output text)"
+        if [ "$${distribution_id}" = "None" ]; then
+          cat > /tmp/output-distribution.json <<EOF
+        {"CallerReference":"streaming-video-app-local","Comment":"streaming-video-app-local","Enabled":true,"IsIPV6Enabled":false,"Origins":{"Quantity":1,"Items":[{"Id":"video-output-s3","DomainName":"$${VIDEO_OUTPUT_BUCKET}.s3.$${AWS_REGION}.amazonaws.com","S3OriginConfig":{"OriginAccessIdentity":""},"OriginAccessControlId":"$${oac_id}"}]},"DefaultCacheBehavior":{"TargetOriginId":"video-output-s3","ViewerProtocolPolicy":"allow-all","AllowedMethods":{"Quantity":2,"Items":["GET","HEAD"],"CachedMethods":{"Quantity":2,"Items":["GET","HEAD"]}},"CachePolicyId":"4135ea2d-6df8-44a3-9df3-4b5a84be39ad","TrustedSigners":{"Enabled":false,"Quantity":0}},"Restrictions":{"GeoRestriction":{"RestrictionType":"none","Quantity":0}},"ViewerCertificate":{"CloudFrontDefaultCertificate":true}}
+        EOF
+          distribution_id="$$(aws cloudfront create-distribution \
+            --distribution-config file:///tmp/output-distribution.json \
+            --query Distribution.Id --output text)"
+        fi
+
+        distribution_status=""
+        attempt=0
+        while [ "$${distribution_status}" != "Deployed" ] && [ "$${attempt}" -lt 60 ]; do
+          distribution_status="$$(aws cloudfront get-distribution \
+            --id "$${distribution_id}" \
+            --query Distribution.Status --output text)"
+          if [ "$${distribution_status}" != "Deployed" ]; then
+            sleep 1
+          fi
+          attempt=$$((attempt + 1))
+        done
+        if [ "$${distribution_status}" != "Deployed" ]; then
+          echo "Local CloudFront distribution did not reach Deployed state: $${distribution_id} ($${distribution_status})" >&2
+          exit 1
+        fi
+
+        distribution_arn="$$(aws cloudfront get-distribution \
+          --id "$${distribution_id}" \
+          --query Distribution.ARN --output text)"
+        cat > /tmp/output-bucket-policy.json <<EOF
+        {"Version":"2012-10-17","Statement":[{"Sid":"AllowLocalCloudFrontRead","Effect":"Allow","Principal":{"Service":"cloudfront.amazonaws.com"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::$${VIDEO_OUTPUT_BUCKET}/videos/*","Condition":{"StringEquals":{"AWS:SourceArn":"$${distribution_arn}"}}}]}
+        EOF
+        aws s3api put-bucket-policy \
+          --bucket "$${VIDEO_OUTPUT_BUCKET}" \
+          --policy file:///tmp/output-bucket-policy.json
+
+        sed \
+          -e "s|__FRONTEND_ORIGIN__|$${FRONTEND_ORIGIN}|g" \
+          -e "s|__CLOUDFRONT_DISTRIBUTION_ID__|$${distribution_id}|g" \
+          /tmp/nginx.conf.template > /cloudfront-config/default.conf
+    restart: "no"
+
+volumes:
+  aws_emulator_data:
+    name: streaming-video-aws-emulator-data
+  cloudfront_config:
+    name: streaming-video-cloudfront-config
