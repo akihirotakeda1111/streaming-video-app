@@ -331,6 +331,13 @@ Playlist内のsegment参照は `segment-00000.ts` のような相対名です。
 ### Prerequisites
 
 - Docker EngineまたはDocker DesktopとDocker Compose
+
+ローカルAWS Emulatorを使う場合、AWS account、Terraform resources、AWS credentialsは不要です。[Start the complete local stack](#start-the-complete-local-stack)を参照してください。
+
+### AWS-backed local development prerequisites
+
+以下は通常の `compose.yaml` から実AWSへ接続する場合に限った前提条件です。ローカルAWS Emulatorではなく実AWSを使うときに確認してください。
+
 - 実AWS account内に、`infra/terraform/` に対応するS3、SQS/DLQ、CloudFront/OAC、IAM、アラームが存在すること
 - Input bucketとOutput bucketが別名であること
 - Input S3 CORSのorigin、Output S3 CORSのorigin、`FRONTEND_ORIGIN` が実際のFrontend originと一致すること
@@ -340,7 +347,7 @@ Playlist内のsegment参照は `segment-00000.ts` のような相対名です。
 
 `infra/terraform-e2e/` と `compose.e2e.yaml`、`setup_reliability_env.sh --start-services` はReliability E2E専用です。これらの準備・起動手順は後述の [Reliability E2E（Phase 2）](#reliability-e2ephase-2) を参照してください。
 
-### Configuration
+### AWS-backed local configuration
 
 `app/.env.example` を `app/.env` にコピーし、placeholderと認証情報を通常開発用の値へ置き換えます。既存の `.env` がある場合は上書きせず、内容を確認・更新してください。
 
@@ -393,7 +400,7 @@ E2Eセットアップを `source` したシェルでは、AWS接続先・Worker�
 
 heartbeat間隔の2倍がlease期間・visibility延長・sourceキューのvisibility以下になるよう設定します。通常Composeの既定値は順に30 / 120 / 300 / 900秒、5試行です。Reliability E2Eは専用Terraformの5 / 120 / 60 / 10秒、3試行を使い、統合セットアップで反映します。
 
-### Playback CloudFront URL Settings
+### AWS-backed E2E Playback CloudFront URL Settings
 
 GitHub ActionsではRepository variablesの `PLAYBACK_BASE_URL` に、E2EのOutput bucketを配信するCloudFront HTTPS originを設定してください。値はTerraformの `playback_base_url` 出力で確認できます。`merge-tests.yml`、`agent-execute.yml`、`agent-review.yml` はこの値を起動処理とE2Eへ渡します。CIの `start-e2e-compose.sh` はTerraformを参照せず、未設定・不正値ならDocker操作前に停止します。E2Eは返されたmanifestのoriginがこの設定と一致することを検証します。
 
@@ -405,13 +412,39 @@ Reliability E2Eの統合セットアップは `--playback-url` → 環境変数 
 
 ### Start the complete local stack
 
-repository rootから `app/` へ移動し、通常用の `compose.yaml`、`.env`、プロジェクト名 `app`（このディレクトリの既定名）を明示して起動します。
+起動前に `.env.local` を作成します。repository rootで、未作成の場合に限り `.env.example` をコピーしてください。
+
+```powershell
+Copy-Item app/.env.example app/.env.local
+```
+
+macOS / Linuxの場合:
+
+```sh
+cp app/.env.example app/.env.local
+```
+
+`app/.env.local` を開き、AWS Emulator用の値に設定します。`.env.example` のAWS接続値を次の値に置き換えてください。API / WorkerのAWS access key、secret key、session tokenは空欄のままにします。Emulatorがローカル認証情報を用意します。
+
+```dotenv
+AWS_REGION=us-east-1
+VIDEO_ENCODING_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/000000000000/streaming-video-encoding
+VIDEO_INPUT_BUCKET=streaming-video-input-dev
+VIDEO_OUTPUT_BUCKET=streaming-video-output-dev
+OUTPUT_S3_ENDPOINT=http://127.0.0.1:9298
+PLAYBACK_BASE_URL=http://127.0.0.1:9298
+FRONTEND_ORIGIN=http://localhost:5173
+```
+
+`DATABASE_URL` と `COMPOSE_DATABASE_URL` はテンプレートの値を使えます。
+
+repository rootから `app/` へ移動し、通常用の `compose.yaml` にローカルAWS Emulator用の `compose.local-emulator.yaml` を重ねて起動します。CI/E2Eはこのoverlayを使わず、`compose.yaml`から実AWSへ接続します。
 
 ```sh
 cd app
-docker compose -p app --env-file .env -f compose.yaml config --quiet
-docker compose -p app --env-file .env -f compose.yaml up --build -d
-docker compose -p app --env-file .env -f compose.yaml ps -a
+docker compose -p app --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml config --quiet
+docker compose -p app --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml up --build -d
+docker compose -p app --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml ps -a
 ```
 
 `postgres`、`api`、`worker`、`frontend` が起動し、`migrate` が終了コード0で完了していることを確認します。通常用PostgreSQLのコンテナ名は `streaming-video-postgres`、データvolume名は `streaming-video-postgres-data` です。
@@ -428,8 +461,8 @@ Reliability E2Eの既定プロジェクト名は `streaming-video-e2e` です。
 ログ確認と停止:
 
 ```sh
-docker compose -p app --env-file .env -f compose.yaml logs -f api worker frontend
-docker compose -p app --env-file .env -f compose.yaml down
+docker compose -p app --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml logs -f api worker frontend
+docker compose -p app --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml down
 ```
 
 ローカルPostgreSQL dataを含むvolume削除は破壊的です。必要な場合だけ、[local Compose runbook](./docs/runbooks/local-compose.md) の注意事項を確認してください。

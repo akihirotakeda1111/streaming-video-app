@@ -1,35 +1,56 @@
 # Local Docker Compose runtime
 
-The Compose stack runs PostgreSQL, the database migrations, the Go API, the
-Rust worker, and the Vite frontend. S3 and SQS remain real AWS resources.
+The local Compose stack runs PostgreSQL, migrations, the Go API, the Rust
+worker, the Vite frontend, and AWS Emulator. S3, SQS, and CloudFront-style
+playback stay on the local machine through the emulator and its loopback proxy.
+The separate `compose.yaml` base remains suitable for AWS-backed E2E runs.
 
 ## Local configuration
 
-Copy `.env.example` to `.env`, or add the new variables to an existing `.env`,
-then replace the AWS resource placeholders and credentials. Keep the API and
-worker credentials separate so each process can use its least-privilege IAM
-identity.
+Use `.env.local` for the local emulator stack. Set the local bucket names,
+queue URL, and frontend origin there. Set both `OUTPUT_S3_ENDPOINT` and
+`PLAYBACK_BASE_URL` to `http://127.0.0.1:9298`; these point to the local
+loopback proxy. The complete example is in the [application README](../../README.md#start-the-complete-local-stack).
+Leave AWS access keys empty because the emulator supplies local credentials.
+Do not use the emulator overlay for AWS-backed E2E runs.
+
+The emulator keeps S3 objects and SQS messages in memory. Stopping it with
+`docker compose down` clears those resources; the `aws_emulator_data` volume
+stores emulator files such as credentials and certificates, not AWS resource
+state. Compose keeps the PostgreSQL volume unless `--volumes` is specified, so
+database rows can remain while their uploaded videos, HLS objects, and pending
+messages are gone. Startup initialization recreates the buckets, queue, and
+distribution configuration, but it cannot restore that media or message data.
+
+For a fully clean local reset, stop the stack and remove its volumes, then start
+it again. This also deletes all local PostgreSQL data:
+
+```sh
+docker compose --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml down --volumes
+docker compose --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml up --build -d
+```
 
 The two database URLs intentionally use different hosts:
 
 - `DATABASE_URL` uses `localhost` for processes running on the host.
 - `COMPOSE_DATABASE_URL` uses `postgres` for containers on the Compose network.
 
-Start the complete stack from the `app` directory:
+Start the complete local stack from the `app` directory:
 
 ```sh
-docker compose up --build -d
-docker compose ps
+docker compose --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml up --build -d
+docker compose --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml ps
 ```
 
 The frontend is available at `http://localhost:5173` and the API health endpoint
 at `http://localhost:8080/api/v1/health` by default.
 
-View logs or stop the stack with:
+Use the same `--env-file` and both `-f` arguments when checking logs or stopping
+the stack:
 
 ```sh
-docker compose logs -f api worker frontend
-docker compose down
+docker compose --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml logs -f api worker frontend
+docker compose --env-file .env.local -f compose.yaml -f compose.local-emulator.yaml down
 ```
 
 The migration container records applied versions in PostgreSQL. If an older,
@@ -37,10 +58,11 @@ disposable local volume already contains tables that were created manually,
 remove that volume before the first migration-managed startup. Running
 `docker compose down --volumes` deletes all local PostgreSQL data.
 
-## GitHub Actions configuration
+## AWS-backed E2E configuration
 
-The E2E workflows pass repository configuration directly to Compose. They do
-not create or commit an environment file.
+CI and Reliability E2E use `compose.yaml` without the local emulator overlay.
+They pass repository configuration directly to Compose and do not create or
+commit an environment file.
 
 Repository variables:
 
