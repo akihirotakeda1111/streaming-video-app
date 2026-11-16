@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test'
+import { test, expect, type Request } from '@playwright/test'
 import { e2eConfig } from './config.js'
 import { withMp4Fixture } from './fixtures.js'
 
@@ -35,20 +35,33 @@ function requiredLocalUrl(name: string): URL {
   return url
 }
 
+async function uploadRequestEvidence(request: Request): Promise<{
+  contentType: string | undefined
+  bodyBytes: number | undefined
+}> {
+  const buffer = request.postDataBuffer()
+  const headers = await request.allHeaders()
+  const contentLength = headers['content-length']
+  const headerBytes = contentLength && /^\d+$/.test(contentLength)
+    ? Number(contentLength)
+    : undefined
+
+  return {
+    contentType: headers['content-type'],
+    bodyBytes: buffer && buffer.byteLength > 0 ? buffer.byteLength : headerBytes,
+  }
+}
+
 test.describe('@emulator-pipeline', () => {
   test('uploads, transcodes, and plays a video through AWS Emulator', async ({ page, request }) => {
     const s3Proxy = requiredLocalUrl('EMULATOR_S3_PROXY_URL')
     const playbackBase = requiredLocalUrl('PLAYBACK_BASE_URL')
     const apiBase = e2eConfig.apiUrl.replace(/\/$/, '')
-    const putRequests: string[] = []
-    const putContentTypes: string[] = []
-    const putBodyBytes: number[] = []
+    const putRequests: Request[] = []
     const putStatuses: number[] = []
     page.on('request', (browserRequest) => {
       if (browserRequest.method() === 'PUT') {
-        putRequests.push(browserRequest.url())
-        putContentTypes.push(browserRequest.headers()['content-type'] ?? '')
-        putBodyBytes.push(browserRequest.postDataBuffer()?.byteLength ?? 0)
+        putRequests.push(browserRequest)
       }
     })
     page.on('response', (response) => {
@@ -71,17 +84,21 @@ test.describe('@emulator-pipeline', () => {
         timeout: e2eConfig.timeouts.upload,
         message: 'browser did not issue the presigned S3 upload',
       }).toBe(1)
-      const uploadUrl = new URL(putRequests[0]!)
+      const uploadRequest = putRequests[0]
+      if (!uploadRequest) throw new Error('presigned S3 upload request was not captured')
+      const uploadUrl = new URL(uploadRequest.url())
       expect(uploadUrl.origin).toBe(s3Proxy.origin)
       expect(uploadUrl.pathname).toContain(`/videos/${videoId}/jobs/${jobId}/source.mp4`)
-      expect(putContentTypes).toEqual(['video/mp4'])
-      expect(putBodyBytes).toEqual([fixture.sizeBytes])
       await expect.poll(() => putStatuses.length, {
         timeout: e2eConfig.timeouts.upload,
         message: 'presigned S3 upload did not complete',
       }).toBe(1)
       expect(putStatuses[0]).toBeGreaterThanOrEqual(200)
       expect(putStatuses[0]).toBeLessThan(300)
+
+      const upload = await uploadRequestEvidence(uploadRequest)
+      expect(upload.contentType).toBe('video/mp4')
+      expect(upload.bodyBytes, 'could not determine PUT body size').toBe(fixture.sizeBytes)
 
       await expect.poll(async () => {
         const response = await request.get(`${apiBase}/api/v1/videos/${videoId}`)
