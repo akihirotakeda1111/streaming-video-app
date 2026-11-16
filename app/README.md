@@ -522,7 +522,7 @@ npm --prefix app/frontend run test:e2e:type-check
 
 ### Emulator pipeline E2E (CI)
 
-`merge-tests.yml` はAWS Emulatorを使い、ブラウザuploadからS3 notification、SQS、Workerの変換、HLS再生までを検証します。エミュレータのresourceはメモリ上に作られるため、起動ごとに初期化し、終了時にCompose volumeまで削除します。
+`merge-tests.yml` はAWS Emulatorを使い、ブラウザuploadからS3 notification、SQS、Workerの変換、HLS再生までを検証します。エミュレータのresourceはメモリ上に作られるため、起動ごとに初期化します。終了時はCompose serviceを停止・削除し、開発用PostgreSQL volumeは保持します。
 
 同じpipelineをローカルで実行する場合はrepository rootから起動し、別のterminalでPlaywrightを実行します。host側にDocker、Node.js dependencies、FFmpegが必要です。
 
@@ -532,13 +532,13 @@ bash app/scripts/start-e2e-emulator.sh
 E2E_ENVIRONMENT=disposable \
 E2E_FRONTEND_URL=http://localhost:5173 \
 E2E_API_URL=http://127.0.0.1:8000 \
-E2E_PROJECT=chromium \
+E2E_PROJECT=emulator \
 PLAYBACK_BASE_URL=http://127.0.0.1:9298 \
 EMULATOR_S3_PROXY_URL=http://127.0.0.1:9298 \
 FFMPEG_PATH=ffmpeg \
-npm --prefix app/frontend run test:e2e -- e2e/emulator-pipeline.spec.ts --project=chromium
+npm --prefix app/frontend run test:e2e -- e2e/emulator-pipeline.spec.ts --project=emulator
 
-docker compose -f app/compose.yaml -f app/compose.local-emulator.yaml down --volumes --remove-orphans
+docker compose -f app/compose.yaml -f app/compose.local-emulator.yaml down --remove-orphans
 ```
 
 このsuiteはEmulatorとローカルproxyを通したアプリpipelineを確認します。実AWSのIAM / S3 bucket policy、CloudFront OAC、edge cacheの検証には使いません。

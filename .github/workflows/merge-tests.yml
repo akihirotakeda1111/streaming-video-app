@@ -283,11 +283,11 @@ jobs:
           E2E_ENVIRONMENT: disposable
           E2E_FRONTEND_URL: http://localhost:5173
           E2E_API_URL: http://127.0.0.1:8000
-          E2E_PROJECT: chromium
+          E2E_PROJECT: emulator
           PLAYBACK_BASE_URL: http://127.0.0.1:9298
           EMULATOR_S3_PROXY_URL: http://127.0.0.1:9298
           FFMPEG_PATH: /usr/bin/ffmpeg
-        run: npm run test:e2e -- e2e/emulator-pipeline.spec.ts --project=chromium
+        run: npm run test:e2e -- e2e/emulator-pipeline.spec.ts --project=emulator
 
       - name: Show E2E runtime logs
         if: ${{ failure() }}

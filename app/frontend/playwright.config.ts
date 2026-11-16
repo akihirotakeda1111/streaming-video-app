@@ -23,6 +23,7 @@ const scalabilityTimeout = scalabilityTimeoutMs()
 
 const browserTestIgnore = ['**/*.test.ts', '**/reliability/**/*.spec.ts',
   '**/scalability/**/*.spec.ts',
+  '**/emulator-pipeline.spec.ts',
   ...(process.env.E2E_INCLUDE_DELIVERY_REPLAY === 'true' || process.env.E2E_DISCOVERY === 'true'
     ? [] : ['**/delivery-regression.spec.ts'])]
 
@@ -79,6 +80,15 @@ export default defineConfig({
     {
       name: 'chromium',
       testIgnore: browserTestIgnore,
+      use: {
+        ...devices['Desktop Chrome'],
+      },
+    },
+    {
+      name: 'emulator',
+      testMatch: '**/emulator-pipeline.spec.ts',
+      retries: 0,
+      workers: 1,
       use: {
         ...devices['Desktop Chrome'],
       },
