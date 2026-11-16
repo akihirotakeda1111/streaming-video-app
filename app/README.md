@@ -10,7 +10,7 @@ Streaming Video App は、動画アップロードから非同期エンコード
 Upload -> asynchronous Encode -> HLS generation -> Playback
 ```
 
-このリポジトリは本番向け動画配信サービスではありません。ローカルComposeはFrontend、Go API、Rust Worker、PostgreSQLを起動し、S3、SQS/DLQ、CloudFrontは実AWSを利用します。クラウド用TerraformはAPI・Worker・encoderをECS/Fargate、PostgreSQLをprivate RDSへ配置します。Frontendのホスティングは別途用意します。
+このリポジトリは本番向け動画配信サービスではありません。標準のローカルComposeはFrontend、Go API、Rust Worker、PostgreSQLを起動し、S3、SQS/DLQ、CloudFrontは実AWSを利用します。ローカル開発とCI E2Eでは [AWS Emulator overlay](./compose.local-emulator.yaml) を追加してAWS API接続をエミュレータへ向けられます。クラウド用TerraformはAPI・Worker・encoderをECS/Fargate、PostgreSQLをprivate RDSへ配置します。Frontendのホスティングは別途用意します。
 
 ## What this application does
 
@@ -228,6 +228,7 @@ app/
 │   ├── validate_contracts.py       # OpenAPI / examples / domain整合性
 │   ├── validate_terraform_contracts.py
 │   ├── start-e2e-compose.sh        # Phase 1正常系E2E runtime起動
+│   ├── start-e2e-emulator.sh       # Emulator E2E runtime起動
 │   ├── setup_reliability_env.sh    # Bashへ統合設定を反映（.mjsと連携）
 │   ├── run_reliability_e2e.py      # 障害注入・証跡管理
 │   ├── setup_scalability_env.sh    # 配備済み環境からhandoff / shell設定を生成
@@ -235,6 +236,7 @@ app/
 ├── config/                         # 現在は空の予約領域
 ├── compose.e2e.yaml                # 専用DB・ラベル・restart policy
 ├── compose.yaml                    # PostgreSQL、migration、API、Worker、Frontend
+├── compose.local-emulator.yaml     # local / CI Emulator overlay
 └── .env.example                    # local runtime設定例（実credentialは含まない）
 ```
 
@@ -402,7 +404,7 @@ heartbeat間隔の2倍がlease期間・visibility延長・sourceキューのvisi
 
 ### AWS-backed E2E Playback CloudFront URL Settings
 
-GitHub ActionsではRepository variablesの `PLAYBACK_BASE_URL` に、E2EのOutput bucketを配信するCloudFront HTTPS originを設定してください。値はTerraformの `playback_base_url` 出力で確認できます。`merge-tests.yml`、`agent-execute.yml`、`agent-review.yml` はこの値を起動処理とE2Eへ渡します。CIの `start-e2e-compose.sh` はTerraformを参照せず、未設定・不正値ならDocker操作前に停止します。E2Eは返されたmanifestのoriginがこの設定と一致することを検証します。
+GitHub ActionsのAWS-backed E2EではRepository variable `PLAYBACK_BASE_URL` にE2E Output bucketを配信するCloudFront HTTPS originを設定してください。値はTerraformの `playback_base_url` 出力で確認できます。`aws-e2e-manual.yml`、`agent-execute.yml`、`agent-review.yml` はこの値を起動処理とE2Eへ渡します。AWS-backed `start-e2e-compose.sh` はTerraformを参照せず、未設定・不正値ならDocker操作前に停止します。E2Eは返されたmanifestのoriginがこの設定と一致することを検証します。`merge-tests.yml` のEmulator E2Eはloopbackの再生endpointを使います。
 
 APIは必須の `PLAYBACK_BASE_URL` に公開manifest key（legacy jobは従来のHLS key）を連結します。S3への自動フォールバックはありません。ユーザー情報、パス、クエリ、フラグメントを含まないHTTPS originを指定してください。末尾のスラッシュは正規化します。APIのループバックHTTP許可はローカルテスト用です。
 
@@ -438,7 +440,7 @@ FRONTEND_ORIGIN=http://localhost:5173
 
 `DATABASE_URL` と `COMPOSE_DATABASE_URL` はテンプレートの値を使えます。
 
-repository rootから `app/` へ移動し、通常用の `compose.yaml` にローカルAWS Emulator用の `compose.local-emulator.yaml` を重ねて起動します。CI/E2Eはこのoverlayを使わず、`compose.yaml`から実AWSへ接続します。
+repository rootから `app/` へ移動し、通常用の `compose.yaml` にローカルAWS Emulator用の `compose.local-emulator.yaml` を重ねて起動します。CIの`merge-tests.yml`もこのoverlayでEmulator E2Eを実行します。実AWSを使うAWS-backed E2Eはoverlayを使わず、`compose.yaml`から専用AWS resourcesへ接続します。
 
 ```sh
 cd app
@@ -518,9 +520,34 @@ npm --prefix app/frontend run test:e2e:helpers
 npm --prefix app/frontend run test:e2e:type-check
 ```
 
-### Pipeline / Delivery E2E
+### Emulator pipeline E2E (CI)
+
+`merge-tests.yml` はAWS Emulatorを使い、ブラウザuploadからS3 notification、SQS、Workerの変換、HLS再生までを検証します。エミュレータのresourceはメモリ上に作られるため、起動ごとに初期化します。終了時はCompose serviceを停止・削除し、開発用PostgreSQL volumeは保持します。
+
+同じpipelineをローカルで実行する場合はrepository rootから起動し、別のterminalでPlaywrightを実行します。host側にDocker、Node.js dependencies、FFmpegが必要です。
+
+```sh
+bash app/scripts/start-e2e-emulator.sh
+
+E2E_ENVIRONMENT=disposable \
+E2E_FRONTEND_URL=http://localhost:5173 \
+E2E_API_URL=http://127.0.0.1:8000 \
+E2E_PROJECT=emulator \
+PLAYBACK_BASE_URL=http://127.0.0.1:9298 \
+EMULATOR_S3_PROXY_URL=http://127.0.0.1:9298 \
+FFMPEG_PATH=ffmpeg \
+npm --prefix app/frontend run test:e2e -- e2e/emulator-pipeline.spec.ts --project=emulator
+
+docker compose -f app/compose.yaml -f app/compose.local-emulator.yaml down --remove-orphans
+```
+
+このsuiteはEmulatorとローカルproxyを通したアプリpipelineを確認します。実AWSのIAM / S3 bucket policy、CloudFront OAC、edge cacheの検証には使いません。
+
+### Real AWS Pipeline / Delivery E2E
 
 Full E2Eはmock storageではなく、実際のS3/SQSとローカルCompose stackを使用します。disposableなE2E環境を使ってください。テストはAWSへ動画とHLS objectsを作成します。
+
+GitHub Actionsでは `AWS E2E (manual)` workflowから任意実行できます。merge-testsの必須E2EはEmulator pipeline suiteを実行します。
 
 必要なAWS resource variables、`PLAYBACK_BASE_URL`、API / Worker credentialsをshell environmentへ設定した後、repository rootからBashで起動します。起動scriptはTerraformを参照せず、playback originの未設定・不正値はDocker操作前に拒否します。
 

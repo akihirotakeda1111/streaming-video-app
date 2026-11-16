@@ -41,7 +41,7 @@ Browser
 
 API process内で動画を同期変換せず、upload、job管理、queue consumption、encoding、playbackを別の責務として実装しています。
 
-ローカルComposeではFrontend、Go API、Rust Worker、PostgreSQLとAWS Emulatorを起動し、S3、SQS、CloudFront相当のHLS配信をローカルで扱います。CI/E2EではComposeのローカルEmulator overlayを使わず、専用の実AWSリソースを利用します。クラウド用TerraformではAPI・Worker・encoderをECS/Fargate、PostgreSQLをprivate RDSに配置します。Frontendのホスティングは別途用意します。
+標準のローカルComposeはFrontend、Go API、Rust Worker、PostgreSQLを起動し、AWSサービスには設定された接続先を使います。ローカル開発ではAWS Emulator overlayを重ねてS3、SQS、CloudFront相当のHLS配信をローカルで扱えます。CIの`merge-tests.yml`もこのoverlayを使ってEmulator pipeline E2Eを実行します。実AWSを使う通常のpipeline E2Eは`AWS E2E (manual)`やagent workflowsから実行し、Reliability / Scalability E2Eもそれぞれの専用AWS環境を使います。クラウド用TerraformではAPI・Worker・encoderをECS/Fargate、PostgreSQLをprivate RDSに配置します。Frontendのホスティングは別途用意します。
 
 ### Components
 
@@ -152,15 +152,15 @@ Frontend、Go API、Rust Worker、E2Eに必要なtoolchainは、Task Specの `al
 
 ### Merge Tests
 
-[`.github/workflows/merge-tests.yml`](./.github/workflows/merge-tests.yml) は `main` または `dev` で始まるブランチの `app/**` 変更時、またはmanual dispatchで実行されます。
+[`.github/workflows/merge-tests.yml`](./.github/workflows/merge-tests.yml) は `main`、`dev*`、`dev/**` ブランチ上で `app/**` または `.github/workflows/merge-tests.yml` がpushされたときに実行されます。`workflow_dispatch`からも実行でき、作業ブランチへpushした後にActions画面でそのブランチを選べます。通常の作業ブランチへのpushは自動実行対象ではありません。
 
 - Contracts: API・storage・reliability・scalabilityとTerraform orchestration構成の静的検証
 - Frontend: dependency install、unit tests、build
 - Go API: `go test ./...`
 - Rust Worker: Cargo workspace tests
-- E2E: helper tests、Compose runtime、Playwrightによる実パイプライン確認
+- E2E: helper testsとAWS Emulatorを使ったブラウザupload、S3 notification、SQS、Worker変換、HLS再生のpipeline確認
 
-変更pathに応じて必要なjobだけを実行します。Reliability E2Eの障害注入とScalability E2Eの実AWS負荷試験は、それぞれの専用環境で手動実行します。
+変更pathに応じてFrontend、Go API、Rust Worker、Contractsのjobを選びます。これらのいずれかが選ばれるとE2Eも実行されます。E2E関連pathだけの変更でもE2Eを実行します。手動dispatchでは全jobが実行対象です。Reliability E2Eの障害注入とScalability E2Eの実AWS負荷試験は、それぞれの専用環境で実行します。
 
 ## Repository Structure
 
@@ -227,23 +227,28 @@ Task Specのbranch、prerequisite、allowed paths、validation環境が満たさ
 
 ## Configuration for GitHub Actions
 
-Agent workflowsは次のrepository secretsを使用します。
+Agent専用のworkflowは次のrepository secretsを使用します。
 
 | Secret | Purpose |
 | --- | --- |
 | `CODEX_API_KEY` | Codexによるtask実装 |
 | `REVIEW_CLASSIFIER_API_KEY` | CodeRabbit feedbackのclassification |
 | `AGENT_PR_PAT` | Pull Request作成 |
-| `AWS_E2E_API_ACCESS_KEY_ID` / `AWS_E2E_API_SECRET_ACCESS_KEY` | E2E用Go APIのAWS identity |
-| `AWS_E2E_WORKER_ACCESS_KEY_ID` / `AWS_E2E_WORKER_SECRET_ACCESS_KEY` | E2E用Rust WorkerのAWS identity |
 
-E2Eは次のrepository variablesを使用します。
+`AWS E2E (manual)`とagent workflowsによるAWS-backed E2Eは次のrepository variablesとsecretsを使用します。`merge-tests.yml`のEmulator E2EにはAWS用のvariables、secrets、OIDC roleは不要です。
 
 - `AWS_REGION`
 - `VIDEO_ENCODING_QUEUE_URL`
 - `VIDEO_INPUT_BUCKET`
 - `VIDEO_OUTPUT_BUCKET`
 - `PLAYBACK_BASE_URL`（対象Output bucketを配信するCloudFront HTTPS origin）
+- `E2E_AWS_ACCOUNT_ID`
+- `AWS_E2E_RUNNER_ROLE_ARN`
+
+| Secret | Purpose |
+| --- | --- |
+| `AWS_E2E_API_ACCESS_KEY_ID` / `AWS_E2E_API_SECRET_ACCESS_KEY` | AWS-backed E2E用Go APIのAWS identity |
+| `AWS_E2E_WORKER_ACCESS_KEY_ID` / `AWS_E2E_WORKER_SECRET_ACCESS_KEY` | AWS-backed E2E用Rust WorkerのAWS identity |
 
 FrontendにはAWS credentialsを渡しません。APIとWorkerのcredentialsは分離されています。
 

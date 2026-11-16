@@ -1,9 +1,11 @@
 # Local Docker Compose runtime
 
-The local Compose stack runs PostgreSQL, migrations, the Go API, the Rust
-worker, the Vite frontend, and AWS Emulator. S3, SQS, and CloudFront-style
-playback stay on the local machine through the emulator and its loopback proxy.
-The separate `compose.yaml` base remains suitable for AWS-backed E2E runs.
+The local emulator stack combines `compose.yaml` with the
+`compose.local-emulator.yaml` overlay to run PostgreSQL, migrations, the Go API,
+the Rust worker, the Vite frontend, and AWS Emulator. S3, SQS, and
+CloudFront-style playback stay on the local machine through the emulator and
+its loopback proxy. The `compose.yaml` base remains suitable for AWS-backed E2E
+runs.
 
 ## Local configuration
 
@@ -60,9 +62,12 @@ remove that volume before the first migration-managed startup. Running
 
 ## AWS-backed E2E configuration
 
-CI and Reliability E2E use `compose.yaml` without the local emulator overlay.
-They pass repository configuration directly to Compose and do not create or
-commit an environment file.
+The CI `merge-tests.yml` workflow uses the emulator overlay and does not need
+AWS repository variables, AWS credentials, or an OIDC role. The optional
+`AWS E2E (manual)` workflow and AWS-backed agent / Reliability E2E runs use
+`compose.yaml` without the local emulator overlay. They pass repository
+configuration directly to Compose and do not create or commit an environment
+file.
 
 Repository variables:
 
@@ -70,6 +75,7 @@ Repository variables:
 - `VIDEO_ENCODING_QUEUE_URL`
 - `VIDEO_INPUT_BUCKET`
 - `VIDEO_OUTPUT_BUCKET`
+- `PLAYBACK_BASE_URL`
 
 Repository secrets:
 

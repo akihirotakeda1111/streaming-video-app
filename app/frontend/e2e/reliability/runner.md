@@ -48,21 +48,23 @@ runnerは各dispatch前に共通事前確認を行う。Reliabilityの操作シ�
 
 ## 事前準備
 
-### 通常CIと専用runnerの分担
+### Emulator CI、AWS-backed E2E、専用runnerの分担
 
-通常の `npm --prefix app/frontend run test:e2e` はブラウザ/API/FFmpegと配信設定のpreflightを先に実行し、成功した場合だけ新規アップロード・CloudFront再生などの通常テストに進む。`delivery-regression` と6つのReliabilityシナリオは通常選択から除外し、専用runnerが明示選択する。`--list` は実AWSへ接続せず全体を列挙する。明示的なPlaywright引数を渡した場合は、その選択を維持する。
+`merge-tests.yml` はAWS Emulator overlayを使い、`emulator-pipeline.spec.ts`でuploadからHLS再生までのpipelineを検証する。このsuiteは実AWSのIAM、S3 bucket policy、CloudFront OACやedge cacheを検証しない。AWS-backed pipeline / delivery E2Eは`AWS E2E (manual)`またはローカル実行を使う。
 
-merge-tests、agent-execute、agent-reviewのテスト実行プロセスには、起動ステップとは別に次を渡す。
+AWS-backedの `npm --prefix app/frontend run test:e2e` はブラウザ/API/FFmpegと配信設定のpreflightを先に実行し、成功した場合だけ新規アップロード・CloudFront再生などの通常テストに進む。`delivery-regression` と6つのReliabilityシナリオは通常選択から除外し、専用runnerが明示選択する。`--list` は実AWSへ接続せず全体を列挙する。明示的なPlaywright引数を渡した場合は、その選択を維持する。
+
+`AWS E2E (manual)`、`agent-execute`、`agent-review`のAWS-backedテスト実行プロセスには、起動ステップとは別に次を渡す。
 
 - Repository Variables：`AWS_REGION`、`VIDEO_OUTPUT_BUCKET`（`E2E_OUTPUT_BUCKET`へ渡す）、`E2E_AWS_ACCOUNT_ID`、`PLAYBACK_BASE_URL`、`AWS_E2E_RUNNER_ROLE_ARN`。
 - ホストrunnerはGitHub OIDCでIAMロールを引き受ける。runner用アクセスキー・シークレットキー・セッショントークンのSecretsは不要。API/Workerの認証は既存の設定を維持する。
 - OIDCロールには、下記のS3/CloudFront読み取り権限を付与する。
 
-`OUTPUT_S3_ENDPOINT` もテスト実行プロセスに必要。merge-testsでは `VIDEO_OUTPUT_BUCKET` と `AWS_REGION` から `https://<bucket>.s3.<region>.amazonaws.com` を組み立てて渡すため、同名のRepository Variableは不要。起動スクリプト内のexportは後続ステップへ引き継がれない。通常実行入口で未設定・別バケット・CloudFront URLの誤指定を拒否する。
+`OUTPUT_S3_ENDPOINT` もAWS-backedテスト実行プロセスに必要です。`VIDEO_OUTPUT_BUCKET` と `AWS_REGION` から `https://<bucket>.s3.<region>.amazonaws.com` を組み立てます。起動スクリプト内のexportは後続ステップへ引き継がれないため、各テストstepにも設定を渡してください。通常実行入口で未設定・別バケット・CloudFront URLの誤指定を拒否します。`merge-tests.yml`のEmulator suiteはloopback proxyを使います。
 
-agentの検証プロセスは独自の環境変数許可リストを維持する。ワークフローで設定した配信変数・OIDC認証がそのまま検証子プロセスへ渡るわけではないため、agent経由の実AWS配信E2Eは本対応の動作保証対象に含めない。merge-testsは通常E2Eを直接起動するため、この制約を受けない。
+agentの検証プロセスは独自の環境変数許可リストを維持する。ワークフローで設定した配信変数・OIDC認証がそのまま検証子プロセスへ渡るわけではないため、agent経由の実AWS配信E2Eは動作保証対象に含めません。`merge-tests.yml`のEmulator suiteは実AWS認証に依存しません。実AWSでの通常pipeline確認には`AWS E2E (manual)`を使用してください。
 
-これらのGitHub設定は別途登録が必要。設定不足はskipせず失敗させる。通常CIは過去の `legacy.json` やDBに依存せず、移行前互換性は専用runnerで別途検証する。
+AWS-backed E2Eで使うGitHub設定は別途登録が必要です。設定不足はskipせず失敗させます。Emulatorを使う`merge-tests.yml`はこれらのAWS設定に依存しません。通常のpipeline検証は過去の `legacy.json` やDBに依存せず、移行前互換性は専用runnerで別途検証します。
 
 ### ツールと実行場所
 
