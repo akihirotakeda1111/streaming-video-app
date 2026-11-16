@@ -88,7 +88,7 @@ flowchart TB
     Scaling -.->|Worker 台数調整| Worker
 ```
 
-ローカル実行では、API・Worker・PostgreSQL・Frontend を [Docker Compose](../compose.yaml) と [AWS Emulator overlay](../compose.local-emulator.yaml) で動かします。CI/E2E はoverlayを使わずAWSの専用リソースを利用します。ローカル構成では `terraform-compute/` の ALB・RDS・ECS は不要です。Frontend のホスティング自体は、これらの Terraform 定義の管理対象に含まれません。
+ローカル実行では、API・Worker・PostgreSQL・Frontend を [Docker Compose](../compose.yaml) と [AWS Emulator overlay](../compose.local-emulator.yaml) で動かします。CIの`merge-tests.yml`もoverlayを使ってEmulator E2Eを実行します。AWS-backed E2EとReliability E2Eはoverlayを使わず、AWSの専用リソースを利用します。ローカル構成では `terraform-compute/` の ALB・RDS・ECS は不要です。Frontend のホスティング自体は、これらの Terraform 定義の管理対象に含まれません。
 
 ## 各リソースの役割
 

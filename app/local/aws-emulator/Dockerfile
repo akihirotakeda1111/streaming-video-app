@@ -1,6 +1,7 @@
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal
 
 ARG TARGETARCH
+ARG AWS_EMULATOR_VERSION=1.0.385
 
 RUN set -eu; \
     case "${TARGETARCH:-amd64}" in \
@@ -8,7 +9,7 @@ RUN set -eu; \
         arm64) package_arch=aarch64 ;; \
         *) echo "Unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSLo /tmp/aws-emulator.rpm "https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator-${package_arch}.rpm"; \
+    curl -fsSLo /tmp/aws-emulator.rpm "https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/aws-emulator-${AWS_EMULATOR_VERSION}-1-${package_arch}.rpm"; \
     rpm -i /tmp/aws-emulator.rpm \
     && rm /tmp/aws-emulator.rpm \
     && mkdir -p /home/emulator/.aws/emulator \

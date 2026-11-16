@@ -1,5 +1,5 @@
-# Local-only overlay for AWS Emulator, its S3 CORS/CloudFront proxy, and seed resources.
-# Production-style and CI/E2E Compose runs use compose.yaml without this overlay.
+# Local and Emulator E2E overlay for AWS Emulator, its S3 CORS/CloudFront proxy, and seed resources.
+# Production-style AWS E2E runs use compose.yaml without this overlay.
 services:
   api:
     user: "1000:0"
